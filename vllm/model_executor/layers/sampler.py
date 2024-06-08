@@ -14,6 +14,8 @@ from vllm.sequence import (CompletionSequenceGroupOutput, Logprob,
                            PromptLogprobs, SampleLogprobs, SamplerOutput,
                            SequenceOutput)
 
+from block_timer.timer import Timer
+
 # (num_token_ids, num_parent_ids) per sequence group.
 SampleResultType = List[Tuple[List[int], List[int]]]
 
@@ -47,6 +49,7 @@ class Sampler(nn.Module):
         # speculative decoding.
         self.include_gpu_probs_tensor = False
 
+    @Timer(title="\t\t\tSampler.forward")
     def forward(
         self,
         logits: torch.Tensor,
@@ -63,9 +66,10 @@ class Sampler(nn.Module):
         logits = _apply_min_tokens_penalty(logits, sampling_metadata)
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
-        (sampling_tensors, do_penalties, do_top_p_top_k,
-         do_min_p) = SamplingTensors.from_sampling_metadata(
-             sampling_metadata, vocab_size, logits.device, logits.dtype)
+        with Timer(title="\t\t\t\tSamplingTensors.from_sampling_metadata") as t:
+            (sampling_tensors, do_penalties, do_top_p_top_k,
+             do_min_p) = SamplingTensors.from_sampling_metadata(
+                 sampling_metadata, vocab_size, logits.device, logits.dtype)
 
         # Apply presence and frequency penalties.
         if do_penalties:
@@ -220,6 +224,7 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
     return logits
 
 
+@Timer(title="\t\t\t\tSampler._apply_top_k_top_p")
 def _apply_top_k_top_p(
     logits: torch.Tensor,
     p: torch.Tensor,
@@ -252,6 +257,7 @@ def _apply_top_k_top_p(
     return logits
 
 
+@Timer(title="\t\t\t\tSampler._apply_min_p")
 def _apply_min_p(
     logits: torch.Tensor,
     min_p: torch.Tensor,
@@ -635,6 +641,7 @@ def _sample_with_triton_kernel(
     return sample_results
 
 
+@Timer(title="\t\t\t\tSampler._sample")
 def _sample(
     probs: torch.Tensor, logprobs: torch.Tensor,
     sampling_metadata: SamplingMetadata, sampling_tensors: SamplingTensors,
@@ -686,6 +693,7 @@ def _get_ranks(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     return result.sum(1).add_(1)
 
 
+@Timer(title="\t\t\t\tSampler._get_logprobs")
 def _get_logprobs(
     logprobs: torch.Tensor,
     sampling_metadata: SamplingMetadata,

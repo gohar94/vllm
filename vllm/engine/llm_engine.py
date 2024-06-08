@@ -35,6 +35,8 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import Counter
 
+from block_timer.timer import Timer
+
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
@@ -162,17 +164,18 @@ class LLMEngine:
         self.generation_config_fields = _load_generation_config_dict(
             model_config)
 
-        self.model_executor = executor_class(
-            model_config=model_config,
-            cache_config=cache_config,
-            parallel_config=parallel_config,
-            scheduler_config=scheduler_config,
-            device_config=device_config,
-            lora_config=lora_config,
-            vision_language_config=vision_language_config,
-            speculative_config=speculative_config,
-            load_config=load_config,
-        )
+        with Timer(title="Create executor class") as t:
+            self.model_executor = executor_class(
+                model_config=model_config,
+                cache_config=cache_config,
+                parallel_config=parallel_config,
+                scheduler_config=scheduler_config,
+                device_config=device_config,
+                lora_config=lora_config,
+                vision_language_config=vision_language_config,
+                speculative_config=speculative_config,
+                load_config=load_config,
+            )
 
         if not self.model_config.embedding_mode:
             self._initialize_kv_caches()
@@ -220,7 +223,8 @@ class LLMEngine:
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
-        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+        with Timer(title="Create scheduler") as t:
+            self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
 
         # Metric Logging.
         if self.log_stats:
@@ -232,19 +236,21 @@ class LLMEngine:
 
         # Create sequence output processor, e.g. for beam search or
         # speculative decoding.
-        self.output_processor = (
-            SequenceGroupOutputProcessor.create_output_processor(
-                self.scheduler_config,
-                self.detokenizer,
-                self.scheduler,
-                self.seq_counter,
-                self.get_tokenizer_for_seq,
-                stop_checker=StopChecker(
-                    self.scheduler_config.max_model_len,
+        with Timer(title="Create output processor") as t:
+            self.output_processor = (
+                SequenceGroupOutputProcessor.create_output_processor(
+                    self.scheduler_config,
+                    self.detokenizer,
+                    self.scheduler,
+                    self.seq_counter,
                     self.get_tokenizer_for_seq,
-                ),
-            ))
+                    stop_checker=StopChecker(
+                        self.scheduler_config.max_model_len,
+                        self.get_tokenizer_for_seq,
+                    ),
+                ))
 
+    @Timer(title="Initialize KV caches")
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
 
@@ -299,12 +305,13 @@ class LLMEngine:
             executor_class = GPUExecutor
 
         # Create the LLM engine.
-        engine = cls(
-            **engine_config.to_dict(),
-            executor_class=executor_class,
-            log_stats=not engine_args.disable_log_stats,
-            usage_context=usage_context,
-        )
+        with Timer(title="Create LLM engine") as t:
+            engine = cls(
+                **engine_config.to_dict(),
+                executor_class=executor_class,
+                log_stats=not engine_args.disable_log_stats,
+                usage_context=usage_context,
+            )
         return engine
 
     def __reduce__(self):
@@ -618,6 +625,7 @@ class LLMEngine:
             request_outputs.append(request_output)
         return request_outputs
 
+    @Timer(title="LLMEngine.step")
     def step(self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
 

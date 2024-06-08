@@ -41,6 +41,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 
+from block_timer.timer import Timer
+
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
 
@@ -51,6 +53,7 @@ class OPTLearnedPositionalEmbedding(nn.Embedding):
         self.offset = 2
         super().__init__(num_embeddings + self.offset, embedding_dim)
 
+    @Timer(title="OPTLearnedPositionalEmbedding.forward")
     def forward(self, positions: torch.Tensor):
         return super().forward(positions + self.offset)
 
@@ -94,16 +97,20 @@ class OPTAttention(nn.Module):
                               cache_config=cache_config,
                               quant_config=quant_config)
 
+    @Timer(title="\t\t\t\t\t\t\tOPTAttention.forward")
     def forward(
         self,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.chunk(chunks=3, dim=-1)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        output, _ = self.out_proj(attn_output)
+        with Timer(title="\t\t\t\t\t\t\t\tOPTAttention.forward.qkv_proj"):
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.chunk(chunks=3, dim=-1)
+        with Timer(title="\t\t\t\t\t\t\t\tOPTAttention.forward.attn"):
+            attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        with Timer(title="\t\t\t\t\t\t\t\tOPTAttention.forward.out_proj"):
+            output, _ = self.out_proj(attn_output)
         return output
 
 
@@ -148,6 +155,7 @@ class OPTDecoderLayer(nn.Module):
             self.embed_dim,
             elementwise_affine=config.layer_norm_elementwise_affine)
 
+    @Timer(title="\t\t\t\t\t\tOPTDecoderLayer.forward")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -237,6 +245,7 @@ class OPTDecoder(nn.Module):
             for _ in range(config.num_hidden_layers)
         ])
 
+    @Timer(title="\t\t\t\t\tOPTDecoder.forward")
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -272,6 +281,7 @@ class OPTModel(nn.Module):
         super().__init__()
         self.decoder = OPTDecoder(config, cache_config, quant_config)
 
+    @Timer(title="\t\t\t\tOPTModel.forward")
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -298,6 +308,7 @@ class OPTForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
 
+    @Timer(title="\t\t\tOPTForCausalLM.forward")
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -323,6 +334,7 @@ class OPTForCausalLM(nn.Module):
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
+    @Timer("OPTForCausalLM.load_weights")
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

@@ -24,6 +24,8 @@ from vllm.sequence import (MultiModalData, SamplerOutput, SequenceData,
 from vllm.utils import (CudaMemoryProfiler, get_kv_cache_torch_dtype, is_hip,
                         is_pin_memory_available, make_tensor_with_pad)
 
+from block_timer.timer import Timer
+
 logger = init_logger(__name__)
 
 _PAD_SLOT_ID = -1
@@ -129,18 +131,20 @@ class ModelRunner:
         # Set after load_model.
         self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
 
+    @Timer(title="ModelRunner.load_model")
     def load_model(self) -> None:
         with CudaMemoryProfiler() as m:
-            self.model = get_model(
-                model_config=self.model_config,
-                device_config=self.device_config,
-                load_config=self.load_config,
-                lora_config=self.lora_config,
-                vision_language_config=self.vision_language_config,
-                parallel_config=self.parallel_config,
-                scheduler_config=self.scheduler_config,
-                cache_config=self.cache_config,
-            )
+            with Timer(title="get_model") as t:
+                self.model = get_model(
+                    model_config=self.model_config,
+                    device_config=self.device_config,
+                    load_config=self.load_config,
+                    lora_config=self.lora_config,
+                    vision_language_config=self.vision_language_config,
+                    parallel_config=self.parallel_config,
+                    scheduler_config=self.scheduler_config,
+                    cache_config=self.cache_config,
+                )
 
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB",
@@ -607,6 +611,7 @@ class ModelRunner:
             num_prefills=num_prefills,
         )
 
+    @Timer(title="\t\tModelRunner.prepare_input_tensors")
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
@@ -674,6 +679,7 @@ class ModelRunner:
                 sampling_metadata, lora_requests, lora_mapping,
                 multi_modal_input)
 
+    @Timer(title="\tModelRunner.execute_model")
     @torch.inference_mode()
     def execute_model(
         self,
@@ -693,8 +699,10 @@ class ModelRunner:
         if prefill_meta is None and decode_meta.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
             model_executable = self.graph_runners[graph_batch_size]
+            print("\t\t--Decode--")
         else:
             model_executable = self.model
+            print("\t\t--Prefill--")
         execute_model_kwargs = {
             "input_ids": input_tokens,
             "positions": input_positions,
@@ -703,20 +711,24 @@ class ModelRunner:
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
-        hidden_states = model_executable(**execute_model_kwargs)
+
+        with Timer(title="\t\tmodel_executable") as t:
+            hidden_states = model_executable(**execute_model_kwargs)
 
         # Compute the logits.
-        logits = self.model.compute_logits(hidden_states, sampling_metadata)
+        with Timer(title="\t\tModel.compute_logits") as t:
+            logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
         # Only perform sampling in the driver worker.
         if not self.is_driver_worker:
             return None
 
         # Sample the next token.
-        output = self.model.sample(
-            logits=logits,
-            sampling_metadata=sampling_metadata,
-        )
+        with Timer(title="\t\tModel.sample") as t:
+            output = self.model.sample(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
 
         return output
 
@@ -967,6 +979,7 @@ class CUDAGraphRunner:
         self.output_buffers = {"hidden_states": hidden_states}
         return
 
+    @Timer(title="\t\t\tCUDAGraphRunner.forward")
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -979,16 +992,18 @@ class CUDAGraphRunner:
         del kv_caches
 
         # Copy the input tensors to the input buffers.
-        self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
-        self.input_buffers["positions"].copy_(positions, non_blocking=True)
-        self.input_buffers["slot_mapping"].copy_(attn_metadata.slot_mapping,
-                                                 non_blocking=True)
-        self.input_buffers["seq_lens_tensor"].copy_(
-            attn_metadata.decode_metadata.seq_lens_tensor, non_blocking=True)
-        self.input_buffers["block_tables"].copy_(
-            attn_metadata.decode_metadata.block_tables, non_blocking=True)
+        with Timer(title="\t\t\t\tCopy Buffers"):
+            self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
+            self.input_buffers["positions"].copy_(positions, non_blocking=True)
+            self.input_buffers["slot_mapping"].copy_(attn_metadata.slot_mapping,
+                                                     non_blocking=True)
+            self.input_buffers["seq_lens_tensor"].copy_(
+                attn_metadata.decode_metadata.seq_lens_tensor, non_blocking=True)
+            self.input_buffers["block_tables"].copy_(
+                attn_metadata.decode_metadata.block_tables, non_blocking=True)
         # Run the graph.
-        self.graph.replay()
+        with Timer(title="\t\t\t\tCUDAGraph.replay"):
+            self.graph.replay()
 
         # Return the output tensor.
         return self.output_buffers["hidden_states"]

@@ -21,6 +21,8 @@ from vllm.worker.embedding_model_runner import EmbeddingModelRunner
 from vllm.worker.model_runner import ModelRunner
 from vllm.worker.worker_base import WorkerBase
 
+from block_timer.timer import Timer
+
 
 class Worker(WorkerBase):
     """A worker class that executes (a partition of) the model on a GPU.
@@ -178,6 +180,7 @@ class Worker(WorkerBase):
         torch.cuda.empty_cache()
         return num_gpu_blocks, num_cpu_blocks
 
+    @Timer(title="Worker initialize cache")
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
         """Allocate GPU and CPU KV cache with the specified number of blocks.
@@ -191,8 +194,10 @@ class Worker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
-        self._init_cache_engine()
-        self._warm_up_model()
+        with Timer(title="Init cache engine") as t:
+            self._init_cache_engine()
+        with Timer(title="Warm up model") as t:
+            self._warm_up_model()
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None

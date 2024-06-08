@@ -15,6 +15,8 @@ from vllm.sequence import MultiModalData
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter
 
+from block_timer.timer import Timer
+
 logger = init_logger(__name__)
 
 
@@ -138,6 +140,7 @@ class LLM:
     ) -> None:
         self.llm_engine.tokenizer.tokenizer = tokenizer
 
+    @Timer(title="generate")
     def generate(
         self,
         prompts: Optional[Union[str, List[str]]] = None,
@@ -237,6 +240,7 @@ class LLM:
 
         return self._run_engine(use_tqdm)
 
+    @Timer(title="_validate_and_prepare_requests")
     def _validate_and_prepare_requests(
         self,
         prompts: Optional[Union[str, List[str]]],
@@ -306,6 +310,7 @@ class LLM:
 
         return requests_data
 
+    @Timer(title="_add_request")
     def _add_request(
         self,
         prompt: Optional[str],
@@ -339,6 +344,7 @@ class LLM:
         total_toks = 0
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
+            print("\n\n")
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
