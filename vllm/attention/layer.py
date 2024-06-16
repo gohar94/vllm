@@ -82,6 +82,8 @@ class Attention(nn.Module):
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        if kv_cache is not None:
+            breakpoint()
         return self.impl.forward(query, key, value, kv_cache, attn_metadata,
                                  self._kv_scale)
 
