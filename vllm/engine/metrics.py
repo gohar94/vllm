@@ -1,4 +1,6 @@
 import time
+import os
+import csv
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -370,6 +372,76 @@ class StatLoggerBase(ABC):
         to be emitted at same time as log interval)."""
         if stats.spec_decode_metrics is not None:
             self.spec_decode_metrics = stats.spec_decode_metrics
+
+
+class CSVStatLogger(StatLoggerBase):
+    """CSVStatLogger is used in LLMEngine to log to a .csv file."""
+
+    def __init__(self, local_interval: float) -> None:
+        super().__init__(local_interval)
+        self.csv_filepath = "logs.csv"
+        self.csv_file = open(self.csv_filepath, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        header = [
+            "AvgPromptThroughput (tokens/s)",
+            "AvgGenerationThroughput (tokens/s)",
+            "Running (reqs)",
+            "Swapped (reqs)",
+            "Pending (reqs)",
+            "GPU_KVCacheUsage (%)",
+            "CPU_KVCacheUsage (%)",
+        ]
+        self.csv_writer.writerows([header])
+
+    def __del__(self):
+        self.csv_file.close()
+        logger.info(f"CSV log stored in: {self.csv_filepath}")
+        super().__del__()
+
+    def info(self, type: str, obj: SupportsMetricsInfo) -> None:
+        raise NotImplementedError
+
+    def log(self, stats: Stats) -> None:
+        """Called by LLMEngine.
+           Logs to .csv file every self.local_interval seconds."""
+
+        # Save tracked stats for token counters.
+        self.num_prompt_tokens.append(stats.num_prompt_tokens_iter)
+        self.num_generation_tokens.append(stats.num_generation_tokens_iter)
+
+        # Log locally every local_interval seconds.
+        if local_interval_elapsed(stats.now, self.last_local_log,
+                                  self.local_interval):
+            # Compute summary metrics for tracked stats (and log them
+            # to promethus if applicable).
+            prompt_throughput = get_throughput(self.num_prompt_tokens,
+                                               now=stats.now,
+                                               last_log=self.last_local_log)
+            generation_throughput = get_throughput(
+                self.num_generation_tokens,
+                now=stats.now,
+                last_log=self.last_local_log)
+
+            data = [
+                prompt_throughput,
+                generation_throughput,
+                stats.num_running_sys,
+                stats.num_swapped_sys,
+                stats.num_waiting_sys,
+                stats.gpu_cache_usage_sys * 100,
+                stats.cpu_cache_usage_sys * 100,
+            ]
+            self.csv_writer.writerows([data])
+
+            # Reset tracked stats for next interval.
+            self.num_prompt_tokens = []
+            self.num_generation_tokens = []
+            self.last_local_log = stats.now
+
+            if stats.spec_decode_metrics is not None:
+                logger.info(
+                    self._format_spec_decode_metrics_str(
+                        stats.spec_decode_metrics))
 
 
 class LoggingStatLogger(StatLoggerBase):
