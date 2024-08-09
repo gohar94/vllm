@@ -268,14 +268,16 @@ class ColumnParallelLinear(LinearBase):
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
                  output_sizes: Optional[List[int]] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 tp_size: Optional[int] = None):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config, prefix)
 
         self.gather_output = gather_output
 
         # Divide the weight matrix along the last dimension.
-        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size is None:
+            tp_size = get_tensor_model_parallel_world_size()
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -524,7 +526,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 tp_size: Optional[int] = None):
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.total_num_heads = total_num_heads
@@ -532,7 +535,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
-        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size is None:
+            tp_size = get_tensor_model_parallel_world_size()
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
@@ -557,7 +561,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
                          quant_config=quant_config,
-                         prefix=prefix)
+                         prefix=prefix,
+                         tp_size=tp_size)
 
     def weight_loader(self,
                       param: Parameter,
@@ -717,7 +722,9 @@ class RowParallelLinear(LinearBase):
                  params_dtype: Optional[torch.dtype] = None,
                  reduce_results: bool = True,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 tp_rank: Optional[int] = None,
+                 tp_size: Optional[int] = None):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config, prefix)
 
@@ -725,8 +732,14 @@ class RowParallelLinear(LinearBase):
         self.reduce_results = reduce_results
 
         # Divide the weight matrix along the last dimension.
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        if tp_rank is None:
+            self.tp_rank = get_tensor_model_parallel_rank()
+        else:
+            self.tp_rank = tp_rank
+        if tp_size is None:
+            self.tp_size = get_tensor_model_parallel_world_size()
+        else:
+            self.tp_size = tp_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.quant_method.create_weights(

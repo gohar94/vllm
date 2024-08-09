@@ -105,10 +105,13 @@ class LlamaAttention(nn.Module):
         bias: bool = False,
         cache_config: Optional[CacheConfig] = None,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size is None:
+            tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -139,6 +142,7 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            tp_size=tp_size,
         )
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
@@ -146,6 +150,8 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
 
         self.rotary_emb = get_rope(

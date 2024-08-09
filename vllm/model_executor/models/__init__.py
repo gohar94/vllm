@@ -83,7 +83,11 @@ _EMBEDDING_MODELS = {
     "MistralModel": ("llama_embedding", "LlamaEmbeddingModel"),
 }
 
-_MODELS = {**_GENERATION_MODELS, **_EMBEDDING_MODELS}
+_MODEL_LAYERS = {
+    "LlamaAttention": ("llama", "LlamaAttention"),
+}
+
+_MODELS = {**_GENERATION_MODELS, **_EMBEDDING_MODELS, **_MODEL_LAYERS}
 
 # Architecture -> type.
 # out of tree models
