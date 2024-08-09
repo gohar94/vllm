@@ -1,5 +1,6 @@
 import random
 import time
+import sys
 from typing import List, Optional
 
 import torch
@@ -150,16 +151,18 @@ def main(
         return (end_time - start_time) / num_iters
 
     # Warmup.
-    print("Warming up...")
     run_benchmark = run_cuda_benchmark
-    run_benchmark(num_iters=3, profile=False)
+    """
+    print("Warming up...", file=sys.stderr)
+    run_benchmark(num_iters=1, profile=False)
+    """
 
     # Benchmark.
     if do_profile:
         latency = run_benchmark(num_iters=1, profile=True)
     else:
-        latency = run_benchmark(num_iters=100, profile=False)
-    print(f"Kernel running time: {latency * 1000000:.3f} us")
+        latency = run_benchmark(num_iters=1, profile=False)
+    print(f"Kernel running time: {latency * 1000000:.3f} us", file=sys.stderr)
 
 
 if __name__ == '__main__':
@@ -194,7 +197,7 @@ if __name__ == '__main__':
         "data type. CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. "
         "ROCm (AMD GPU) supports fp8 (=fp8_e4m3)")
     args = parser.parse_args()
-    print(args)
+    print(args, file=sys.stderr)
 
     if args.num_query_heads % args.num_kv_heads != 0:
         raise ValueError("num_query_heads must be divisible by num_kv_heads")
