@@ -476,18 +476,8 @@ class Worker(WorkerBase):
         
         print(f"[DEBUG worker] execute_model completed")
         
-        # LoRA training for training requests (detach-reattach pattern)
-        if hasattr(self.model_runner, '_training_hidden_states'):
-            hidden_states = self.model_runner._training_hidden_states
-            if hidden_states:
-                lora_stats = self.lora_training_manager.apply_lora_and_train(
-                    hidden_states, scheduler_output
-                )
-                if lora_stats:
-                    logger.info(
-                        f"LoRA training: {lora_stats['num_requests']} requests, "
-                        f"avg_loss={lora_stats['avg_loss']:.4f}"
-                    )
+        # NOTE: LoRA training is now done inside model_runner.execute_model
+        # while still in the enable_grad() context. We don't call it here anymore.
         
         # Collect training losses for monitoring (vLLM-computed losses)
         training_stats = self.training_manager.collect_losses()

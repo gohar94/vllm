@@ -470,7 +470,9 @@ class LLM:
         # The LoRA training manager will handle actual training
         print(f"[DEBUG llm.train] Calling _run_engine()...")
         outputs = self._run_engine(use_tqdm=use_tqdm)
-        print(f"[DEBUG llm.train] _run_engine() returned {len(outputs) if outputs else 0} outputs")
+        # Note: Training requests don't produce RequestOutput objects (they don't generate tokens)
+        # Results are retrieved from LoRATrainingManager instead
+        print(f"[DEBUG llm.train] _run_engine() completed, fetching results from LoRA manager...")
         
         # Get results from LoRA training manager
         # The LoRA manager stores losses after each training batch

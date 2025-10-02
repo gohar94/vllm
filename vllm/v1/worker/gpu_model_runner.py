@@ -2104,14 +2104,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         print(f"[DEBUG model_runner] execute_model: has_training_requests={has_training_requests}")
         print(f"[DEBUG model_runner] scheduled_new_reqs count: {len(scheduler_output.scheduled_new_reqs)}")
         
-        # Use no_grad (not inference_mode) for inference batches
-        # inference_mode() cannot be overridden by enable_grad(), but no_grad() can be
-        inference_context = (
-            torch.no_grad() if not has_training_requests
-            else torch.enable_grad()
-        )
-        
-        with inference_context:
+        # Use inference_mode for pure inference batches (better performance + safety)
+        # For training batches, use enable_grad
+        if not has_training_requests:
+            # Pure inference: use inference_mode for maximum performance and safety
+            with torch.inference_mode():
+                return self._execute_model_impl(
+                    scheduler_output, intermediate_tensors, has_training_requests
+                )
+        else:
+            # Training: use enable_grad
             return self._execute_model_impl(
                 scheduler_output, intermediate_tensors, has_training_requests
             )
@@ -2300,6 +2302,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         print(f"[DEBUG model_runner] LoRA training completed: {lora_stats['num_requests']} requests, avg_loss={lora_stats['avg_loss']:.4f}")
                 else:
                     print(f"[DEBUG model_runner] WARNING: lora_training_manager not set on model_runner!")
+            
+            # Clean up training state to prevent interference with future inference
+            # This is critical: lingering gradient-enabled tensors can cause errors
+            self._training_hidden_states = {}
+            if hasattr(self, '_training_losses'):
+                # Don't clear losses yet - they're read by TrainingManager
+                pass
             
             # Return early for training requests - no need for bookkeeping/sampling
             print(f"[DEBUG model_runner] Returning early for training batch")
