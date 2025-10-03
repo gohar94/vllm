@@ -136,6 +136,10 @@ class TorchSDPAMetadata(AttentionMetadata):
     cross_slot_mapping: Optional[torch.Tensor] = None
     cross_block_tables: Optional[torch.Tensor] = None
 
+    # Training flag: when True, backend must compute full prompt attention
+    # and avoid kv-cache usage; also return gradients (no graph capture/inplace)
+    is_training: bool = False
+
     def __post_init__(self):
         # Set during the execution of the first attention op.
         # It is a list because it is needed to set per prompt
@@ -382,7 +386,8 @@ class TorchSDPAMetadataBuilderV1(AttentionMetadataBuilder[TorchSDPAMetadata]):
     def build(self,
               common_prefix_len: int,
               common_attn_metadata: CommonAttentionMetadata,
-              fast_build: bool = False) -> TorchSDPAMetadata:
+              fast_build: bool = False,
+              is_training: bool = False) -> TorchSDPAMetadata:
         num_reqs = common_attn_metadata.num_reqs
         max_query_len = common_attn_metadata.max_query_len
 
@@ -427,6 +432,7 @@ class TorchSDPAMetadataBuilderV1(AttentionMetadataBuilder[TorchSDPAMetadata]):
                                                 1],  # for logits index
             multi_modal_placeholder_index_maps=None,
             enable_kv_scales_calculation=False,
+            is_training=is_training,
         )
 
         return attn_metadata
@@ -519,6 +525,28 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                                  "requires setting cross-attention "
                                  "metadata attributes.")
 
+        # DEBUG: log SDPA usage and training flag (first few calls only)
+        try:
+            if not hasattr(self, "_sdpa_debug_emitted"):
+                self._sdpa_debug_emitted = 0
+            if self._sdpa_debug_emitted < 5:
+                import logging
+                logger = logging.getLogger(__name__)
+                def d(t):
+                    try:
+                        return f"dev={t.device}, req_grad={t.requires_grad}, grad_fn={type(t.grad_fn).__name__ if t.grad_fn else None}"
+                    except Exception:
+                        return "n/a"
+                logger.info(
+                    f"[SDPA] forward(attn_type={self.attn_type}, is_training={getattr(attn_metadata, 'is_training', False)}, "
+                    f"q={tuple(query.shape)} [{d(query)}], "
+                    f"k={tuple(key.shape) if key is not None else None} [{d(key) if key is not None else None}], "
+                    f"v={tuple(value.shape) if value is not None else None} [{d(value) if value is not None else None}]"
+                )
+                self._sdpa_debug_emitted += 1
+        except Exception:
+            pass
+
         # Reshape the query, key, and value tensors.
         query = query.view(-1, self.num_heads, self.head_size)
         if key is not None:
@@ -528,7 +556,9 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         else:
             assert value is None
 
-        if (attn_type != AttentionType.ENCODER and kv_cache.numel() > 0):
+        # Skip kv-cache interaction entirely during training to keep autograd paths
+        if (not attn_metadata.is_training
+                and attn_type != AttentionType.ENCODER and kv_cache.numel() > 0):
             # KV-cache during decoder-self- or
             # encoder-decoder-cross-attention, but not
             # during encoder attention.
@@ -553,7 +583,11 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                     key, value, key_cache, value_cache, updated_slot_mapping,
                     self.kv_cache_dtype, layer._k_scale, layer._v_scale)
 
-        if attn_type != AttentionType.ENCODER:
+        if attn_metadata.is_training:
+            # Training: treat all tokens as prefill; compute full prompt attention
+            num_prefill_tokens = query.shape[0]
+            num_decode_tokens = 0
+        elif attn_type != AttentionType.ENCODER:
             # Decoder self-attention supports chunked prefill.
             # Encoder/decoder cross-attention requires no chunked
             # prefill (100% prefill or 100% decode tokens, no mix)
@@ -603,7 +637,7 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                     self.alibi_slopes,
                 )
 
-        if decode_meta := attn_metadata.decode_metadata:
+        if (not attn_metadata.is_training) and (decode_meta := attn_metadata.decode_metadata):
             assert attn_type != AttentionType.ENCODER_ONLY, (
                 "Encoder-only models should not have decode metadata.")
             # Decoding run.
@@ -673,14 +707,40 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                                                attn_masks):
             end_q = start_q + seq_len_q
             end_kv = start_kv + seq_len_kv
+            # Numeric guard: clamp scale and cast logits to fp32 inside SDPA
+            safe_scale = float(self.scale) if hasattr(self, 'scale') else 1.0
+            # Cast to float32 inside SDPA for numeric stability, then cast back
+            q_sub = query[None, :, start_q:end_q, :].to(torch.float32)
+            k_sub = key[None, :, start_kv:end_kv, :].to(torch.float32)
+            v_sub = value[None, :, start_kv:end_kv, :].to(torch.float32)
             sub_out = scaled_dot_product_attention(
-                query[None, :, start_q:end_q, :],
-                key[None, :, start_kv:end_kv, :],
-                value[None, :, start_kv:end_kv, :],
+                q_sub,
+                k_sub,
+                v_sub,
                 attn_mask=mask,
                 dropout_p=0.0,
                 is_causal=causal_attn and mask is None,
-                scale=self.scale).squeeze(0).movedim(query.dim() - 2, 0)
+                scale=safe_scale).to(output.dtype).squeeze(0).movedim(query.dim() - 2, 0)
+            # Debug: attention block stats (first few calls)
+            try:
+                if not hasattr(self, '_sdpa_block_dbg'):
+                    self._sdpa_block_dbg = 0
+                if self._sdpa_block_dbg < 5:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(
+                        f"[SDPA/FWD] block q=[{start_q}:{end_q}], kv=[{start_kv}:{end_kv}], mean={float(sub_out.mean().detach().cpu()):.6e}, std={float(sub_out.std().detach().cpu()):.6e}, scale={safe_scale}, "
+                        f"req_grad: q={q_sub.requires_grad}, k={k_sub.requires_grad}, v={v_sub.requires_grad}, out={output.requires_grad}"
+                    )
+                    self._sdpa_block_dbg += 1
+            except Exception:
+                pass
+            # Debug: detect NaNs early
+            if torch.isnan(sub_out).any():
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[SDPA/DEBUG] NaN detected in sub_out: q=[%d:%d], kv=[%d:%d], dtype=%s",
+                    start_q, end_q, start_kv, end_kv, str(sub_out.dtype))
             output[start_q:end_q, :, :] = sub_out
             start_q, start_kv = end_q, end_kv
 
