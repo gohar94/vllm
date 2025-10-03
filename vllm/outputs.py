@@ -126,7 +126,7 @@ class RequestOutput:
     ) -> None:
         # Extract training_loss from kwargs if present
         self.training_loss = kwargs.pop('training_loss', None)
-        
+
         if kwargs:
             logger.warning_once("RequestOutput: Ignoring extra arguments: %s",
                                 str(kwargs))

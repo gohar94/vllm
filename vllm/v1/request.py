@@ -32,16 +32,16 @@ class TrainingConfig:
     """
     # Labels for computing training loss
     labels: torch.Tensor
-    
+
     # Whether to compute loss for this request
     compute_loss: bool = True
-    
+
     # Loss function to use (currently only cross_entropy supported)
     loss_fn: str = "cross_entropy"
-    
+
     # Whether to cache activations for backward pass
     cache_for_backward: bool = True
-    
+
     # LoRA configuration for training
     # If provided, the model will use this LoRA adapter during training
     lora_request: Optional["LoRARequest"] = None

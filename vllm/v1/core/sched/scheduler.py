@@ -279,7 +279,8 @@ class Scheduler(SchedulerInterface):
                         preempted_req.num_computed_tokens = 0
                         if self.log_stats:
                             preempted_req.record_event(
-                                EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+                                EngineCoreEventType.PREEMPTED,
+                                scheduled_timestamp)
 
                         self.waiting.prepend_request(preempted_req)
                         preempted_reqs.append(preempted_req)
@@ -293,7 +294,7 @@ class Scheduler(SchedulerInterface):
                         break
                 if not can_schedule:
                     break
-            
+
             # Store blocks for inference requests only
             if new_blocks is not None:
                 assert not request.is_training
@@ -585,10 +586,9 @@ class Scheduler(SchedulerInterface):
             NewRequestData.from_request(
                 req,
                 req_to_new_blocks[req.request_id].get_block_ids()
-                if req_to_new_blocks[req.request_id] is not None
-                else ([], )  # Empty block IDs for training requests
-            )
-            for req in scheduled_new_reqs
+                if req_to_new_blocks[req.request_id] is not None else
+                ([], )  # Empty block IDs for training requests
+            ) for req in scheduled_new_reqs
         ]
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
@@ -984,8 +984,9 @@ class Scheduler(SchedulerInterface):
                 # Get training loss if available
                 training_loss = None
                 if request.is_training and model_runner_output.training_losses:
-                    training_loss = model_runner_output.training_losses.get(req_id)
-                
+                    training_loss = model_runner_output.training_losses.get(
+                        req_id)
+
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(

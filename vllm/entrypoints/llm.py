@@ -404,45 +404,45 @@ class LLM:
         lora_int_id: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         """Train the model on the given training data.
-        
+
         This method processes training examples through the engine pipeline,
         following the same input format as HuggingFace's SFTTrainer.
         Each training example performs a forward pass with next-token prediction.
-        
+
         Args:
             training_data: Training examples. Each example should be a dictionary.
                 Supported formats (in order of preference):
-                
+
                 1. SFTTrainer format (RECOMMENDED):
                    {'text': str}  # Full conversation/document text
-                   
+
                 2. Chat format (will apply chat template):
                    {'messages': [{'role': 'user', 'content': '...'},
                                  {'role': 'assistant', 'content': '...'}]}
-                
+
                 3. Legacy format (for backward compatibility):
                    {'prompt': str, 'labels': list[int]}
                    # If labels not provided, uses prompt tokens as labels
-                
+
                 Note: For causal LM training, labels should be the same as 
                 input tokens (next-token prediction). The model shifts internally.
-                
+
             use_tqdm: If `True`, shows a tqdm progress bar.
-            
+
             lora_request: LoRA request(s) to use for training. Can be:
                 - None: No LoRA adapter used
                 - Single LoRARequest: Same adapter used for all training examples
                 - List[LoRARequest]: One adapter per training example
-            
+
             lora_path: Path to LoRA adapter weights. If provided along with
                 lora_name and lora_int_id, a LoRARequest will be created.
                 Mutually exclusive with lora_request parameter.
-            
+
             lora_name: Name for the LoRA adapter. Required if lora_path is provided.
-            
+
             lora_int_id: Integer ID for the LoRA adapter (must be > 0).
                 Required if lora_path is provided.
-        
+
         Returns:
             A list of training results, each containing:
             {
@@ -450,7 +450,7 @@ class LLM:
                 'loss': None,  # Will be populated once loss computation is implemented
                 'num_tokens': int,
             }
-        
+
         Example:
             >>> llm = LLM(model="meta-llama/Llama-3.2-1B-Instruct")
             >>> # SFTTrainer-compatible format
@@ -468,68 +468,66 @@ class LLM:
         if not envs.VLLM_USE_V1:
             raise NotImplementedError(
                 "Training API is only supported in V1 engine. "
-                "Set VLLM_USE_V1=1 to enable it."
-            )
-        
+                "Set VLLM_USE_V1=1 to enable it.")
+
         # Handle LoRA configuration
         # User can provide either lora_request OR (lora_path + lora_name + lora_int_id)
-        if lora_request is not None and any([lora_path, lora_name, lora_int_id]):
+        if lora_request is not None and any(
+            [lora_path, lora_name, lora_int_id]):
             raise ValueError(
                 "Cannot provide both 'lora_request' and individual LoRA parameters "
-                "(lora_path, lora_name, lora_int_id). Use one or the other."
-            )
-        
+                "(lora_path, lora_name, lora_int_id). Use one or the other.")
+
         # Create LoRARequest from individual parameters if provided
         if lora_path is not None:
             if lora_name is None or lora_int_id is None:
                 raise ValueError(
                     "If 'lora_path' is provided, must also provide "
-                    "'lora_name' and 'lora_int_id'."
-                )
+                    "'lora_name' and 'lora_int_id'.")
             lora_request = LoRARequest(
                 lora_name=lora_name,
                 lora_int_id=lora_int_id,
                 lora_path=lora_path,
             )
-        
+
         # Convert single example to list
         if isinstance(training_data, dict):
             training_data = [training_data]
-        
+
         # Validate training data
         for i, example in enumerate(training_data):
             has_text = 'text' in example
             has_messages = 'messages' in example
             has_prompt = 'prompt' in example or 'prompt_token_ids' in example
-            
+
             if not (has_text or has_messages or has_prompt):
                 raise ValueError(
                     f"Training example {i} must have one of: "
                     "'text' (SFTTrainer format), 'messages' (chat format), "
-                    "or 'prompt'/'prompt_token_ids' (legacy format)"
-                )
-        
+                    "or 'prompt'/'prompt_token_ids' (legacy format)")
+
         # Add training requests to the engine and collect their IDs
         request_ids = self._add_training_requests(
             training_data=training_data,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
         )
-        
+
         # Run the engine to process training requests
         outputs = self._run_engine(use_tqdm=use_tqdm)
-        
+
         # Collect training losses from outputs
         # Create a mapping from request_id to output
         output_map = {output.request_id: output for output in outputs}
-        
+
         tokenizer = self.get_tokenizer()
         results = []
         for req_id, example in zip(request_ids, training_data):
             # Get the output for this request
             output = output_map.get(req_id)
-            training_loss = output.training_loss if output and hasattr(output, 'training_loss') else None
-            
+            training_loss = output.training_loss if output and hasattr(
+                output, 'training_loss') else None
+
             # Calculate num_tokens based on the format
             if 'text' in example:
                 num_tokens = len(tokenizer.encode(example['text']))
@@ -541,20 +539,21 @@ class LLM:
                 )
                 num_tokens = len(tokenizer.encode(text))
             elif 'labels' in example:
-                num_tokens = len(example['labels']) if isinstance(example['labels'], list) else len(example['labels'])
+                num_tokens = len(example['labels']) if isinstance(
+                    example['labels'], list) else len(example['labels'])
             elif 'prompt_token_ids' in example:
                 num_tokens = len(example['prompt_token_ids'])
             elif 'prompt' in example:
                 num_tokens = len(tokenizer.encode(example['prompt']))
             else:
                 num_tokens = 0
-                
+
             results.append({
                 'request_id': req_id,
                 'loss': training_loss,
                 'num_tokens': num_tokens,
             })
-        
+
         return results
 
     def _get_modality_specific_lora_reqs(
@@ -1723,7 +1722,7 @@ class LLM:
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
         )
-    
+
     def _add_training_requests(
         self,
         training_data: Sequence[dict[str, Any]],
@@ -1732,28 +1731,29 @@ class LLM:
         lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
     ) -> list[str]:
         """Validate and add training requests to the engine.
-        
+
         Processes training data in SFTTrainer-compatible format.
-        
+
         Returns:
             List of request IDs for the added training requests.
         """
         from vllm.v1.request import TrainingConfig
-        
+
         num_requests = len(training_data)
-        if isinstance(lora_request, Sequence) and len(lora_request) != num_requests:
+        if isinstance(lora_request,
+                      Sequence) and len(lora_request) != num_requests:
             raise ValueError("The lengths of training_data and lora_request "
                              "must be the same.")
-        
+
         # Add requests to the engine
         it = training_data
         if use_tqdm:
             tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
             it = tqdm_func(it, desc="Adding training requests")
-        
+
         tokenizer = self.get_tokenizer()
         request_ids = []
-        
+
         for i, example in enumerate(it):
             # Process example based on format
             # Format 1: 'text' field (SFTTrainer standard)
@@ -1761,9 +1761,11 @@ class LLM:
                 text = example['text']
                 prompt_token_ids = tokenizer.encode(text)
                 # For causal LM, labels = input_ids (standard practice)
-                labels = torch.tensor(prompt_token_ids, dtype=torch.long, device='cpu')
+                labels = torch.tensor(prompt_token_ids,
+                                      dtype=torch.long,
+                                      device='cpu')
                 prompt = {'prompt_token_ids': prompt_token_ids}
-            
+
             # Format 2: 'messages' field (chat format)
             elif 'messages' in example:
                 # Apply chat template to convert to text
@@ -1773,31 +1775,38 @@ class LLM:
                     tokenize=False,
                 )
                 prompt_token_ids = tokenizer.encode(text)
-                labels = torch.tensor(prompt_token_ids, dtype=torch.long, device='cpu')
+                labels = torch.tensor(prompt_token_ids,
+                                      dtype=torch.long,
+                                      device='cpu')
                 prompt = {'prompt_token_ids': prompt_token_ids}
-            
+
             # Format 3: Legacy 'prompt' + 'labels' format
             elif 'prompt' in example or 'prompt_token_ids' in example:
                 if 'prompt' in example:
                     prompt = example['prompt']
-                    prompt_token_ids = tokenizer.encode(prompt) if isinstance(prompt, str) else None
+                    prompt_token_ids = tokenizer.encode(prompt) if isinstance(
+                        prompt, str) else None
                 else:
                     prompt = {'prompt_token_ids': example['prompt_token_ids']}
                     prompt_token_ids = example['prompt_token_ids']
-                
+
                 # If labels provided, use them; otherwise use prompt tokens
                 if 'labels' in example:
                     labels = example['labels']
                     if isinstance(labels, list):
-                        labels = torch.tensor(labels, dtype=torch.long, device='cpu')
+                        labels = torch.tensor(labels,
+                                              dtype=torch.long,
+                                              device='cpu')
                 else:
                     # Default: labels = input tokens (causal LM standard)
                     if prompt_token_ids is None:
                         prompt_token_ids = example['prompt_token_ids']
-                    labels = torch.tensor(prompt_token_ids, dtype=torch.long, device='cpu')
+                    labels = torch.tensor(prompt_token_ids,
+                                          dtype=torch.long,
+                                          device='cpu')
             else:
                 raise ValueError(f"Training example {i} has invalid format")
-            
+
             # Determine which LoRA request to use for this example
             current_lora_request = None
             if lora_request is not None:
@@ -1805,7 +1814,7 @@ class LLM:
                     current_lora_request = lora_request[i]
                 else:
                     current_lora_request = lora_request
-            
+
             # Create training config with LoRA request
             training_config = TrainingConfig(
                 labels=labels,
@@ -1813,7 +1822,7 @@ class LLM:
                 loss_fn="cross_entropy",
                 lora_request=current_lora_request,
             )
-            
+
             # Add training request and collect its ID
             req_id = self._add_training_request(
                 prompt=prompt,
@@ -1821,9 +1830,9 @@ class LLM:
                 lora_request=current_lora_request,
             )
             request_ids.append(req_id)
-        
+
         return request_ids
-    
+
     def _add_training_request(
         self,
         prompt: PromptType,
@@ -1831,14 +1840,14 @@ class LLM:
         lora_request: Optional[LoRARequest] = None,
     ) -> str:
         """Add a single training request to the engine.
-        
+
         Returns:
             The request ID of the added training request.
         """
         from vllm.v1.request import Request
-        
+
         request_id = str(next(self.request_counter))
-        
+
         # For V1 engine, we need to create a Request object directly
         # and add it to the scheduler
         if envs.VLLM_USE_V1:
@@ -1853,14 +1862,15 @@ class LLM:
                     tokenizer = self.get_tokenizer()
                     prompt_token_ids = tokenizer.encode(prompt['prompt'])
                 else:
-                    raise ValueError("Prompt dict must have 'prompt' or 'prompt_token_ids'")
+                    raise ValueError(
+                        "Prompt dict must have 'prompt' or 'prompt_token_ids'")
             else:
                 raise ValueError(f"Unsupported prompt type: {type(prompt)}")
-            
+
             # Get EOS token ID
             tokenizer = self.get_tokenizer()
             eos_token_id = tokenizer.eos_token_id
-            
+
             # Load LoRA adapter if provided
             if lora_request is not None:
                 # Access the model runner to load the LoRA adapter
@@ -1875,9 +1885,8 @@ class LLM:
                 else:
                     raise NotImplementedError(
                         "Training with async/multiprocess engine not yet supported. "
-                        "Please use the synchronous LLM class with V1 engine."
-                    )
-                
+                        "Please use the synchronous LLM class with V1 engine.")
+
                 # Add the LoRA adapter to the model runner
                 # This loads the adapter weights from disk if not already loaded
                 if hasattr(model_runner, 'add_lora'):
@@ -1885,9 +1894,8 @@ class LLM:
                 else:
                     raise RuntimeError(
                         "LoRA is not enabled. Please initialize the LLM with "
-                        "enable_lora=True and max_loras > 0."
-                    )
-            
+                        "enable_lora=True and max_loras > 0.")
+
             # Create the training request
             training_request = Request(
                 request_id=request_id,
@@ -1899,15 +1907,17 @@ class LLM:
                 training_config=training_config,
                 lora_request=lora_request,
             )
-            
+
             # Add to output processor first (needed for get_num_unfinished_requests)
-            prompt_str = prompt if isinstance(prompt, str) else str(prompt_token_ids)
-            self.llm_engine.output_processor.add_request(training_request, prompt_str, None, 0)
-            
+            prompt_str = prompt if isinstance(prompt,
+                                              str) else str(prompt_token_ids)
+            self.llm_engine.output_processor.add_request(
+                training_request, prompt_str, None, 0)
+
             # Then add to scheduler for execution
             # For V1, the engine has engine_core which contains the actual EngineCore
             engine_core_client = self.llm_engine.engine_core
-            
+
             # Access the actual EngineCore (unwrap from InprocClient)
             if hasattr(engine_core_client, 'engine_core'):
                 # InprocClient case
@@ -1920,11 +1930,10 @@ class LLM:
                 # For async/multiprocess case
                 raise NotImplementedError(
                     "Training with async/multiprocess engine not yet supported. "
-                    "Please use the synchronous LLM class with V1 engine."
-                )
+                    "Please use the synchronous LLM class with V1 engine.")
         else:
             raise NotImplementedError("Training only supported in V1 engine")
-        
+
         return request_id
 
     def _run_engine(

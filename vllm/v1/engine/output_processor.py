@@ -153,7 +153,7 @@ class RequestState:
             top_p = None
             n = None
             temperature = None
-            
+
             # Training requests don't have pooling_params or sampling_params
             if hasattr(request, 'is_training') and request.is_training:
                 output_kind = RequestOutputKind.FINAL_ONLY
@@ -206,8 +206,9 @@ class RequestState:
 
         # Training requests don't have detokenizer - return special output with loss
         if self.detokenizer is None:
-            return self._new_training_output(request_id, finished, training_loss)
-        
+            return self._new_training_output(request_id, finished,
+                                             training_loss)
+
         output = self._new_completion_output(new_token_ids, finish_reason,
                                              stop_reason)
 
@@ -295,7 +296,7 @@ class RequestState:
     ) -> PoolingOutput:
 
         return PoolingOutput(data=pooling_output)
-    
+
     def _new_training_output(
         self,
         request_id: str,

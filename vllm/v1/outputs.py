@@ -113,7 +113,7 @@ class ModelRunnerOutput:
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: Optional[dict[str, int]] = None
-    
+
     # req_id -> loss (for training requests)
     training_losses: Optional[dict[str, Optional[float]]] = None
 

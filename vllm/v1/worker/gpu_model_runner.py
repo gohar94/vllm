@@ -2045,15 +2045,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         # Detect if this batch contains any training requests
         has_training_requests = any(
-            req.is_training for req in scheduler_output.scheduled_new_reqs
-        )
-        
+            req.is_training for req in scheduler_output.scheduled_new_reqs)
+
         if has_training_requests:
             # Dispatch to training execution (without @torch.inference_mode)
-            return self.execute_model_training(scheduler_output, intermediate_tensors)
+            return self.execute_model_training(scheduler_output,
+                                               intermediate_tensors)
         else:
             # Dispatch to inference execution (with @torch.inference_mode)
-            return self.execute_model_inference(scheduler_output, intermediate_tensors)
+            return self.execute_model_inference(scheduler_output,
+                                                intermediate_tensors)
 
     @torch.inference_mode()
     def execute_model_inference(
@@ -2348,7 +2349,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("ComputeLoss"):
             # For training, model_output should be hidden states
             hidden_states = model_output
-            
+
             # Handle pipeline parallelism
             if not get_pp_group().is_last_rank:
                 # Return the intermediate tensors for next PP stage
@@ -2358,66 +2359,67 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Compute logits for loss calculation
             # For training, we typically need logits for all tokens, not just sampled ones
             logits = self.model.compute_logits(hidden_states, None)
-            
+
             # Collect losses for each training request
             losses = {}
             req_ids_output = []
             req_id_to_index = {}
-            
+
             offset = 0
             for i, req_id in enumerate(self.input_batch.req_ids):
                 if req_id is None:
                     continue
-                    
+
                 req_state = self.requests.get(req_id)
                 if req_state is None or not req_state.is_training:
                     continue
-                
+
                 # Get the number of tokens for this request
-                num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                num_tokens = scheduler_output.num_scheduled_tokens.get(
+                    req_id, 0)
                 if num_tokens == 0:
                     continue
-                
+
                 # Extract logits and labels for this request
                 request_logits = logits[offset:offset + num_tokens]
-                
+
                 # Get labels from training config
                 training_config = req_state.training_config
                 if training_config is not None and training_config.labels is not None:
                     labels = training_config.labels
-                    
+
                     # Convert labels to tensor if needed and move to device
                     if not isinstance(labels, torch.Tensor):
-                        labels = torch.tensor(labels, dtype=torch.long, device=self.device)
+                        labels = torch.tensor(labels,
+                                              dtype=torch.long,
+                                              device=self.device)
                     else:
                         labels = labels.to(self.device)
-                    
+
                     # Ensure labels are the right length
                     if len(labels) != num_tokens:
                         logger.warning(
                             f"Label length mismatch for request {req_id}: "
-                            f"expected {num_tokens}, got {len(labels)}"
-                        )
+                            f"expected {num_tokens}, got {len(labels)}")
                         offset += num_tokens
                         continue
-                    
+
                     # Compute cross-entropy loss
                     # Shift logits and labels for next-token prediction
                     # logits: [seq_len, vocab_size], labels: [seq_len]
                     shift_logits = request_logits[:-1, :].contiguous()
                     shift_labels = labels[1:].contiguous()
-                    
+
                     loss_fct = torch.nn.CrossEntropyLoss()
                     loss = loss_fct(
                         shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)
-                    )
-                    
+                        shift_labels.view(-1))
+
                     losses[req_id] = loss.item()
                 else:
                     # No labels provided, cannot compute loss
                     losses[req_id] = None
-                
+
                 req_ids_output.append(req_id)
                 req_id_to_index[req_id] = len(req_ids_output) - 1
                 offset += num_tokens
