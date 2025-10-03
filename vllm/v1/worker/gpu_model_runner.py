@@ -581,6 +581,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                is_training=new_req_data.is_training,
+                training_config=new_req_data.training_config,
             )
             self.requests[req_id] = req_state
 
@@ -2027,8 +2029,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             invalid_req_indices,
         )
 
-    @torch.inference_mode()
     def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        """Execute model - dispatches to training or inference based on request type.
+        
+        Args:
+            scheduler_output: Output from the scheduler
+            intermediate_tensors: Intermediate tensors from previous pipeline stage
+            
+        Returns:
+            ModelRunnerOutput (or async wrapper) or IntermediateTensors for PP
+        """
+        # Detect if this batch contains any training requests
+        has_training_requests = any(
+            req.is_training for req in scheduler_output.scheduled_new_reqs
+        )
+        
+        if has_training_requests:
+            # Dispatch to training execution (without @torch.inference_mode)
+            return self.execute_model_training(scheduler_output, intermediate_tensors)
+        else:
+            # Dispatch to inference execution (with @torch.inference_mode)
+            return self.execute_model_inference(scheduler_output, intermediate_tensors)
+
+    @torch.inference_mode()
+    def execute_model_inference(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
@@ -2232,6 +2260,180 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampled_token_ids=sampler_output.sampled_token_ids,
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
+        )
+
+    def execute_model_training(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> ModelRunnerOutput:
+        """Execute model for training requests.
+        
+        This is a specialized version of execute_model that:
+        1. Does NOT use torch.inference_mode() decorator
+        2. Skips KV cache allocation and management
+        3. Skips sampling and token generation
+        4. Computes and returns training loss
+        5. Enables gradient computation for backward pass
+        
+        Args:
+            scheduler_output: Output from the scheduler containing training requests
+            intermediate_tensors: Intermediate tensors from previous pipeline stage
+            
+        Returns:
+            ModelRunnerOutput with training losses instead of sampled tokens
+        """
+        with record_function_or_nullcontext("Preprocess"):
+            self._update_states(scheduler_output)
+            if not scheduler_output.total_num_scheduled_tokens:
+                # Return empty output if there's no work to do.
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+            if self.prepare_inputs_event is not None:
+                # Ensure prior step has finished with reused CPU tensors.
+                self.prepare_inputs_event.synchronize()
+            try:
+                # Prepare the decoder inputs.
+                # Note: For training, we still need attention metadata for the forward pass
+                (attn_metadata, logits_indices, spec_decode_metadata,
+                 num_scheduled_tokens_np, spec_decode_common_attn_metadata,
+                 max_query_len, ubatch_slices, num_tokens_after_padding
+                 ) = self._prepare_inputs(scheduler_output)
+
+            finally:
+                if self.prepare_inputs_event is not None:
+                    self.prepare_inputs_event.record()
+
+            (
+                num_scheduled_tokens,
+                num_input_tokens,
+                num_tokens_across_dp,
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
+                model_kwargs,
+            ) = self._preprocess(scheduler_output, intermediate_tensors,
+                                 ubatch_slices, num_tokens_after_padding)
+
+            if ubatch_slices is not None:
+                num_input_tokens = num_input_tokens // 2
+
+            uniform_decode = False  # Training always uses non-uniform decode
+            batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
+                                               uniform_decode=uniform_decode)
+            cudagraph_runtime_mode, batch_descriptor = \
+                self.cudagraph_dispatcher.dispatch(batch_descriptor)
+
+        # Run the model WITHOUT torch.inference_mode() to enable gradients
+        with (set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+                ubatch_slices=ubatch_slices,
+        ), record_function_or_nullcontext("Forward")):
+            # Enable gradient computation for training
+            with torch.enable_grad():
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+
+        with record_function_or_nullcontext("ComputeLoss"):
+            # For training, model_output should be hidden states
+            hidden_states = model_output
+            
+            # Handle pipeline parallelism
+            if not get_pp_group().is_last_rank:
+                # Return the intermediate tensors for next PP stage
+                assert isinstance(hidden_states, IntermediateTensors)
+                return hidden_states
+
+            # Compute logits for loss calculation
+            # For training, we typically need logits for all tokens, not just sampled ones
+            logits = self.model.compute_logits(hidden_states, None)
+            
+            # Collect losses for each training request
+            losses = {}
+            req_ids_output = []
+            req_id_to_index = {}
+            
+            offset = 0
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                if req_id is None:
+                    continue
+                    
+                req_state = self.requests.get(req_id)
+                if req_state is None or not req_state.is_training:
+                    continue
+                
+                # Get the number of tokens for this request
+                num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                if num_tokens == 0:
+                    continue
+                
+                # Extract logits and labels for this request
+                request_logits = logits[offset:offset + num_tokens]
+                
+                # Get labels from training config
+                training_config = req_state.training_config
+                if training_config is not None and training_config.labels is not None:
+                    labels = training_config.labels
+                    
+                    # Convert labels to tensor if needed and move to device
+                    if not isinstance(labels, torch.Tensor):
+                        labels = torch.tensor(labels, dtype=torch.long, device=self.device)
+                    else:
+                        labels = labels.to(self.device)
+                    
+                    # Ensure labels are the right length
+                    if len(labels) != num_tokens:
+                        logger.warning(
+                            f"Label length mismatch for request {req_id}: "
+                            f"expected {num_tokens}, got {len(labels)}"
+                        )
+                        offset += num_tokens
+                        continue
+                    
+                    # Compute cross-entropy loss
+                    # Shift logits and labels for next-token prediction
+                    # logits: [seq_len, vocab_size], labels: [seq_len]
+                    shift_logits = request_logits[:-1, :].contiguous()
+                    shift_labels = labels[1:].contiguous()
+                    
+                    loss_fct = torch.nn.CrossEntropyLoss()
+                    loss = loss_fct(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    )
+                    
+                    losses[req_id] = loss.item()
+                else:
+                    # No labels provided, cannot compute loss
+                    losses[req_id] = None
+                
+                req_ids_output.append(req_id)
+                req_id_to_index[req_id] = len(req_ids_output) - 1
+                offset += num_tokens
+
+        # Return training output
+        # Note: For training, we don't have sampled_token_ids or logprobs
+        return ModelRunnerOutput(
+            req_ids=req_ids_output,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=None,  # No sampling for training
+            logprobs=None,  # No logprobs for training
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=None,
+            num_nans_in_logits={},
+            training_losses=losses,  # Add training losses to output
         )
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:

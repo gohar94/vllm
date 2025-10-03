@@ -234,6 +234,36 @@ class LLMEngine:
                                               parent_req, idx)
             # Add the request to EngineCore.
             self.engine_core.add_request(child_request)
+    
+    def add_training_request(
+        self,
+        request_id: str,
+        prompt: PromptType,
+        training_config: "TrainingConfig",
+        arrival_time: Optional[float] = None,
+        lora_request: Optional[LoRARequest] = None,
+        tokenization_kwargs: Optional[dict[str, Any]] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        priority: int = 0,
+    ) -> None:
+        """Add a training request to the engine."""
+        # Validate the request_id type.
+        if not isinstance(request_id, str):
+            raise TypeError(
+                f"request_id must be a string, got {type(request_id)}")
+        
+        # Process raw inputs into the request (training requests don't have params)
+        prompt_str, request = self.processor.process_inputs(
+            request_id, prompt, None, arrival_time, lora_request,
+            tokenization_kwargs, trace_headers, priority)
+        
+        # Mark as training request and add training config
+        request.is_training = True
+        request.training_config = training_config
+        
+        # Add to output processor and engine core
+        self.output_processor.add_request(request, prompt_str, None, 0)
+        self.engine_core.add_request(request)
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
 
