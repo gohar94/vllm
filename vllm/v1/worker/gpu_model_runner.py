@@ -2500,8 +2500,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             hidden_states = hidden_states.detach().requires_grad_(True)
             
             # Process each layer with LoRA-enabled attention
-            for layer_idx in range(len(self.model.layers)):
-                layer = self.model.layers[layer_idx]
+            for layer_idx in range(len(self.model.model.layers)):
+                layer = self.model.model.layers[layer_idx]
                 
                 # Input layernorm
                 normed_hidden = layer.input_layernorm(hidden_states)
@@ -2530,7 +2530,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 hidden_states = hidden_states + mlp_output
             
             # Final layer norm
-            hidden_states = self.model.final_layernorm(hidden_states)
+            hidden_states = self.model.model.norm(hidden_states)
             
             # Apply lm_head LoRA to get logits
             logits = self.lora_attention_training_manager.apply_lm_head_lora(hidden_states)
@@ -2581,6 +2581,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Optimizer step
                 self.lora_attention_training_manager.optimizer.step()
                 self.lora_attention_training_manager.optimizer.zero_grad()
+                
+                # Store training results
+                total_loss_value = total_loss.item()
+                training_stats = {
+                    "num_requests": len(training_losses),
+                    "avg_loss": total_loss_value / len(training_losses),
+                    "total_loss": total_loss_value,
+                    "individual_losses": {f"req_{i}": float(loss) for i, loss in enumerate(training_losses.values())},
+                }
+                
+                if not hasattr(self.lora_attention_training_manager, '_last_training_stats'):
+                    self.lora_attention_training_manager._last_training_stats = []
+                self.lora_attention_training_manager._last_training_stats.append(training_stats)
                 
                 print(f"[DEBUG model_runner] Training step complete")
         

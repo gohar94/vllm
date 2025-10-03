@@ -474,19 +474,19 @@ class LLM:
         # Results are retrieved from LoRATrainingManager instead
         print(f"[DEBUG llm.train] _run_engine() completed, fetching results from LoRA manager...")
         
-        # Get results from LoRA training manager
-        # The LoRA manager stores losses after each training batch
+        # Get results from LoRA attention training manager
+        # The LoRA attention manager stores losses after each training batch
         worker = self.llm_engine.model_executor.driver_worker
-        lora_manager = worker.lora_training_manager
+        lora_attention_manager = worker.model_runner.lora_attention_training_manager
         
         # Retrieve training results
-        # The LoRA manager processes training during engine execution
+        # The LoRA attention manager processes training during engine execution
         # We can access the loss history
         results = []
         
-        # Get loss history from LoRA training manager
-        if hasattr(lora_manager, '_last_training_stats'):
-            stats_list = lora_manager._last_training_stats
+        # Get loss history from LoRA attention training manager
+        if hasattr(lora_attention_manager, '_last_training_stats'):
+            stats_list = lora_attention_manager._last_training_stats
             for stats in stats_list:
                 for req_id, loss in stats.get('individual_losses', {}).items():
                     results.append({

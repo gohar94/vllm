@@ -136,14 +136,23 @@ class LoRAAttention(torch.autograd.Function):
         v = v_base + v_lora_delta  # Gradients flow through v_lora
         # k stays as base (no LoRA)
         
+        # For GQA, we need to ensure q has the same number of heads as k/v
+        # If num_heads > num_kv_heads, we need to repeat k and v to match q
+        if num_heads > num_kv_heads:
+            # Repeat k and v to match the number of query heads
+            repeat_factor = num_heads // num_kv_heads
+            k = k.repeat_interleave(repeat_factor, dim=-1)
+            v = v.repeat_interleave(repeat_factor, dim=-1)
+        
         # 3. Apply RoPE (frozen)
         with torch.no_grad():
             q, k = base_rotary_emb(positions, q, k)
         
         # 4. Reshape for xformers attention
         q = q.view(seq_len, num_heads, head_dim)
-        k = k.view(seq_len, num_kv_heads, head_dim)
-        v = v.view(seq_len, num_kv_heads, head_dim)
+        # For GQA, k and v should have the same number of heads as q after repetition
+        k = k.view(seq_len, num_heads, head_dim)
+        v = v.view(seq_len, num_heads, head_dim)
         
         # 5. Attention with gradient support (no KV cache!)
         # Add batch dimension for xformers: [1, seq_len, num_heads, head_dim]
@@ -170,13 +179,15 @@ class LoRAAttention(torch.autograd.Function):
         with torch.no_grad():
             final_output, _ = base_o_proj(output)
         
-        # Save for backward
-        ctx.save_for_backward(q, k, v, output.unsqueeze(0), lse, hidden_states)
+        # Save for backward - need to reshape output to match query shape
+        output_reshaped = output.view(1, seq_len, num_heads, head_dim)
+        ctx.save_for_backward(q, k, v, output_reshaped, lse, hidden_states)
         ctx.q_lora = q_lora
         ctx.v_lora = v_lora
         ctx.scale = scale
         ctx.num_heads = num_heads
         ctx.head_dim = head_dim
+        ctx.seq_len = seq_len
         
         return final_output
     
@@ -410,6 +421,12 @@ class LoRAAttentionTrainingManager:
         }
         
         return lora_weights
+    
+    def get_training_results(self) -> Optional[Dict[str, float]]:
+        """Get the latest training results."""
+        if hasattr(self, '_last_training_stats') and self._last_training_stats:
+            return self._last_training_stats[-1]
+        return None
     
     def save_checkpoint(self, path: str):
         """Save LoRA checkpoint to disk."""
