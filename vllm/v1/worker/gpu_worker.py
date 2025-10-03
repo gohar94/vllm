@@ -224,6 +224,40 @@ class Worker(WorkerBase):
         # Store reference on model_runner so it can be called from within execute_model
         # This is CRITICAL: LoRA training must be called while still in enable_grad() context
         self.model_runner.lora_training_manager = self.lora_training_manager
+        
+        # Construct the LoRA Attention Training Manager (for q_proj/v_proj training)
+        # This is optional - only create if we want attention LoRA training
+        # TODO: Make this configurable via environment variable or config
+        if os.environ.get('VLLM_ENABLE_ATTENTION_LORA_TRAINING', '0') == '1':
+            from vllm.v1.worker.lora_attention_training_manager import LoRAAttentionTrainingManager
+            
+            # Get attention config from model
+            hf_config = model_config.hf_config
+            num_layers = hf_config.num_hidden_layers
+            num_heads = hf_config.num_attention_heads
+            num_kv_heads = getattr(hf_config, 'num_key_value_heads', num_heads)
+            head_dim = model_config.get_hidden_size() // num_heads
+            
+            self.lora_attention_training_manager = LoRAAttentionTrainingManager(
+                model_runner=self.model_runner,
+                num_layers=num_layers,
+                hidden_size=model_config.get_hidden_size(),
+                vocab_size=model_config.get_vocab_size(),
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                lora_rank=8,  # TODO: Make configurable
+                lora_alpha=16.0,  # TODO: Make configurable
+                learning_rate=2e-4,  # TODO: Make configurable
+            )
+            
+            # Store reference on model_runner
+            self.model_runner.lora_attention_training_manager = self.lora_attention_training_manager
+            
+            if self.rank == 0:
+                from vllm.logger import init_logger
+                logger = init_logger(__name__)
+                logger.info("LoRA Attention Training enabled for q_proj, v_proj, lm_head")
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

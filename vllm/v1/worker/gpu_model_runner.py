@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 from typing_extensions import TypeAlias
 
@@ -2094,29 +2095,49 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
-        # Check if this batch contains training requests
-        # For now, assume homogeneous batches (all inference OR all training)
-        has_training_requests = any(
-            req.is_training 
-            for req in scheduler_output.scheduled_new_reqs
-        )
+        # Check batch composition
+        training_reqs = [req for req in scheduler_output.scheduled_new_reqs if req.is_training]
+        inference_reqs = [req for req in scheduler_output.scheduled_new_reqs if not req.is_training]
         
-        print(f"[DEBUG model_runner] execute_model: has_training_requests={has_training_requests}")
-        print(f"[DEBUG model_runner] scheduled_new_reqs count: {len(scheduler_output.scheduled_new_reqs)}")
+        has_training = len(training_reqs) > 0
+        has_inference = len(inference_reqs) > 0
         
-        # Use inference_mode for pure inference batches (better performance + safety)
-        # For training batches, use enable_grad
-        if not has_training_requests:
-            # Pure inference: use inference_mode for maximum performance and safety
-            with torch.inference_mode():
+        print(f"[DEBUG model_runner] execute_model: training={len(training_reqs)}, inference={len(inference_reqs)}")
+        
+        # Route to appropriate execution path
+        if has_training and has_inference:
+            # Mixed batch - check if we support it
+            if hasattr(self, 'lora_attention_training_manager'):
+                # Attention LoRA training requires homogeneous batches
+                raise ValueError(
+                    f"Mixed inference/training batches not supported for attention LoRA training. "
+                    f"Got {len(training_reqs)} training and {len(inference_reqs)} inference requests. "
+                    f"Please ensure scheduler creates homogeneous batches."
+                )
+            else:
+                # lm_head-only training supports mixed batches
                 return self._execute_model_impl(
-                    scheduler_output, intermediate_tensors, has_training_requests
+                    scheduler_output, intermediate_tensors, has_training_requests=True
+                )
+        elif has_training:
+            # Pure training batch
+            if hasattr(self, 'lora_attention_training_manager'):
+                # Use attention LoRA training path
+                print(f"[DEBUG model_runner] Routing to attention LoRA training path")
+                return self._execute_training_batch_with_attention_lora(
+                    scheduler_output, intermediate_tensors
+                )
+            else:
+                # Use lm_head-only training path
+                return self._execute_model_impl(
+                    scheduler_output, intermediate_tensors, has_training_requests=True
                 )
         else:
-            # Training: use enable_grad
-            return self._execute_model_impl(
-                scheduler_output, intermediate_tensors, has_training_requests
-            )
+            # Pure inference batch: use inference_mode for maximum performance
+            with torch.inference_mode():
+                return self._execute_model_impl(
+                    scheduler_output, intermediate_tensors, has_training_requests=False
+                )
     
     def _execute_model_impl(
         self,
@@ -2418,6 +2439,163 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             token_offset += num_tokens
         
         return training_hidden_states
+    
+    def _execute_training_batch_with_attention_lora(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors],
+    ) -> ModelRunnerOutput:
+        """
+        Training-specific forward pass with LoRA on q_proj, v_proj, and lm_head.
+        
+        Uses gradient-enabled attention (xformers) and applies LoRA at each layer.
+        No KV cache is used (not needed for training).
+        
+        This path requires homogeneous training batches.
+        """
+        print(f"[DEBUG model_runner] _execute_training_batch_with_attention_lora")
+        
+        with record_function_or_nullcontext("Preprocess"):
+            self._update_states(scheduler_output)
+            if not scheduler_output.total_num_scheduled_tokens:
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            
+            if self.prepare_inputs_event is not None:
+                self.prepare_inputs_event.synchronize()
+            
+            try:
+                # Prepare inputs (same as inference)
+                (attn_metadata, logits_indices, spec_decode_metadata,
+                 num_scheduled_tokens_np, spec_decode_common_attn_metadata,
+                 max_query_len, ubatch_slices, num_tokens_after_padding
+                 ) = self._prepare_inputs(scheduler_output)
+            finally:
+                if self.prepare_inputs_event is not None:
+                    self.prepare_inputs_event.record()
+            
+            (
+                num_scheduled_tokens,
+                num_input_tokens,
+                num_tokens_across_dp,
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
+                model_kwargs,
+            ) = self._preprocess(scheduler_output, intermediate_tensors,
+                                 ubatch_slices, num_tokens_after_padding)
+        
+        # Training forward pass with gradients
+        with torch.enable_grad():
+            print(f"[DEBUG model_runner] Starting training forward with {num_input_tokens} tokens")
+            
+            # Get embeddings (no gradients needed for base embeddings)
+            with torch.no_grad():
+                if inputs_embeds is not None:
+                    hidden_states = inputs_embeds
+                else:
+                    hidden_states = self.model.get_input_embeddings(input_ids)
+            
+            # Detach and enable gradients for LoRA
+            hidden_states = hidden_states.detach().requires_grad_(True)
+            
+            # Process each layer with LoRA-enabled attention
+            for layer_idx in range(len(self.model.layers)):
+                layer = self.model.layers[layer_idx]
+                
+                # Input layernorm
+                normed_hidden = layer.input_layernorm(hidden_states)
+                
+                # Attention with LoRA (gradient-enabled, no KV cache)
+                if hasattr(self, 'lora_attention_training_manager'):
+                    attn_output = self.lora_attention_training_manager.forward_layer_with_lora(
+                        layer_idx=layer_idx,
+                        hidden_states=normed_hidden,
+                        positions=positions,
+                        base_layer=layer,
+                    )
+                else:
+                    raise RuntimeError(
+                        "lora_attention_training_manager not initialized. "
+                        "Please set it in gpu_worker.py"
+                    )
+                
+                # Residual connection
+                hidden_states = hidden_states + attn_output
+                
+                # MLP (no LoRA here, using base MLP)
+                mlp_input = layer.post_attention_layernorm(hidden_states)
+                with torch.no_grad():
+                    mlp_output = layer.mlp(mlp_input)
+                hidden_states = hidden_states + mlp_output
+            
+            # Final layer norm
+            hidden_states = self.model.final_layernorm(hidden_states)
+            
+            # Apply lm_head LoRA to get logits
+            logits = self.lora_attention_training_manager.apply_lm_head_lora(hidden_states)
+            
+            # Compute loss for training requests
+            training_losses = {}
+            total_loss = None
+            token_offset = 0
+            
+            for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+                req_state = self.requests.get(req_id)
+                
+                if not req_state or not req_state.is_training:
+                    token_offset += num_tokens
+                    continue
+                
+                # Extract logits and labels for this request
+                req_logits = logits[token_offset:token_offset + num_tokens]
+                
+                if req_state.training_config and req_state.training_config.labels is not None:
+                    labels = req_state.training_config.labels.to(req_logits.device)
+                    
+                    # Causal LM loss: predict next token
+                    if len(labels) >= num_tokens and num_tokens > 1:
+                        shift_logits = req_logits[:-1, :]
+                        shift_labels = labels[1:num_tokens]
+                        
+                        loss = F.cross_entropy(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                            ignore_index=-100,
+                        )
+                        
+                        training_losses[req_id] = loss.item()
+                        
+                        if total_loss is None:
+                            total_loss = loss
+                        else:
+                            total_loss = total_loss + loss
+                
+                token_offset += num_tokens
+            
+            # Backward pass
+            if total_loss is not None:
+                print(f"[DEBUG model_runner] Computing gradients, loss={total_loss.item():.4f}")
+                total_loss.backward()
+                
+                # Optimizer step
+                self.lora_attention_training_manager.optimizer.step()
+                self.lora_attention_training_manager.optimizer.zero_grad()
+                
+                print(f"[DEBUG model_runner] Training step complete")
+        
+        # Return output (no sampling for training)
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        req_id_to_index = {req_id: i for i, req_id in enumerate(req_ids)}
+        
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[] for _ in req_ids],
+            logprobs=[[] for _ in req_ids],
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
     
     def _process_training_outputs(
         self,
