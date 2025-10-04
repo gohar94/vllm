@@ -32,6 +32,8 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, ModelRunnerOutput)
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.training_manager import TrainingManager
+from vllm.v1.worker.lora_training_manager import LoRATrainingManager
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 
@@ -201,6 +203,61 @@ class Worker(WorkerBase):
         # Construct the model runner
         self.model_runner: GPUModelRunner = GPUModelRunner(
             self.vllm_config, self.device)
+        
+        # Construct the training manager (monitoring only)
+        self.training_manager: TrainingManager = TrainingManager(
+            model_runner=self.model_runner,
+        )
+        
+        # Construct the LoRA training manager (actual training)
+        # Get model dimensions from config
+        model_config = self.vllm_config.model_config
+        self.lora_training_manager: LoRATrainingManager = LoRATrainingManager(
+            model_runner=self.model_runner,
+            hidden_size=model_config.get_hidden_size(),
+            vocab_size=model_config.get_vocab_size(),
+            lora_rank=8,  # TODO: Make configurable
+            lora_alpha=16.0,  # TODO: Make configurable
+            learning_rate=1e-4,  # TODO: Make configurable
+        )
+        
+        # Store reference on model_runner so it can be called from within execute_model
+        # This is CRITICAL: LoRA training must be called while still in enable_grad() context
+        self.model_runner.lora_training_manager = self.lora_training_manager
+        
+        # Construct the LoRA Attention Training Manager (for q_proj/v_proj training)
+        # This is optional - only create if we want attention LoRA training
+        # TODO: Make this configurable via environment variable or config
+        if os.environ.get('VLLM_ENABLE_ATTENTION_LORA_TRAINING', '0') == '1':
+            from vllm.v1.worker.lora_attention_training_manager import LoRAAttentionTrainingManager
+            
+            # Get attention config from model
+            hf_config = model_config.hf_config
+            num_layers = hf_config.num_hidden_layers
+            num_heads = hf_config.num_attention_heads
+            num_kv_heads = getattr(hf_config, 'num_key_value_heads', num_heads)
+            head_dim = model_config.get_hidden_size() // num_heads
+            
+            self.lora_attention_training_manager = LoRAAttentionTrainingManager(
+                model_runner=self.model_runner,
+                num_layers=num_layers,
+                hidden_size=model_config.get_hidden_size(),
+                vocab_size=model_config.get_vocab_size(),
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                lora_rank=8,  # TODO: Make configurable
+                lora_alpha=16.0,  # TODO: Make configurable
+                learning_rate=2e-4,  # TODO: Make configurable
+            )
+            
+            # Store reference on model_runner
+            self.model_runner.lora_attention_training_manager = self.lora_attention_training_manager
+            
+            if self.rank == 0:
+                from vllm.logger import init_logger
+                logger = init_logger(__name__)
+                logger.info("LoRA Attention Training enabled for q_proj, v_proj, lm_head")
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -422,7 +479,8 @@ class Worker(WorkerBase):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
-    @torch.inference_mode()
+    # Removed @torch.inference_mode() decorator to allow training with gradients
+    # We handle the context inside model_runner.execute_model instead
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -443,8 +501,26 @@ class Worker(WorkerBase):
                     all_gather_group=get_tp_group(),
                     all_gather_tensors=all_gather_tensors))
 
+        print(f"[DEBUG worker] execute_model called with {len(scheduler_output.scheduled_new_reqs)} new reqs")
+        for req in scheduler_output.scheduled_new_reqs:
+            print(f"[DEBUG worker]   - req {req.req_id}: is_training={req.is_training}")
+        
         output = self.model_runner.execute_model(scheduler_output,
                                                  intermediate_tensors)
+        
+        print(f"[DEBUG worker] execute_model completed")
+        
+        # NOTE: LoRA training is now done inside model_runner.execute_model
+        # while still in the enable_grad() context. We don't call it here anymore.
+        
+        # Collect training losses for monitoring (vLLM-computed losses)
+        training_stats = self.training_manager.collect_losses()
+        if training_stats:
+            logger.info(
+                f"Monitoring losses: {training_stats['num_requests']} requests, "
+                f"avg_loss={training_stats['avg_loss']:.4f}"
+            )
+        
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
             return output
 
