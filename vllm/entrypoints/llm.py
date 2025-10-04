@@ -56,6 +56,7 @@ from vllm.transformers_utils.tokenizer import (AnyTokenizer, MistralTokenizer,
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, Device, as_iter, is_list_of
 from vllm.v1.sample.logits_processor import LogitsProcessor
+from vllm.lora.training_manager import TrainingManager
 
 if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
@@ -490,6 +491,10 @@ class LLM:
                 lora_path=lora_path,
             )
 
+        # TODO(girfan): Handle this default LoRA request better.
+        if lora_request is None:
+            lora_request = LoRARequest(lora_name=f"LaAL_1", lora_int_id=1, lora_path=TrainingManager.LoRA_PATH)
+
         # Convert single example to list
         if isinstance(training_data, dict):
             training_data = [training_data]
@@ -505,6 +510,10 @@ class LLM:
                     f"Training example {i} must have one of: "
                     "'text' (SFTTrainer format), 'messages' (chat format), "
                     "or 'prompt'/'prompt_token_ids' (legacy format)")
+
+
+        # lora_request = self.training_manager.add_lora()
+        # logger.info(f"[LaAL]: Added LoRA {lora_request.lora_int_id} with name {lora_request.lora_name} and path {lora_request.lora_path}")
 
         # Add training requests to the engine and collect their IDs
         request_ids = self._add_training_requests(
@@ -1728,7 +1737,7 @@ class LLM:
         training_data: Sequence[dict[str, Any]],
         *,
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
-        lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
+        lora_request: LoRARequest = None,
     ) -> list[str]:
         """Validate and add training requests to the engine.
 
@@ -1738,12 +1747,6 @@ class LLM:
             List of request IDs for the added training requests.
         """
         from vllm.v1.request import TrainingConfig
-
-        num_requests = len(training_data)
-        if isinstance(lora_request,
-                      Sequence) and len(lora_request) != num_requests:
-            raise ValueError("The lengths of training_data and lora_request "
-                             "must be the same.")
 
         # Add requests to the engine
         it = training_data
@@ -1807,27 +1810,19 @@ class LLM:
             else:
                 raise ValueError(f"Training example {i} has invalid format")
 
-            # Determine which LoRA request to use for this example
-            current_lora_request = None
-            if lora_request is not None:
-                if isinstance(lora_request, Sequence):
-                    current_lora_request = lora_request[i]
-                else:
-                    current_lora_request = lora_request
-
             # Create training config with LoRA request
             training_config = TrainingConfig(
                 labels=labels,
                 compute_loss=True,
                 loss_fn="cross_entropy",
-                lora_request=current_lora_request,
+                lora_request=lora_request,
             )
 
             # Add training request and collect its ID
             req_id = self._add_training_request(
                 prompt=prompt,
                 training_config=training_config,
-                lora_request=current_lora_request,
+                lora_request=lora_request,
             )
             request_ids.append(req_id)
 
@@ -1850,89 +1845,64 @@ class LLM:
 
         # For V1 engine, we need to create a Request object directly
         # and add it to the scheduler
-        if envs.VLLM_USE_V1:
-            # Tokenize the prompt if needed
-            if isinstance(prompt, str):
-                tokenizer = self.get_tokenizer()
-                prompt_token_ids = tokenizer.encode(prompt)
-            elif isinstance(prompt, dict):
-                if 'prompt_token_ids' in prompt:
-                    prompt_token_ids = prompt['prompt_token_ids']
-                elif 'prompt' in prompt:
-                    tokenizer = self.get_tokenizer()
-                    prompt_token_ids = tokenizer.encode(prompt['prompt'])
-                else:
-                    raise ValueError(
-                        "Prompt dict must have 'prompt' or 'prompt_token_ids'")
-            else:
-                raise ValueError(f"Unsupported prompt type: {type(prompt)}")
-
-            # Get EOS token ID
-            tokenizer = self.get_tokenizer()
-            eos_token_id = tokenizer.eos_token_id
-
-            # Load LoRA adapter if provided
-            if lora_request is not None:
-                # Access the model runner to load the LoRA adapter
-                engine_core_client = self.llm_engine.engine_core
-                if hasattr(engine_core_client, 'engine_core'):
-                    # InprocClient case
-                    actual_engine_core = engine_core_client.engine_core
-                    model_runner = actual_engine_core.runner
-                elif hasattr(engine_core_client, 'runner'):
-                    # Direct EngineCore access
-                    model_runner = engine_core_client.runner
-                else:
-                    raise NotImplementedError(
-                        "Training with async/multiprocess engine not yet supported. "
-                        "Please use the synchronous LLM class with V1 engine.")
-
-                # Add the LoRA adapter to the model runner
-                # This loads the adapter weights from disk if not already loaded
-                if hasattr(model_runner, 'add_lora'):
-                    model_runner.add_lora(lora_request)
-                else:
-                    raise RuntimeError(
-                        "LoRA is not enabled. Please initialize the LLM with "
-                        "enable_lora=True and max_loras > 0.")
-
-            # Create the training request
-            training_request = Request(
-                request_id=request_id,
-                prompt_token_ids=prompt_token_ids,
-                sampling_params=None,
-                pooling_params=None,
-                eos_token_id=eos_token_id,
-                is_training=True,
-                training_config=training_config,
-                lora_request=lora_request,
-            )
-
-            # Add to output processor first (needed for get_num_unfinished_requests)
-            prompt_str = prompt if isinstance(prompt,
-                                              str) else str(prompt_token_ids)
-            self.llm_engine.output_processor.add_request(
-                training_request, prompt_str, None, 0)
-
-            # Then add to scheduler for execution
-            # For V1, the engine has engine_core which contains the actual EngineCore
-            engine_core_client = self.llm_engine.engine_core
-
-            # Access the actual EngineCore (unwrap from InprocClient)
-            if hasattr(engine_core_client, 'engine_core'):
-                # InprocClient case
-                actual_engine_core = engine_core_client.engine_core
-                actual_engine_core.scheduler.add_request(training_request)
-            elif hasattr(engine_core_client, 'scheduler'):
-                # Direct EngineCore access
-                engine_core_client.scheduler.add_request(training_request)
-            else:
-                # For async/multiprocess case
-                raise NotImplementedError(
-                    "Training with async/multiprocess engine not yet supported. "
-                    "Please use the synchronous LLM class with V1 engine.")
-        else:
+        if not envs.VLLM_USE_V1:
             raise NotImplementedError("Training only supported in V1 engine")
+
+        # Tokenize the prompt if needed
+        if isinstance(prompt, str):
+            tokenizer = self.get_tokenizer()
+            prompt_token_ids = tokenizer.encode(prompt)
+        elif isinstance(prompt, dict):
+            if 'prompt_token_ids' in prompt:
+                prompt_token_ids = prompt['prompt_token_ids']
+            elif 'prompt' in prompt:
+                tokenizer = self.get_tokenizer()
+                prompt_token_ids = tokenizer.encode(prompt['prompt'])
+            else:
+                raise ValueError(
+                    "Prompt dict must have 'prompt' or 'prompt_token_ids'")
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
+
+        # Get EOS token ID
+        tokenizer = self.get_tokenizer()
+        eos_token_id = tokenizer.eos_token_id
+
+        # Create the training request
+        training_request = Request(
+            request_id=request_id,
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=None,
+            pooling_params=None,
+            eos_token_id=eos_token_id,
+            is_training=True,
+            training_config=training_config,
+            lora_request=lora_request,
+        )
+
+        # Add to output processor first (needed for get_num_unfinished_requests)
+        prompt_str = prompt if isinstance(prompt,
+                                            str) else str(prompt_token_ids)
+        self.llm_engine.output_processor.add_request(
+            training_request, prompt_str, None, 0)
+
+        # Then add to scheduler for execution
+        # For V1, the engine has engine_core which contains the actual EngineCore
+        engine_core_client = self.llm_engine.engine_core
+
+        # Access the actual EngineCore (unwrap from InprocClient)
+        if hasattr(engine_core_client, 'engine_core'):
+            # InprocClient case
+            actual_engine_core = engine_core_client.engine_core
+            actual_engine_core.scheduler.add_request(training_request)
+        elif hasattr(engine_core_client, 'scheduler'):
+            # Direct EngineCore access
+            engine_core_client.scheduler.add_request(training_request)
+        else:
+            # For async/multiprocess case
+            raise NotImplementedError(
+                "Training with async/multiprocess engine not yet supported. "
+                "Please use the synchronous LLM class with V1 engine.")
 
         return request_id
 

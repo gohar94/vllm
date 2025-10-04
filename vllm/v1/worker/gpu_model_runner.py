@@ -257,6 +257,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
+        # Training manager for LoRA training (initialized after model load)
+        self.training_manager = None
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -1007,12 +1010,32 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
-            # NOTE(woosuk): Due to chunked prefills, the batch may contain
-            # partial requests. While we should not sample any token
-            # from these partial requests, we do so for simplicity.
-            # We will ignore the sampled tokens from the partial requests.
-            # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            # Check if this is a training batch (all requests are training)
+            is_training_batch = False
+            if self.input_batch.num_reqs > 0:
+                # Check if any request is a training request
+                training_count = sum(
+                    1 for req_id in self.input_batch.req_ids
+                    if req_id is not None 
+                    and (req_state := self.requests.get(req_id)) is not None
+                    and req_state.is_training
+                )
+                is_training_batch = (training_count == self.input_batch.num_reqs)
+            
+            if is_training_batch:
+                # For training, we need logits for ALL tokens, not just last ones
+                # Create indices for all tokens: [0, 1, 2, ..., total_num_scheduled_tokens-1]
+                logits_indices = torch.arange(total_num_scheduled_tokens, 
+                                              dtype=torch.int32,
+                                              device="cpu")
+            else:
+                # For inference: select only the last token of each sequence for sampling
+                # NOTE(woosuk): Due to chunked prefills, the batch may contain
+                # partial requests. While we should not sample any token
+                # from these partial requests, we do so for simplicity.
+                # We will ignore the sampled tokens from the partial requests.
+                # TODO: Support prompt logprobs.
+                logits_indices = query_start_loc[1:] - 1
             num_draft_tokens = None
             spec_decode_metadata = None
         else:
@@ -1156,7 +1179,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Hot-Swap lora model
         if self.lora_config:
-            self.set_active_loras(self.input_batch, num_scheduled_tokens)
+            self.set_active_loras(self.input_batch, num_scheduled_tokens, is_training_batch)
 
         return (attn_metadata, logits_indices, spec_decode_metadata,
                 num_scheduled_tokens, spec_decode_common_attn_metadata,
@@ -2356,8 +2379,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 assert isinstance(hidden_states, IntermediateTensors)
                 return hidden_states
 
+            # Select the hidden states for the tokens we want
+            # (logits_indices was prepared in _prepare_inputs - for training it includes ALL tokens)
+            hidden_states = hidden_states[logits_indices]
+            logger.info(f"[Training Debug] hidden_states.shape={hidden_states.shape}")
+
             # Compute logits for loss calculation
-            # For training, we typically need logits for all tokens, not just sampled ones
+            # For training, we need logits for all tokens (achieved via logits_indices)
             logits = self.model.compute_logits(hidden_states, None)
 
             # Collect losses for each training request
@@ -2663,6 +2691,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                   self.scheduler_config,
                                                   self.lora_config,
                                                   self.device)
+                # Initialize TrainingManager for LoRA training
+                self._init_training_manager()
             if hasattr(self, "drafter"):
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
@@ -2721,6 +2751,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.NONE, self.device)
+
+    def _init_training_manager(self) -> None:
+        """Initialize the TrainingManager for LoRA training.
+        
+        This is called after the model is loaded with LoRA support.
+        The TrainingManager will extract layer dimensions from the model
+        and provide functionality to create random LoRA adapters for training.
+        """
+        from vllm.lora.training_manager import TrainingManager
+
+        self.training_manager = TrainingManager(
+            model=self.model,
+            lora_manager=self.lora_manager,
+            lora_config=self.lora_config,
+            device=self.device,
+            dtype=self.dtype,
+            sub_modules=None,
+        )
+        logger.info("TrainingManager initialized for LoRA training")
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, \
