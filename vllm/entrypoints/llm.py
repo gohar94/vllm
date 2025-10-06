@@ -1118,6 +1118,7 @@ class LLM:
             considered legacy and may be deprecated in the future. You should
             instead pass them via the `inputs` parameter.
         """
+
         if self.supported_tasks == ["encode"] and pooling_task is None:
             pooling_task = "encode"
 
