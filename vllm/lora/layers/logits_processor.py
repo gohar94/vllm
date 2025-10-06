@@ -158,8 +158,24 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
+        # DEBUG: Log logits processor
+        if not hasattr(self, '_logits_debug_logged'):
+            self._logits_debug_logged = True
+            print(f"\n[LogitsProcessor Debug]")
+            print(f"  lm_head.weight.shape: {lm_head.weight.shape}")
+            print(f"  hidden_states.shape: {hidden_states.shape}")
+            print(f"  base_layer.vocab_size: {self.base_layer.vocab_size}")
+            print(f"  base_layer.org_vocab_size: {self.base_layer.org_vocab_size}")
+        
         # Get the logits for the next tokens.
         logits = lm_head.quant_method.apply(lm_head, hidden_states)
+        
+        # DEBUG: Log logits shape
+        if not hasattr(self, '_logits_debug_logged_2'):
+            self._logits_debug_logged_2 = True
+            print(f"  logits (from lm_head).shape: {logits.shape}")
+            print(f"  logits sample: {logits[0, :5].tolist()}")
+        
         if embedding_bias is not None:
             logits += embedding_bias
 
@@ -228,8 +244,22 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         if not current_platform.can_update_inplace():
             logits = lora_output
 
+        # DEBUG: Log before trimming
+        if not hasattr(self, '_logits_debug_logged_3'):
+            self._logits_debug_logged_3 = True
+            print(f"  logits (before trim).shape: {logits.shape}")
+            print(f"  logits (before trim) sample: {logits[0, :5].tolist()}")
+            print(f"  Trimming to: {self.base_layer.vocab_size}")
+
         # Remove paddings in vocab (if any).
         logits = logits[:, :self.base_layer.vocab_size]
+        
+        # DEBUG: Log after trimming
+        if not hasattr(self, '_logits_debug_logged_4'):
+            self._logits_debug_logged_4 = True
+            print(f"  logits (after trim).shape: {logits.shape}")
+            print(f"  logits (after trim) sample: {logits[0, :5].tolist()}")
+        
         return logits
 
     def forward(self, *args, **kwargs):

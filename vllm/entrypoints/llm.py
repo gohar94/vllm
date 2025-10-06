@@ -511,8 +511,8 @@ class LLM:
             )
 
         # TODO(girfan): Handle this default LoRA request better.
-        if lora_request is None:
-            lora_request = LoRARequest(lora_name=f"LaAL_1", lora_int_id=1, lora_path=TrainingManager.LoRA_PATH)
+        # if lora_request is None:
+        #     lora_request = LoRARequest(lora_name=f"LaAL_1", lora_int_id=1, lora_path=TrainingManager.LoRA_PATH)
 
         # Convert single example to list
         if isinstance(training_data, dict):
@@ -581,6 +581,36 @@ class LLM:
                 'loss': training_loss,
                 'num_tokens': num_tokens,
             })
+
+        # Clear KV cache state before returning
+        # This ensures clean state between training runs
+        try:
+            if hasattr(self.llm_engine, 'scheduler') and self.llm_engine.scheduler:
+                # V0 engine
+                if isinstance(self.llm_engine.scheduler, list):
+                    for sched in self.llm_engine.scheduler:
+                        if hasattr(sched, 'free_finished_req_ids'):
+                            sched.free_finished_req_ids()
+                else:
+                    self.llm_engine.scheduler.free_finished_req_ids()
+            
+            if hasattr(self.llm_engine, 'model_executor'):
+                # V0 engine
+                for worker in self.llm_engine.model_executor.workers:
+                    if hasattr(worker, 'cache_engine') and worker.cache_engine:
+                        worker.cache_engine.reset()
+            elif hasattr(self.llm_engine, 'engine_core'):
+                # V1 engine
+                if hasattr(self.llm_engine.engine_core, 'model_runner'):
+                    runner = self.llm_engine.engine_core.model_runner
+                    if hasattr(runner, 'kv_cache') and runner.kv_cache:
+                        if isinstance(runner.kv_cache, list):
+                            for cache in runner.kv_cache:
+                                cache.zero_()
+                        else:
+                            runner.kv_cache.zero_()
+        except Exception as e:
+            logger.warning(f"Failed to clear KV cache: {e}")
 
         return results
 

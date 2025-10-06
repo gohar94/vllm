@@ -49,6 +49,13 @@ class LogitsProcessor(CustomOp):
         self.logits_as_input = logits_as_input
         # original vocabulary size (without LoRA).
         self.org_vocab_size = org_vocab_size or vocab_size
+        
+        # DEBUG: Log initialization
+        print(f"\n[LogitsProcessor __init__]")
+        print(f"  vocab_size (input): {vocab_size}")
+        print(f"  org_vocab_size (input): {org_vocab_size}")
+        print(f"  self.vocab_size: {self.vocab_size}")
+        print(f"  self.org_vocab_size: {self.org_vocab_size}")
         # Soft cap the logits. Used in Gemma 2.
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
