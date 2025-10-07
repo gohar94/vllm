@@ -2392,14 +2392,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 print(f"[vLLM Forward] model_kwargs keys={list(model_kwargs.keys())}")
             
             # Enable gradient computation for training
-            with torch.enable_grad():
-                model_output = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
+            # with torch.enable_grad():
+            model_output = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+
+            # DEBUG: Log forward pass outputs
+            print(f"[vLLM Forward] model_output.shape={model_output.shape}")
+            print(f"[vLLM Forward] model_output[0,:5]={model_output[0,:5].tolist()}")
 
         with record_function_or_nullcontext("ComputeLoss"):
             # For training, model_output should be hidden states

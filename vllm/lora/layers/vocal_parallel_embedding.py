@@ -153,6 +153,14 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
                 self.lora_b_stacked,
                 add_input=True)
 
+        # check if lora_output is all zeros
+        if lora_output is not None:
+            if lora_output.norm().item() == 0:
+                print("  LoRA output is all zeros")
+            else:
+                print("  LoRA output is not all zeros")
+
+
         if not current_platform.can_update_inplace():
             full_output = lora_output
 

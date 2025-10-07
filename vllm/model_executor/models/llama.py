@@ -258,23 +258,33 @@ class LlamaAttention(nn.Module):
                     if kv.numel() > 0:
                         print(f"  KV cache[0] norm: {kv.norm().item():.10f}")
         
-        attn_output = self.attn(q, k, v)
-        
+        attn_output = self.attn(q, k, v, log=is_real_training and layer_idx == 0)
+
         if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_4'):
             setattr(self, f'{debug_key}_4', True)
+            torch.save(q, "q.pt")
+            torch.save(k, "k.pt")
+            torch.save(v, "v.pt")
+            torch.save(hidden_states, "hidden_states.pt")
+            torch.save(attn_output, "attn_output.pt")
+            torch.save(self.attn.kv_cache, "kv_cache.pt")
+            print(f"  Saved q, k, v to q.pt, k.pt, v.pt, attn_output.pt, hidden_states.pt, kv_cache.pt")
+        
+        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_5'):
+            setattr(self, f'{debug_key}_5', True)
             print(f"  attn_output.shape: {attn_output.shape}")
             print(f"  attn_output[0, :5]: {attn_output[0, :5].tolist()}")
         
         # DEBUG: Before o_proj
-        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_5'):
-            setattr(self, f'{debug_key}_5', True)
+        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_6'):
+            setattr(self, f'{debug_key}_6', True)
             print(f"  Before o_proj: attn_output[0, :5]: {attn_output[0, :5].tolist()}")
             print(f"  o_proj type: {type(self.o_proj)}")
         
         output, _ = self.o_proj(attn_output)
         
-        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_6'):
-            setattr(self, f'{debug_key}_6', True)
+        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_7'):
+            setattr(self, f'{debug_key}_7', True)
             print(f"  After o_proj: output[0, :5]: {output[0, :5].tolist()}")
         
         return output
