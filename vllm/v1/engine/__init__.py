@@ -117,6 +117,8 @@ class EngineCoreOutput(
     trace_headers: Optional[Mapping[str, str]] = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    # Training loss (for training requests)
+    training_loss: Optional[float] = None
 
     @property
     def finished(self) -> bool:
