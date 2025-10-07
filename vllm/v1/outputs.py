@@ -117,6 +117,9 @@ class ModelRunnerOutput:
     # req_id -> loss (for training requests)
     training_losses: Optional[dict[str, Optional[float]]] = None
 
+    # req_id -> logits (for training requests)
+    training_logits: Optional[dict[str, Optional[torch.Tensor]]] = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

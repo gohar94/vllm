@@ -2395,97 +2395,91 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # For training, we need logits for all tokens (achieved via logits_indices)
             logits = self.model.compute_logits(hidden_states, None)
 
-            # Collect losses for each training request
-            losses = {}
-            req_ids_output = []
-            req_id_to_index = {}
+        # Collect losses and logits for each training request
+        losses = {}
+        logits_dict = {}
+        req_ids_output = []
+        req_id_to_index = {}
 
-            offset = 0
-            for i, req_id in enumerate(self.input_batch.req_ids):
-                if req_id is None:
-                    continue
+        offset = 0
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            if req_id is None:
+                continue
 
-                req_state = self.requests.get(req_id)
-                if req_state is None or not req_state.is_training:
-                    continue
+            req_state = self.requests.get(req_id)
+            if req_state is None or not req_state.is_training:
+                continue
 
-                # Get the number of tokens for this request
-                num_tokens = scheduler_output.num_scheduled_tokens.get(
-                    req_id, 0)
-                if num_tokens == 0:
-                    continue
+            # Get the number of tokens for this request
+            num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if num_tokens == 0:
+                continue
 
-                # Extract logits and labels for this request
-                request_logits = logits[offset:offset + num_tokens]
+            # Extract logits and labels for this request
+            request_logits = logits[offset:offset + num_tokens]
 
-                # Get labels from training config
-                training_config = req_state.training_config
-                if training_config is not None and training_config.labels is not None:
-                    labels = training_config.labels
+            # Store logits for this request (detached to avoid gradient issues)
+            logits_dict[req_id] = request_logits.detach().cpu()
 
-                    # Convert labels to tensor if needed and move to device
-                    if not isinstance(labels, torch.Tensor):
-                        labels = torch.tensor(labels,
-                                              dtype=torch.long,
-                                              device=self.device)
-                    else:
-                        labels = labels.to(self.device)
+            # Get labels from training config
+            training_config = req_state.training_config
+            if training_config is not None and training_config.labels is not None:
+                labels = training_config.labels
 
-                    # Ensure labels are the right length
-                    if len(labels) != num_tokens:
-                        logger.warning(
-                            f"Label length mismatch for request {req_id}: "
-                            f"expected {num_tokens}, got {len(labels)}")
-                        offset += num_tokens
-                        continue
-
-                    # Compute cross-entropy loss
-                    # Shift logits and labels for next-token prediction
-                    # logits: [seq_len, vocab_size], labels: [seq_len]
-                    logger.info(f"[Loss Debug] req_id={req_id}")
-                    logger.info(
-                        f"[Loss Debug] request_logits.shape={request_logits.shape}"
-                    )
-                    logger.info(f"[Loss Debug] labels.shape={labels.shape}")
-                    logger.info(
-                        f"[Loss Debug] labels[:10]={labels[:10].tolist()}")
-
-                    # Save vLLM logits for comparison (before trimming)
-                    torch.save(request_logits.cpu(), "/tmp/vllm_logits.pt")
-                    logger.info(
-                        "[Loss Debug] Saved vLLM logits to /tmp/vllm_logits.pt"
-                    )
-                    logger.info(
-                        f"[Loss Debug] request_logits[0, :5]={request_logits[0, :5].tolist()}"
-                    )
-
-                    shift_logits = request_logits[:-1, :].contiguous()
-                    shift_labels = labels[1:].contiguous()
-
-                    logger.info(
-                        f"[Loss Debug] shift_logits.shape={shift_logits.shape}"
-                    )
-                    logger.info(
-                        f"[Loss Debug] shift_labels.shape={shift_labels.shape}"
-                    )
-                    logger.info(
-                        f"[Loss Debug] shift_labels[:10]={shift_labels[:10].tolist()}"
-                    )
-
-                    loss_fct = torch.nn.CrossEntropyLoss()
-                    loss = loss_fct(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1))
-
-                    logger.info(f"[Loss Debug] loss={loss.item():.6f}")
-                    losses[req_id] = loss.item()
+                # Convert labels to tensor if needed and move to device
+                if not isinstance(labels, torch.Tensor):
+                    labels = torch.tensor(labels,
+                                          dtype=torch.long,
+                                          device=self.device)
                 else:
-                    # No labels provided, cannot compute loss
-                    losses[req_id] = None
+                    labels = labels.to(self.device)
 
-                req_ids_output.append(req_id)
-                req_id_to_index[req_id] = len(req_ids_output) - 1
-                offset += num_tokens
+                # Ensure labels are the right length
+                if len(labels) != num_tokens:
+                    logger.warning(
+                        f"Label length mismatch for request {req_id}: "
+                        f"expected {num_tokens}, got {len(labels)}")
+                    offset += num_tokens
+                    continue
+
+                # Compute cross-entropy loss
+                # Shift logits and labels for next-token prediction
+                # logits: [seq_len, vocab_size], labels: [seq_len]
+                logger.info(f"[Loss Debug] req_id={req_id}")
+                logger.info(
+                    f"[Loss Debug] request_logits.shape={request_logits.shape}"
+                )
+                logger.info(f"[Loss Debug] labels.shape={labels.shape}")
+                logger.info(f"[Loss Debug] labels[:10]={labels[:10].tolist()}")
+
+                logger.info(
+                    f"[Loss Debug] request_logits[0, :5]={request_logits[0, :5].tolist()}"
+                )
+
+                shift_logits = request_logits[:-1, :].contiguous()
+                shift_labels = labels[1:].contiguous()
+
+                logger.info(
+                    f"[Loss Debug] shift_logits.shape={shift_logits.shape}")
+                logger.info(
+                    f"[Loss Debug] shift_labels.shape={shift_labels.shape}")
+                logger.info(
+                    f"[Loss Debug] shift_labels[:10]={shift_labels[:10].tolist()}"
+                )
+
+                loss_fct = torch.nn.CrossEntropyLoss()
+                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_labels.view(-1))
+
+                logger.info(f"[Loss Debug] loss={loss.item():.6f}")
+                losses[req_id] = loss.item()
+            else:
+                # No labels provided, cannot compute loss
+                losses[req_id] = None
+
+            req_ids_output.append(req_id)
+            req_id_to_index[req_id] = len(req_ids_output) - 1
+            offset += num_tokens
 
         # Return training output
         # Note: For training, we don't have sampled_token_ids or logprobs
@@ -2499,6 +2493,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=None,
             num_nans_in_logits={},
             training_losses=losses,  # Add training losses to output
+            training_logits=logits_dict,  # Add training logits to output
         )
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:

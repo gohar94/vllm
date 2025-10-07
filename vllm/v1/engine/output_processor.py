@@ -189,6 +189,7 @@ class RequestState:
         stop_reason: Union[int, str, None],
         kv_transfer_params: Optional[dict[str, Any]] = None,
         training_loss: Optional[float] = None,
+        training_logits: Optional[torch.Tensor] = None,
     ) -> Optional[Union[RequestOutput, PoolingRequestOutput]]:
 
         finished = finish_reason is not None
@@ -207,7 +208,7 @@ class RequestState:
         # Training requests don't have detokenizer - return special output with loss
         if self.detokenizer is None:
             return self._new_training_output(request_id, finished,
-                                             training_loss)
+                                             training_loss, training_logits)
 
         output = self._new_completion_output(new_token_ids, finish_reason,
                                              stop_reason)
@@ -302,6 +303,7 @@ class RequestState:
         request_id: str,
         finished: bool,
         training_loss: Optional[float] = None,
+        training_logits: Optional[torch.Tensor] = None,
     ) -> RequestOutput:
         """Create a RequestOutput for training requests."""
         # Training requests don't generate text, just return loss
@@ -326,6 +328,7 @@ class RequestState:
             num_cached_tokens=0,
             metrics=self.stats,
             training_loss=training_loss,  # Pass the training loss
+            training_logits=training_logits,  # Pass the training logits
         )
 
 
@@ -450,6 +453,7 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             training_loss = engine_core_output.training_loss
+            training_logits = engine_core_output.training_logits
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
 
@@ -472,7 +476,7 @@ class OutputProcessor:
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                     new_token_ids, pooling_output, finish_reason, stop_reason,
-                    kv_transfer_params, training_loss):
+                    kv_transfer_params, training_loss, training_logits):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)

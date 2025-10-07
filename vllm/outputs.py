@@ -124,8 +124,9 @@ class RequestOutput:
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
     ) -> None:
-        # Extract training_loss from kwargs if present
+        # Extract training_loss and training_logits from kwargs if present
         self.training_loss = kwargs.pop('training_loss', None)
+        self.training_logits = kwargs.pop('training_logits', None)
 
         if kwargs:
             logger.warning_once("RequestOutput: Ignoring extra arguments: %s",

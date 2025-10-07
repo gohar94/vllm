@@ -466,7 +466,8 @@ class LLM:
             A list of training results, each containing:
             {
                 'request_id': str,
-                'loss': None,  # Will be populated once loss computation is implemented
+                'loss': float,  # Training loss value
+                'logits': torch.Tensor,  # Model logits [seq_len, vocab_size]
                 'num_tokens': int,
             }
 
@@ -509,10 +510,6 @@ class LLM:
                 lora_path=lora_path,
             )
 
-        # TODO(girfan): Handle this default LoRA request better.
-        # if lora_request is None:
-        #     lora_request = LoRARequest(lora_name=f"LaAL_1", lora_int_id=1, lora_path=TrainingManager.LoRA_PATH)
-
         # Convert single example to list
         if isinstance(training_data, dict):
             training_data = [training_data]
@@ -550,6 +547,8 @@ class LLM:
             output = output_map.get(req_id)
             training_loss = output.training_loss if output and hasattr(
                 output, 'training_loss') else None
+            training_logits = output.training_logits if output and hasattr(
+                output, 'training_logits') else None
 
             # Calculate num_tokens based on the format
             if 'text' in example:
@@ -574,6 +573,7 @@ class LLM:
             results.append({
                 'request_id': req_id,
                 'loss': training_loss,
+                'logits': training_logits,
                 'num_tokens': num_tokens,
             })
 
