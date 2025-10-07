@@ -17,10 +17,6 @@ from vllm.platforms import current_platform
 from .base import BaseLayerWithLoRA
 from .utils import _get_lora_device
 
-# Initialize logger at module level to avoid torch.compile issues
-from vllm.logger import init_logger
-logger = init_logger(__name__)
-
 
 class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
 
@@ -110,15 +106,6 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         embeddings_tensor: Optional[torch.Tensor],
         lora_bias: Optional[torch.Tensor] = None,
     ):
-        # DEBUG: Log LoRA weight setting
-        from vllm.logger import init_logger
-        logger = init_logger(__name__)
-        if not hasattr(self, '_set_lora_logged'):
-            self._set_lora_logged = True
-            logger.info(f"[LoRA Set Debug] Layer: {type(self.base_layer).__name__}, index={index}")
-            logger.info(f"[LoRA Set Debug]   lora_a shape={lora_a.shape}, norm={lora_a.norm().item():.6f}")
-            logger.info(f"[LoRA Set Debug]   lora_b shape={lora_b.shape}, norm={lora_b.norm().item():.6f}")
-        
         # Except for QKVParallelLinearWithLoRA and
         # MergedColumnParallelLinearWithLoRA, all other linear LoRA layers
         # store weights in a tuple of size 1. These two layers will
@@ -163,7 +150,6 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             torch.Tensor] = self.punica_wrapper.add_lora_linear(
                 output, x, self.lora_a_stacked, self.lora_b_stacked,
                 self.lora_bias_stacked, 1.0, self.output_slices)
-        
         if not current_platform.can_update_inplace():
             output = lora_output
 

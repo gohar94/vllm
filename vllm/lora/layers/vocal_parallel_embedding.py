@@ -101,7 +101,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
                             0, :lora_b.shape[1], :lora_b.shape[0]].copy_(
                                 lora_b.T, non_blocking=True)
         # Only copy embeddings if there's space for them (lora_extra_vocab_size > 0)
-        if embeddings_tensor is not None and self.embeddings_tensors.shape[1] > 0:
+        if embeddings_tensor is not None and self.embeddings_tensors.shape[
+                1] > 0:
             self.embeddings_tensors[
                 index,
                 :embeddings_tensor.shape[0],
@@ -152,14 +153,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
                 full_lora_a_embeddings,
                 self.lora_b_stacked,
                 add_input=True)
-
-        # check if lora_output is all zeros
-        if lora_output is not None:
-            if lora_output.norm().item() == 0:
-                print("  LoRA output is all zeros")
-            else:
-                print("  LoRA output is not all zeros")
-
 
         if not current_platform.can_update_inplace():
             full_output = lora_output

@@ -1016,16 +1016,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Check if any request is a training request
                 training_count = sum(
                     1 for req_id in self.input_batch.req_ids
-                    if req_id is not None 
-                    and (req_state := self.requests.get(req_id)) is not None
-                    and req_state.is_training
-                )
-                is_training_batch = (training_count == self.input_batch.num_reqs)
-            
+                    if req_id is not None and (req_state := self.requests.get(
+                        req_id)) is not None and req_state.is_training)
+                is_training_batch = (
+                    training_count == self.input_batch.num_reqs)
+
             if is_training_batch:
                 # For training, we need logits for ALL tokens, not just last ones
                 # Create indices for all tokens: [0, 1, 2, ..., total_num_scheduled_tokens-1]
-                logits_indices = torch.arange(total_num_scheduled_tokens, 
+                logits_indices = torch.arange(total_num_scheduled_tokens,
                                               dtype=torch.int32,
                                               device="cpu")
             else:
@@ -1179,17 +1178,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Hot-Swap lora model
         if self.lora_config:
-            self.set_active_loras(self.input_batch, num_scheduled_tokens, is_training_batch)
-            logger.info(f"[LoRA Debug] is_training_batch={is_training_batch}")
-            logger.info(f"[LoRA Debug] lora_config={self.lora_config}")
-            logger.info(f"[LoRA Debug] active lora requests={self.lora_manager.list_adapters()}")
-            
-            # Debug: Print actual LoRA paths being used
-            for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]:
-                if req_id is not None:
-                    req = self.requests.get(req_id)
-                    if req and req.lora_request:
-                        logger.info(f"[LoRA Debug] Request {req_id} using LoRA: {req.lora_request.lora_name} from {req.lora_request.lora_path}")
+            self.set_active_loras(self.input_batch, num_scheduled_tokens,
+                                  is_training_batch)
 
         return (attn_metadata, logits_indices, spec_decode_metadata,
                 num_scheduled_tokens, spec_decode_common_attn_metadata,
@@ -2359,14 +2349,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             cudagraph_runtime_mode, batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(batch_descriptor)
 
-            # Zero out KV cache BEFORE training forward pass to ensure clean state
-            # This ensures no residual data from profiling or previous runs
-            print(f"[Training Debug] Zeroing KV cache before forward pass. Num caches: {len(self.kv_caches)}")
-            for i, kv_cache in enumerate(self.kv_caches):
-                norm_before = kv_cache.norm().item()
-                kv_cache.zero_()
-                print(f"[Training Debug] KV cache {i}: norm before zero = {norm_before:.6f}, after = {kv_cache.norm().item():.6f}")
-
         # Run the model WITHOUT torch.inference_mode() to enable gradients
         with (set_forward_context(
                 attn_metadata,
@@ -2377,41 +2359,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 batch_descriptor=batch_descriptor,
                 ubatch_slices=ubatch_slices,
         ), record_function_or_nullcontext("Forward")):
-            # DEBUG: Log forward pass inputs
-            # Check if this is a real training request (not dummy/profiling)
-            is_training_batch = any(
-                req_id is not None and 
-                self.requests.get(req_id) is not None and 
-                getattr(self.requests[req_id], 'is_training', False)
-                for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]
-            )
-            
-            if is_training_batch:
-                print(f"[vLLM Forward] input_ids={'None' if input_ids is None else input_ids.shape}")
-                if input_ids is not None:
-                    print(f"[vLLM Forward] input_ids={input_ids.tolist()}")
-                print(f"[vLLM Forward] positions={'None' if positions is None else positions.shape}")
-                if positions is not None:
-                    print(f"[vLLM Forward] positions={positions.tolist()}")
-                print(f"[vLLM Forward] inputs_embeds={'None' if inputs_embeds is None else inputs_embeds.shape}")
-                if inputs_embeds is not None:
-                    print(f"[vLLM Forward] inputs_embeds[0,:5]={inputs_embeds[0,:5].tolist()}")
-                print(f"[vLLM Forward] intermediate_tensors={type(intermediate_tensors)}")
-                print(f"[vLLM Forward] model_kwargs keys={list(model_kwargs.keys())}")
-            
             # Enable gradient computation for training
-            # with torch.enable_grad():
-            model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            with torch.enable_grad():
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
             # DEBUG: Log forward pass outputs
             print(f"[vLLM Forward] model_output.shape={model_output.shape}")
-            print(f"[vLLM Forward] model_output[0,:5]={model_output[0,:5].tolist()}")
+            print(
+                f"[vLLM Forward] model_output[0,:5]={model_output[0,:5].tolist()}"
+            )
 
         with record_function_or_nullcontext("ComputeLoss"):
             # For training, model_output should be hidden states
@@ -2426,7 +2388,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Select the hidden states for the tokens we want
             # (logits_indices was prepared in _prepare_inputs - for training it includes ALL tokens)
             hidden_states = hidden_states[logits_indices]
-            logger.info(f"[Training Debug] hidden_states.shape={hidden_states.shape}")
+            logger.info(
+                f"[Training Debug] hidden_states.shape={hidden_states.shape}")
 
             # Compute logits for loss calculation
             # For training, we need logits for all tokens (achieved via logits_indices)
@@ -2480,29 +2443,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     # Shift logits and labels for next-token prediction
                     # logits: [seq_len, vocab_size], labels: [seq_len]
                     logger.info(f"[Loss Debug] req_id={req_id}")
-                    logger.info(f"[Loss Debug] request_logits.shape={request_logits.shape}")
+                    logger.info(
+                        f"[Loss Debug] request_logits.shape={request_logits.shape}"
+                    )
                     logger.info(f"[Loss Debug] labels.shape={labels.shape}")
-                    logger.info(f"[Loss Debug] labels[:10]={labels[:10].tolist()}")
-                    
+                    logger.info(
+                        f"[Loss Debug] labels[:10]={labels[:10].tolist()}")
+
                     # Save vLLM logits for comparison (before trimming)
                     torch.save(request_logits.cpu(), "/tmp/vllm_logits.pt")
-                    logger.info(f"[Loss Debug] Saved vLLM logits to /tmp/vllm_logits.pt")
-                    logger.info(f"[Loss Debug] request_logits[0, :5]={request_logits[0, :5].tolist()}")
-                    
-                    # Trim logits to match the actual vocab size (128256 instead of 128512)
-                    # The extra tokens in vLLM are padding and shouldn't be used
-                    actual_vocab_size = 128256
-                    if request_logits.size(-1) > actual_vocab_size:
-                        logger.info(f"[Loss Debug] Trimming logits from {request_logits.size(-1)} to {actual_vocab_size}")
-                        request_logits = request_logits[:, :actual_vocab_size].contiguous()
-                        logger.info(f"[Loss Debug] After trim: request_logits.shape={request_logits.shape}")
-                    
+                    logger.info(
+                        "[Loss Debug] Saved vLLM logits to /tmp/vllm_logits.pt"
+                    )
+                    logger.info(
+                        f"[Loss Debug] request_logits[0, :5]={request_logits[0, :5].tolist()}"
+                    )
+
                     shift_logits = request_logits[:-1, :].contiguous()
                     shift_labels = labels[1:].contiguous()
-                    
-                    logger.info(f"[Loss Debug] shift_logits.shape={shift_logits.shape}")
-                    logger.info(f"[Loss Debug] shift_labels.shape={shift_labels.shape}")
-                    logger.info(f"[Loss Debug] shift_labels[:10]={shift_labels[:10].tolist()}")
+
+                    logger.info(
+                        f"[Loss Debug] shift_logits.shape={shift_logits.shape}"
+                    )
+                    logger.info(
+                        f"[Loss Debug] shift_labels.shape={shift_labels.shape}"
+                    )
+                    logger.info(
+                        f"[Loss Debug] shift_labels[:10]={shift_labels[:10].tolist()}"
+                    )
 
                     loss_fct = torch.nn.CrossEntropyLoss()
                     loss = loss_fct(
@@ -2519,9 +2487,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 req_id_to_index[req_id] = len(req_ids_output) - 1
                 offset += num_tokens
 
-        # Note: KV cache was already zeroed before the forward pass
-        # This ensures clean state for the training computation
-        
         # Return training output
         # Note: For training, we don't have sampled_token_ids or logprobs
         return ModelRunnerOutput(

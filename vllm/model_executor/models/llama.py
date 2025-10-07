@@ -204,89 +204,17 @@ class LlamaAttention(nn.Module):
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
         )
-        
-        # DEBUG: Log attention class being used and set layer index
-        layer_idx = extract_layer_index(prefix)
-        self._layer_idx = layer_idx  # Store for forward pass logging
-        if layer_idx == 0:
-            print(f"\n[LlamaAttention Debug] Layer 0 Attention Setup")
-            print(f"  Attention class: {attn_cls.__name__}")
-            print(f"  Attention instance type: {type(self.attn)}")
-            print(f"  cache_config: {cache_config}")
-            print(f"  Actual attn object: {self.attn}")
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # DEBUG: Log attention forward pass details
-        is_real_training = hidden_states.shape[0] < 100
-        debug_key = f'_debug_attn_forward_{hidden_states.shape[0]}'
-        layer_idx = getattr(self, '_layer_idx', -1)
-        
-        if is_real_training and layer_idx == 0 and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            print(f"\n[LlamaAttention Debug] Layer 0 Forward Pass")
-            print(f"  hidden_states.shape: {hidden_states.shape}")
-            print(f"  hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
-            print(f"  QKV projection type: {type(self.qkv_proj)}")
-        
         qkv, _ = self.qkv_proj(hidden_states)
-        
-        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_2'):
-            setattr(self, f'{debug_key}_2', True)
-            print(f"  qkv.shape: {qkv.shape}")
-            print(f"  qkv[0, :5]: {qkv[0, :5].tolist()}")
-        
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        
-        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_3'):
-            setattr(self, f'{debug_key}_3', True)
-            print(f"  After rotary - q[0, :5]: {q[0, :5].tolist()}")
-            print(f"  After rotary - k[0, :5]: {k[0, :5].tolist()}")
-            print(f"  After rotary - v[0, :5]: {v[0, :5].tolist()}")
-            print(f"  Calling attn: {type(self.attn)}")
-            # DEBUG: Check KV cache and metadata
-            if hasattr(self.attn, 'kv_cache'):
-                print(f"  KV cache type: {type(self.attn.kv_cache)}")
-                if isinstance(self.attn.kv_cache, list) and len(self.attn.kv_cache) > 0:
-                    kv = self.attn.kv_cache[0]
-                    print(f"  KV cache[0] shape: {kv.shape if hasattr(kv, 'shape') else 'N/A'}")
-                    print(f"  KV cache[0] numel: {kv.numel() if hasattr(kv, 'numel') else 'N/A'}")
-                    if kv.numel() > 0:
-                        print(f"  KV cache[0] norm: {kv.norm().item():.10f}")
-        
-        attn_output = self.attn(q, k, v, log=is_real_training and layer_idx == 0)
-
-        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_4'):
-            setattr(self, f'{debug_key}_4', True)
-            torch.save(q, "q.pt")
-            torch.save(k, "k.pt")
-            torch.save(v, "v.pt")
-            torch.save(hidden_states, "hidden_states.pt")
-            torch.save(attn_output, "attn_output.pt")
-            torch.save(self.attn.kv_cache, "kv_cache.pt")
-            print(f"  Saved q, k, v to q.pt, k.pt, v.pt, attn_output.pt, hidden_states.pt, kv_cache.pt")
-        
-        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_5'):
-            setattr(self, f'{debug_key}_5', True)
-            print(f"  attn_output.shape: {attn_output.shape}")
-            print(f"  attn_output[0, :5]: {attn_output[0, :5].tolist()}")
-        
-        # DEBUG: Before o_proj
-        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_6'):
-            setattr(self, f'{debug_key}_6', True)
-            print(f"  Before o_proj: attn_output[0, :5]: {attn_output[0, :5].tolist()}")
-            print(f"  o_proj type: {type(self.o_proj)}")
-        
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
-        
-        if is_real_training and layer_idx == 0 and not hasattr(self, f'{debug_key}_7'):
-            setattr(self, f'{debug_key}_7', True)
-            print(f"  After o_proj: output[0, :5]: {output[0, :5].tolist()}")
-        
         return output
 
     def _init_rotary_emb(self, config: LlamaConfig,
@@ -380,18 +308,6 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # DEBUG: Log first layer details
-        is_real_training = hidden_states.shape[0] < 100
-        debug_key = f'_debug_layer_forward_{hidden_states.shape[0]}'
-        if is_real_training and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            layer_idx = getattr(self, '_layer_idx', -1)  # Will be set externally
-            if layer_idx == 0:
-                print(f"\n[LlamaDecoderLayer Debug] Layer 0 Forward")
-                print(f"  positions: {positions.tolist()}")
-                print(f"  hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
-                print(f"  residual is None: {residual is None}")
-        
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -399,25 +315,8 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-        
-        # DEBUG: Log after layernorm
-        debug_key = f'_debug_after_norm_{hidden_states.shape[0]}'
-        if is_real_training and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            layer_idx = getattr(self, '_layer_idx', -1)
-            if layer_idx == 0:
-                print(f"  After input_layernorm[0, :5]: {hidden_states[0, :5].tolist()}")
-        
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states)
-
-        # DEBUG: Log after attention
-        debug_key = f'_debug_after_attn_{hidden_states.shape[0]}'
-        if is_real_training and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            layer_idx = getattr(self, '_layer_idx', -1)
-            if layer_idx == 0:
-                print(f"  After self_attn[0, :5]: {hidden_states[0, :5].tolist()}")
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
@@ -465,9 +364,6 @@ class LlamaModel(nn.Module):
                                       prefix=prefix),
             prefix=f"{prefix}.layers",
         )
-        # DEBUG: Set layer indices for debugging
-        for idx, layer in enumerate(self.layers):
-            layer._layer_idx = idx
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -501,35 +397,12 @@ class LlamaModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # DEBUG: Log input embeddings (for both profiling and actual runs)
-        is_real_training = hidden_states.shape[0] < 100  # Real training has fewer tokens
-        debug_key = f'_debug_embeddings_logged_{hidden_states.shape[0]}'
-        if is_real_training and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            print(f"\n[LlamaModel Debug] Input Embeddings (shape={hidden_states.shape})")
-            print(f"  hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
-            print(f"  hidden_states.norm(): {hidden_states.norm().item():.10f}")
-
         aux_hidden_states = []
-        layers_to_log = {0, 1, 2, len(self.layers)-1}  # Log first 3 and last layer
-        
         for idx, layer in enumerate(
                 islice(self.layers, self.start_layer, self.end_layer)):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            
-            debug_key = f'_debug_layer_{idx}_logged_{hidden_states.shape[0]}'
-            hidden_states_before = hidden_states.clone() if idx in layers_to_log and is_real_training and not hasattr(self, debug_key) else None
             hidden_states, residual = layer(positions, hidden_states, residual)
-            
-            # DEBUG: Log layer outputs
-            if hidden_states_before is not None:
-                setattr(self, debug_key, True)
-                print(f"\n[LlamaModel Debug] Layer {idx} Output (shape={hidden_states.shape})")
-                print(f"  hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
-                print(f"  hidden_states.norm(): {hidden_states.norm().item():.10f}")
-                delta = (hidden_states - hidden_states_before).abs().max().item()
-                print(f"  max change from input: {delta:.10f}")
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -537,25 +410,7 @@ class LlamaModel(nn.Module):
                 "residual": residual
             })
 
-        # DEBUG: Log before norm
-        debug_key = f'_debug_pre_norm_logged_{hidden_states.shape[0]}'
-        if is_real_training and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            print(f"\n[LlamaModel Debug] Before Norm (shape={hidden_states.shape})")
-            print(f"  hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
-            print(f"  hidden_states.norm(): {hidden_states.norm().item():.10f}")
-            if residual is not None:
-                print(f"  residual[0, :5]: {residual[0, :5].tolist()}")
-
         hidden_states, _ = self.norm(hidden_states, residual)
-
-        # DEBUG: Log after norm
-        debug_key = f'_debug_post_norm_logged_{hidden_states.shape[0]}'
-        if is_real_training and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            print(f"\n[LlamaModel Debug] After Norm (final hidden states) (shape={hidden_states.shape})")
-            print(f"  hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
-            print(f"  hidden_states.norm(): {hidden_states.norm().item():.10f}")
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -705,11 +560,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
                     self.model.embed_tokens)
 
             logit_scale = getattr(config, "logit_scale", 1.0)
-            # FIX: Use config.vocab_size for LogitsProcessor, not unpadded_vocab_size
-            # The unpadded_vocab_size includes lora_extra_vocab_size which is for
-            # additional vocabulary tokens, but LogitsProcessor should trim to the
-            # actual vocab size (config.vocab_size)
-            self.logits_processor = LogitsProcessor(config.vocab_size,
+            self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                     config.vocab_size,
                                                     logit_scale)
         else:
@@ -752,27 +603,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        # DEBUG: Log before logits computation
-        is_real_training = hidden_states.shape[0] < 100
-        debug_key = f'_debug_compute_logits_logged_{hidden_states.shape[0]}'
-        if is_real_training and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            print(f"\n[LlamaForCausalLM Debug] compute_logits Input (shape={hidden_states.shape})")
-            print(f"  hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
-            print(f"  hidden_states.norm(): {hidden_states.norm().item():.10f}")
-        
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
-        
-        # DEBUG: Log after logits computation
-        debug_key = f'_debug_compute_logits_logged_2_{hidden_states.shape[0]}'
-        if is_real_training and not hasattr(self, debug_key):
-            setattr(self, debug_key, True)
-            if logits is not None:
-                print(f"\n[LlamaForCausalLM Debug] compute_logits Output (shape={logits.shape})")
-                print(f"  logits[0, :5]: {logits[0, :5].tolist()}")
-                print(f"  logits.norm(): {logits.norm().item():.10f}")
-        
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str,

@@ -255,7 +255,6 @@ class Attention(nn.Module, AttentionLayerBase):
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: Optional[torch.Size] = None,
-        log: bool = False,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -305,7 +304,7 @@ class Attention(nn.Module, AttentionLayerBase):
                                   output=output)
             else:
                 torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name, log=log)
+                    query, key, value, output, self.layer_name)
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
@@ -587,7 +586,6 @@ def unified_attention_with_output(
     layer_name: str,
     output_scale: Optional[torch.Tensor] = None,
     output_block_scale: Optional[torch.Tensor] = None,
-    log: bool = False,
 ) -> None:
     wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -596,7 +594,6 @@ def unified_attention_with_output(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-
     self.impl.forward(self,
                       query,
                       key,
@@ -606,22 +603,6 @@ def unified_attention_with_output(
                       output=output,
                       output_scale=output_scale,
                       output_block_scale=output_block_scale)
-
-    if log:
-        torch.save(query, "attn_layer_query.pt")
-        torch.save(key, "attn_layer_key.pt")
-        torch.save(value, "attn_layer_value.pt")
-        torch.save(output, "attn_layer_output.pt")
-        if output_scale is not None:
-            torch.save(output_scale, "attn_layer_output_scale.pt")
-        if output_block_scale is not None:
-            torch.save(output_block_scale, "attn_layer_output_block_scale.pt")
-        if kv_cache is not None:
-            torch.save(kv_cache, "attn_layer_kv_cache.pt")
-        torch.save(attn_metadata.slot_mapping, "attn_metadata_slot_mapping.pt")
-        torch.save(attn_metadata.block_table, "attn_metadata_block_table.pt")
-        print(f"Saved all tensors to files")
-
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
 

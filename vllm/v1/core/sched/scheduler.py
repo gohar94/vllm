@@ -481,7 +481,7 @@ class Scheduler(SchedulerInterface):
 
                 # Allocate KV cache blocks for all requests (including training)
                 # Training requests need allocated blocks for proper slot_mapping
-                # The cache will be zeroed after each training step
+                # The prefix caching for training requests is freed after each training step
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
