@@ -479,23 +479,22 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                # Training requests don't need KV cache
-                if request.is_training:
-                    new_blocks = None  # No KV cache for training
-                else:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens + num_external_computed_tokens,
-                        num_new_local_computed_tokens,
-                        new_computed_blocks,
-                        num_lookahead_tokens=effective_lookahead_tokens,
-                        delay_cache_blocks=load_kv_async,
-                        num_encoder_tokens=num_encoder_tokens,
-                    )
+                # Allocate KV cache blocks for all requests (including training)
+                # Training requests need allocated blocks for proper slot_mapping
+                # The cache will be zeroed after each training step
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens + num_external_computed_tokens,
+                    num_new_local_computed_tokens,
+                    new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                    delay_cache_blocks=load_kv_async,
+                    num_encoder_tokens=num_encoder_tokens,
+                )
 
-                    if new_blocks is None:
-                        # The request cannot be scheduled.
-                        break
+                if new_blocks is None:
+                    # The request cannot be scheduled.
+                    break
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -534,12 +533,10 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
-                # Training requests don't have KV cache blocks
-                if request.is_training:
-                    req_to_new_blocks[request.request_id] = None
-                else:
-                    req_to_new_blocks[request.request_id] = (
-                        self.kv_cache_manager.get_blocks(request.request_id))
+                # Get allocated blocks for all requests (including training)
+                # Training requests need KV cache blocks for proper slot_mapping
+                req_to_new_blocks[request.request_id] = (
+                    self.kv_cache_manager.get_blocks(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -587,7 +584,7 @@ class Scheduler(SchedulerInterface):
                 req,
                 req_to_new_blocks[req.request_id].get_block_ids()
                 if req_to_new_blocks[req.request_id] is not None else
-                ([], )  # Empty block IDs for training requests
+                ([], )  # Fallback for requests without allocated blocks
             ) for req in scheduled_new_reqs
         ]
         cached_reqs_data = self._make_cached_request_data(

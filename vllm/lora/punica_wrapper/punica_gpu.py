@@ -15,22 +15,11 @@ import vllm.envs as envs
 from vllm.lora.layers import LoRAMapping
 from vllm.triton_utils import HAS_TRITON
 
-# FORCE TORCH_OPS: Set to False to disable Triton and use PyTorch SGMV/BGMV
-USE_TRITON = False  # Changed from HAS_TRITON
-
-if USE_TRITON:
+if HAS_TRITON:
     from vllm.lora.ops.triton_ops import (LoRAKernelMeta, lora_expand,
                                           lora_shrink)
-else:
-    # Use PyTorch fallback operations (SGMV/BGMV)
-    from vllm.lora.ops.torch_ops import (bgmv_expand, bgmv_shrink,
-                                         sgmv_expand, sgmv_shrink)
 
 from .punica_base import PunicaWrapperBase
-
-# Initialize logger at module level to avoid torch.compile issues
-from vllm.logger import init_logger
-logger = init_logger(__name__)
 
 
 @final
@@ -48,25 +37,19 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         self.max_loras = kwargs['max_loras']
 
-        if USE_TRITON:
-            self.token_mapping_meta = LoRAKernelMeta.make(self.max_loras,
-                                                          max_num_batched_tokens,
-                                                          device=device)
+        self.token_mapping_meta = LoRAKernelMeta.make(self.max_loras,
+                                                      max_num_batched_tokens,
+                                                      device=device)
 
-            # When cudagraph capture size is greater than max_num_seqs (max_batches,
-            # here), V0 captures the graph as if max_num_seqs is set to
-            # the capture size.
-            # V1 doesn't have this problem and always respects max_num_seqs.
-            max_num_prompts = (max_batches
-                               if envs.VLLM_USE_V1 else max_num_batched_tokens)
-            self.prompt_mapping_meta = LoRAKernelMeta.make(self.max_loras,
-                                                           max_num_prompts,
-                                                           device=device)
-        else:
-            # For torch_ops (BGMV/SGMV), we don't need kernel metadata
-            self.token_mapping_meta = None
-            self.prompt_mapping_meta = None
-            logger.info("Using PyTorch BGMV/SGMV operations (torch_ops) for LoRA")
+        # When cudagraph capture size is greater than max_num_seqs (max_batches,
+        # here), V0 captures the graph as if max_num_seqs is set to
+        # the capture size.
+        # V1 doesn't have this problem and always respects max_num_seqs.
+        max_num_prompts = (max_batches
+                           if envs.VLLM_USE_V1 else max_num_batched_tokens)
+        self.prompt_mapping_meta = LoRAKernelMeta.make(self.max_loras,
+                                                       max_num_prompts,
+                                                       device=device)
 
     def update_metadata(self, mapping: LoRAMapping,
                         lora_index_to_id: list[Optional[int]], max_loras: int,
@@ -76,10 +59,9 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self._update_base_metadata(mapping, lora_index_to_id, max_loras,
                                    vocab_size, extra_vocab_size)
 
-        # Prepare cuda kernel metadata tensors (only for Triton)
-        if USE_TRITON:
-            self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
-            self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+        # Prepare cuda kernel metadata tensors
+        self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
+        self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
 
     def add_shrink(self, y: torch.Tensor, x: torch.Tensor,
                    lora_a_stacked: tuple[torch.Tensor,
@@ -99,19 +81,13 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
-        if USE_TRITON:
-            lora_shrink(
-                x,
-                lora_a_stacked,
-                y,
-                *self.token_mapping_meta.meta_args(x.size(0)),
-                scale,
-            )
-        else:
-            # Use PyTorch BGMV implementation
-            # For torch_ops, we process each slice separately
-            for i, lora_a in enumerate(lora_a_stacked):
-                bgmv_shrink(x, lora_a, y[i], self.token_lora_indices, scale)
+        lora_shrink(
+            x,
+            lora_a_stacked,
+            y,
+            *self.token_mapping_meta.meta_args(x.size(0)),
+            scale,
+        )
 
     def add_expand(self,
                    y: torch.Tensor,
@@ -153,24 +129,14 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         assert x.size(0) == len(output_slices)
         num_tokens = x.size(1)  # first dimension is the num slices
 
-        if USE_TRITON:
-            lora_expand(
-                x,
-                lora_b_stacked,
-                y,
-                *self.token_mapping_meta.meta_args(num_tokens),
-                offset_start=offset_start,
-                add_inputs=True,
-            )
-        else:
-            # Use PyTorch BGMV implementation
-            # Process each slice separately
-            offset = offset_start
-            for i, (lora_b, slice_size) in enumerate(zip(lora_b_stacked, output_slices)):
-                x_slice = x[i]  # Shape: (num_tokens, rank)
-                y_slice = y[:, offset:offset + slice_size]
-                bgmv_expand(x_slice, lora_b, y_slice, self.token_lora_indices, add_inputs=add_inputs)
-                offset += slice_size
+        lora_expand(
+            x,
+            lora_b_stacked,
+            y,
+            *self.token_mapping_meta.meta_args(num_tokens),
+            offset_start=offset_start,
+            add_inputs=True,
+        )
 
         y = y.view_as(y_org)
 
@@ -193,18 +159,14 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
 
-        if USE_TRITON:
-            lora_expand(
-                x.unsqueeze(dim=0),
-                (lora_b_stacked, ),
-                y,
-                *self.token_mapping_meta.meta_args(x.size(0)),
-                offset_start=0,
-                add_inputs=add_inputs,
-            )
-        else:
-            # Use PyTorch BGMV implementation
-            bgmv_expand(x, lora_b_stacked, y, self.token_lora_indices, add_inputs=add_inputs)
+        lora_expand(
+            x.unsqueeze(dim=0),
+            (lora_b_stacked, ),
+            y,
+            *self.token_mapping_meta.meta_args(x.size(0)),
+            offset_start=0,
+            add_inputs=add_inputs,
+        )
 
     def add_lora_linear(self,
                         y: torch.Tensor,
@@ -240,20 +202,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             buffer (Optional[torch.Tensor]): Defaults to None.
         """
 
-        # DEBUG: Log punica wrapper call
-        if not hasattr(self, '_punica_logged'):
-            self._punica_logged = True
-            logger.info(f"[Punica GPU Debug] add_lora_linear called")
-            logger.info(f"  y.shape: {y.shape}, y sample: {y[0, :5].tolist()}")
-            logger.info(f"  x.shape: {x.shape}")
-            logger.info(f"  scale: {scale}")
-            logger.info(f"  token_lora_indices: {self._token_lora_indices[:min(10, len(self._token_lora_indices))].tolist()}")
-            for i, (lora_a, lora_b) in enumerate(zip(lora_a_stacked, lora_b_stacked)):
-                logger.info(f"  Stack {i}: lora_a.shape={lora_a.shape}, lora_b.shape={lora_b.shape}")
-                logger.info(f"  Stack {i}: lora_a norm={lora_a.norm().item():.10f}, lora_b norm={lora_b.norm().item():.10f}")
-
-        y_before = y.clone() if not hasattr(self, '_punica_logged_2') else None
-
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
         if lora_bias_stacked is not None:
             assert len(lora_bias_stacked) == len(output_slices)
@@ -277,12 +225,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             lora_a_stacked,
             scale,
             **kwargs)
-        
-        # DEBUG: Check buffer after shrink (x @ lora_a * scale)
-        if y_before is not None:
-            logger.info(f"  After shrink: buffer.shape={buffer.shape}, buffer norm={buffer.norm().item():.10f}")
-            logger.info(f"  buffer sample: {buffer[0, 0, :min(5, buffer.shape[-1])].tolist()}")
-        
         self.add_expand(
             y,
             buffer,  # type: ignore
@@ -291,13 +233,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             output_slices,
             add_inputs=True,
             **kwargs)
-        
-        # DEBUG: Check what changed
-        if y_before is not None:
-            self._punica_logged_2 = True
-            delta = (y - y_before).abs().max().item()
-            logger.info(f"  After expand: y changed by {delta:.10f}")
-            logger.info(f"  y sample after: {y[0, :5].tolist()}")
 
     def add_lora_logits(self,
                         y: torch.Tensor,
@@ -334,18 +269,11 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                                  dtype=torch.float32,
                                  device=x.device)
 
-        if USE_TRITON:
-            lora_shrink(x, [lora_a_stacked], buffer.unsqueeze(dim=0),
-                        *self.prompt_mapping_meta.meta_args(x.size(0)), scale)
+        lora_shrink(x, [lora_a_stacked], buffer.unsqueeze(dim=0),
+                    *self.prompt_mapping_meta.meta_args(x.size(0)), scale)
 
-            lora_expand(buffer.unsqueeze(dim=0), [lora_b_stacked],
-                        y,
-                        *self.prompt_mapping_meta.meta_args(buffer.size(0)),
-                        add_inputs=True)
-        else:
-            # Use PyTorch BGMV implementation
-            # buffer = (x @ lora_a) * scale
-            bgmv_shrink(x, lora_a_stacked, buffer, self.sampler_indices, scale)
-            # y += buffer @ lora_b
-            bgmv_expand(buffer, lora_b_stacked, y, self.sampler_indices, add_inputs=True)
+        lora_expand(buffer.unsqueeze(dim=0), [lora_b_stacked],
+                    y,
+                    *self.prompt_mapping_meta.meta_args(buffer.size(0)),
+                    add_inputs=True)
         y = y.view_as(y_org)

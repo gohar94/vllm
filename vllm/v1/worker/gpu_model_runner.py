@@ -2359,6 +2359,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             cudagraph_runtime_mode, batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(batch_descriptor)
 
+            # Zero out KV cache BEFORE training forward pass to ensure clean state
+            # This ensures no residual data from profiling or previous runs
+            print(f"[Training Debug] Zeroing KV cache before forward pass. Num caches: {len(self.kv_caches)}")
+            for i, kv_cache in enumerate(self.kv_caches):
+                norm_before = kv_cache.norm().item()
+                kv_cache.zero_()
+                print(f"[Training Debug] KV cache {i}: norm before zero = {norm_before:.6f}, after = {kv_cache.norm().item():.6f}")
+
         # Run the model WITHOUT torch.inference_mode() to enable gradients
         with (set_forward_context(
                 attn_metadata,
@@ -2511,6 +2519,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 req_id_to_index[req_id] = len(req_ids_output) - 1
                 offset += num_tokens
 
+        # Note: KV cache was already zeroed before the forward pass
+        # This ensures clean state for the training computation
+        
         # Return training output
         # Note: For training, we don't have sampled_token_ids or logprobs
         return ModelRunnerOutput(

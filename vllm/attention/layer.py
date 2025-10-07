@@ -597,11 +597,6 @@ def unified_attention_with_output(
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
 
-    if log:
-        torch.save(kv_cache, "attn_layer_kv_cache_before.pt")
-        kv_cache.zero_()
-        torch.save(kv_cache, "attn_layer_kv_cache_after.pt")
-
     self.impl.forward(self,
                       query,
                       key,
@@ -623,6 +618,8 @@ def unified_attention_with_output(
             torch.save(output_block_scale, "attn_layer_output_block_scale.pt")
         if kv_cache is not None:
             torch.save(kv_cache, "attn_layer_kv_cache.pt")
+        torch.save(attn_metadata.slot_mapping, "attn_metadata_slot_mapping.pt")
+        torch.save(attn_metadata.block_table, "attn_metadata_block_table.pt")
         print(f"Saved all tensors to files")
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
