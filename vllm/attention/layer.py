@@ -603,6 +603,7 @@ def unified_attention_with_output(
                       output=output,
                       output_scale=output_scale,
                       output_block_scale=output_block_scale)
+
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
 

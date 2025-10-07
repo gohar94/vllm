@@ -56,7 +56,6 @@ from vllm.transformers_utils.tokenizer import (AnyTokenizer, MistralTokenizer,
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, Device, as_iter, is_list_of
 from vllm.v1.sample.logits_processor import LogitsProcessor
-from vllm.lora.training_manager import TrainingManager
 
 if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
@@ -530,10 +529,6 @@ class LLM:
                     "'text' (SFTTrainer format), 'messages' (chat format), "
                     "or 'prompt'/'prompt_token_ids' (legacy format)")
 
-
-        # lora_request = self.training_manager.add_lora()
-        # logger.info(f"[LaAL]: Added LoRA {lora_request.lora_int_id} with name {lora_request.lora_name} and path {lora_request.lora_path}")
-
         # Add training requests to the engine and collect their IDs
         request_ids = self._add_training_requests(
             training_data=training_data,
@@ -582,8 +577,6 @@ class LLM:
                 'num_tokens': num_tokens,
             })
 
-        # Note: KV cache is now automatically zeroed after each training step
-        # in execute_model_training() in the model runner
         return results
 
     def _get_modality_specific_lora_reqs(
@@ -1907,9 +1900,9 @@ class LLM:
 
         # Add to output processor first (needed for get_num_unfinished_requests)
         prompt_str = prompt if isinstance(prompt,
-                                            str) else str(prompt_token_ids)
-        self.llm_engine.output_processor.add_request(
-            training_request, prompt_str, None, 0)
+                                          str) else str(prompt_token_ids)
+        self.llm_engine.output_processor.add_request(training_request,
+                                                     prompt_str, None, 0)
 
         # Then add to scheduler for execution
         # For V1, the engine has engine_core which contains the actual EngineCore
