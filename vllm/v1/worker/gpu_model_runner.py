@@ -1007,20 +1007,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
+        # Check if this is a training batch (all requests are training)
+        is_training_batch = False
+        if self.input_batch.num_reqs > 0:
+            # Check if any request is a training request
+            training_count = sum(
+                1 for req_id in self.input_batch.req_ids
+                if req_id is not None and (req_state := self.requests.get(
+                    req_id)) is not None and req_state.is_training)
+            is_training_batch = (training_count == self.input_batch.num_reqs)
+
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
-            # Check if this is a training batch (all requests are training)
-            is_training_batch = False
-            if self.input_batch.num_reqs > 0:
-                # Check if any request is a training request
-                training_count = sum(
-                    1 for req_id in self.input_batch.req_ids
-                    if req_id is not None and (req_state := self.requests.get(
-                        req_id)) is not None and req_state.is_training)
-                is_training_batch = (
-                    training_count == self.input_batch.num_reqs)
-
             if is_training_batch:
                 # For training, we need logits for ALL tokens, not just last ones
                 # Create indices for all tokens: [0, 1, 2, ..., total_num_scheduled_tokens-1]
@@ -1153,6 +1152,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         gpu[:num_reqs],
                         num_draft_tokens=self.num_draft_tokens.gpu[:num_reqs],
                     )
+
+                # Add is_training flag to metadata args for XFormers backend
+                if is_training_batch:
+                    extra_attn_metadata_args['is_training'] = True
 
                 if ubatch_slices is not None:
                     common_attn_metadata_list = split_attn_metadata(
