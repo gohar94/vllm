@@ -195,9 +195,18 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
             dtype=self.embeddings_tensors.dtype,
             device=self.embeddings_tensors.device,
         )
-        torch.matmul(self.embeddings_tensors,
-                     hidden_states.T,
-                     out=lora_logits[:-1])
+
+        # CRITICAL: For training, we cannot use out= parameter as it doesn't support autograd
+        # Check if gradients are required (training mode)
+        if hidden_states.requires_grad or self.embeddings_tensors.requires_grad:
+            # Training mode: compute without out= parameter to enable gradient flow
+            lora_logits[:-1] = torch.matmul(self.embeddings_tensors,
+                                            hidden_states.T)
+        else:
+            # Inference mode: use out= parameter for efficiency
+            torch.matmul(self.embeddings_tensors,
+                         hidden_states.T,
+                         out=lora_logits[:-1])
 
         neg_inf, pos_inf = current_platform.get_infinity_values(
             lora_logits.dtype)
