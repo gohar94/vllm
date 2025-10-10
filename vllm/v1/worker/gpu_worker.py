@@ -422,29 +422,37 @@ class Worker(WorkerBase):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
-    @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[Union[ModelRunnerOutput, AsyncModelRunnerOutput]]:
-        intermediate_tensors = None
-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        num_input_tokens = self.model_runner._get_num_input_tokens(
-            num_scheduled_tokens)
-        all_gather_tensors = {
-            "residual":
-            not is_residual_scattered_for_sp(self.vllm_config,
-                                             num_input_tokens)
-        }
-        if forward_pass and not get_pp_group().is_first_rank:
-            intermediate_tensors = IntermediateTensors(
-                get_pp_group().recv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors))
+        # Check if this batch contains training requests
+        has_training_requests = any(
+            req.is_training for req in scheduler_output.scheduled_new_reqs)
+        
+        # Use inference_mode context manager conditionally instead of decorator
+        # This allows gradient computation for training requests
+        inference_mode_context = torch.inference_mode() if not has_training_requests else nullcontext()
+        
+        with inference_mode_context:
+            intermediate_tensors = None
+            forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+            num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+            num_input_tokens = self.model_runner._get_num_input_tokens(
+                num_scheduled_tokens)
+            all_gather_tensors = {
+                "residual":
+                not is_residual_scattered_for_sp(self.vllm_config,
+                                                 num_input_tokens)
+            }
+            if forward_pass and not get_pp_group().is_first_rank:
+                intermediate_tensors = IntermediateTensors(
+                    get_pp_group().recv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors))
 
-        output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
+            output = self.model_runner.execute_model(scheduler_output,
+                                                     intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
             return output
 

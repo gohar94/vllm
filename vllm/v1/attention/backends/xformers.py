@@ -481,24 +481,33 @@ class XFormersAttentionImpl(AttentionImpl):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        # DEBUG: Check input tensors
+        print(f"[Attention Grad Check] query requires_grad: {query.requires_grad}, grad_fn: {query.grad_fn is not None}")
+        print(f"[Attention Grad Check] key requires_grad: {key.requires_grad}, grad_fn: {key.grad_fn is not None}")
+        print(f"[Attention Grad Check] value requires_grad: {value.requires_grad}, grad_fn: {value.grad_fn is not None}")
+        
         num_tokens = query.shape[0]
 
         # For training, we process all tokens together
-        # Reshape query from [num_tokens, num_heads, head_size] to
-        # [1, num_tokens, num_kv_heads, num_queries_per_kv, head_size] for xformers
-        q = query.view(1, num_tokens, self.num_kv_heads,
-                       self.num_queries_per_kv, self.head_size)
-
-        # Reshape key and value from [num_tokens, num_kv_heads, head_size] to
-        # [1, num_tokens, num_kv_heads, 1, head_size] and then expand to match query
-        k = key.view(1, num_tokens, self.num_kv_heads, 1,
-                     self.head_size).expand(1, num_tokens, self.num_kv_heads,
-                                            self.num_queries_per_kv,
-                                            self.head_size)
-        v = value.view(1, num_tokens, self.num_kv_heads, 1,
-                       self.head_size).expand(1, num_tokens, self.num_kv_heads,
-                                              self.num_queries_per_kv,
-                                              self.head_size)
+        # Reshape tensors for xformers BMHK format: [batch, seqlen, num_heads, head_size]
+        # xformers backward doesn't support BMGHK format, so we expand K/V to num_heads
+        
+        # Query: [num_tokens, num_heads, head_size] -> [1, num_tokens, num_heads, head_size]
+        q = query.unsqueeze(0)
+        
+        # Key/Value: [num_tokens, num_kv_heads, head_size] -> [1, num_tokens, num_heads, head_size]
+        if self.num_kv_heads != self.num_heads:
+            # GQA: Expand K and V by repeating each kv_head num_queries_per_kv times
+            k = key.unsqueeze(0).unsqueeze(3).expand(
+                1, num_tokens, self.num_kv_heads, self.num_queries_per_kv, self.head_size
+            ).reshape(1, num_tokens, self.num_heads, self.head_size)
+            v = value.unsqueeze(0).unsqueeze(3).expand(
+                1, num_tokens, self.num_kv_heads, self.num_queries_per_kv, self.head_size
+            ).reshape(1, num_tokens, self.num_heads, self.head_size)
+        else:
+            # MHA: just add batch dimension
+            k = key.unsqueeze(0)
+            v = value.unsqueeze(0)
 
         # Create causal mask for training
         # LowerTriangular creates a causal mask where each token can only attend to
@@ -506,9 +515,9 @@ class XFormersAttentionImpl(AttentionImpl):
         from xformers.ops.fmha.attn_bias import LowerTriangularMask
         attn_bias = LowerTriangularMask()
 
-        # Use xformers memory_efficient_attention_forward directly
-        # This allows gradients to flow through for backward pass
-        attn_output = xops.memory_efficient_attention_forward(
+        # Use xformers memory_efficient_attention (NOT _forward) for training
+        # This function supports both forward and backward passes
+        attn_output = xops.memory_efficient_attention(
             q,
             k,
             v,
@@ -516,10 +525,17 @@ class XFormersAttentionImpl(AttentionImpl):
             p=0.0,  # No dropout
             scale=self.scale,
         )
+        
+        # DEBUG: Check attention output
+        print(f"[Attention Grad Check] attn_output requires_grad: {attn_output.requires_grad}, grad_fn: {attn_output.grad_fn is not None}")
+        if attn_output.grad_fn:
+            print(f"[Attention Grad Check] attn_output.grad_fn: {attn_output.grad_fn}")
 
-        # Reshape output from [1, num_tokens, num_kv_heads, num_queries_per_kv, head_size]
+        # Reshape output from [1, num_tokens, num_heads, head_size]
         # back to [num_tokens, num_heads, head_size]
-        output[:] = attn_output.view(num_tokens, self.num_heads,
-                                     self.head_size)
+        output[:] = attn_output.squeeze(0)
+        
+        # DEBUG: Check final output
+        print(f"[Attention Grad Check] output requires_grad: {output.requires_grad}, grad_fn: {output.grad_fn is not None}")
 
         return output
