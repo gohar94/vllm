@@ -43,6 +43,8 @@ class CachedRequestState:
     mrope_position_delta: Optional[int] = None
 
     lora_request: Optional[LoRARequest] = None
+    is_training: bool = False
+    training_config: Optional["TrainingConfig"] = None
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
@@ -64,10 +66,7 @@ class CachedRequestState:
     def get_token_id(self, idx: int) -> int:
         if idx < self.num_prompt_tokens:
             return self.prompt_token_ids[idx]
-        elif idx - self.num_prompt_tokens < len(self.output_token_ids):
-            return self.output_token_ids[idx - self.num_prompt_tokens]
-        else:
-            return -1
+        return self.output_token_ids[idx - self.num_prompt_tokens]
 
 
 class InputBatch:
@@ -402,6 +401,10 @@ class InputBatch:
             self.pooling_params[req_id] = pooling_params
             self.logits_processing_needs_token_ids[req_index] = (
                 pooling_params.requires_token_ids)
+        elif request.is_training:
+            # Training request: no sampling or pooling params needed
+            # Training requests only compute loss, no token generation
+            pass
         else:
             raise NotImplementedError("Unrecognized request type")
 
@@ -761,23 +764,34 @@ class InputBatch:
                                               non_blocking=True)
 
     def make_lora_inputs(
-        self, num_scheduled_tokens: np.ndarray
+        self, num_scheduled_tokens: np.ndarray, is_training_batch: bool = False
     ) -> tuple[tuple[int, ...], tuple[int, ...], set[LoRARequest]]:
         """
         Given the num_scheduled_tokens for each request in the batch, return
         datastructures used to activate the current LoRAs.
+        Args:
+            num_scheduled_tokens: Number of tokens scheduled for each request.
+            is_training_batch: If True, create per-token prompt mapping for training.
         Returns:
-            1. prompt_lora_mapping: A tuple of size self.num_reqs where,
-               prompt_lora_mapping[i] is the LoRA id to use for the ith prompt.
+            1. prompt_lora_mapping: A tuple of size self.num_reqs (for inference)
+               or sum(num_scheduled_tokens) (for training) where each entry is
+               the LoRA id to use for that prompt/token.
             2. token_lora_mapping: A tuple of size np.sum(num_scheduled_tokens)
                where, token_lora_mapping[i] is the LoRA id to use for ith token.
             3. lora_requests: Set of relevant LoRA requests.
         """
 
         req_lora_mapping = self.request_lora_mapping[:self.num_reqs]
-        prompt_lora_mapping = tuple(req_lora_mapping)
         token_lora_mapping = tuple(
             req_lora_mapping.repeat(num_scheduled_tokens))
+        
+        if is_training_batch:
+            # For training, we need per-token mapping since we compute logits for all tokens
+            prompt_lora_mapping = token_lora_mapping
+        else:
+            # For inference, we only need per-request mapping (for last token sampling)
+            prompt_lora_mapping = tuple(req_lora_mapping)
+        
         active_lora_requests: set[LoRARequest] = set(
             self.lora_id_to_lora_request.values())
 

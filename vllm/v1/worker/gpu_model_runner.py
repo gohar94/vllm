@@ -257,6 +257,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
+        # Training manager for LoRA training (initialized after model load)
+        self.training_manager = None
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -581,6 +584,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                is_training=new_req_data.is_training,
+                training_config=new_req_data.training_config,
             )
             self.requests[req_id] = req_state
 
@@ -1002,15 +1007,33 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
+        # Check if this is a training batch (all requests are training)
+        is_training_batch = False
+        if self.input_batch.num_reqs > 0:
+            # Check if any request is a training request
+            training_count = sum(
+                1 for req_id in self.input_batch.req_ids
+                if req_id is not None and (req_state := self.requests.get(
+                    req_id)) is not None and req_state.is_training)
+            is_training_batch = (training_count == self.input_batch.num_reqs)
+
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
-            # NOTE(woosuk): Due to chunked prefills, the batch may contain
-            # partial requests. While we should not sample any token
-            # from these partial requests, we do so for simplicity.
-            # We will ignore the sampled tokens from the partial requests.
-            # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            if is_training_batch:
+                # For training, we need logits for ALL tokens, not just last ones
+                # Create indices for all tokens: [0, 1, 2, ..., total_num_scheduled_tokens-1]
+                logits_indices = torch.arange(total_num_scheduled_tokens,
+                                              dtype=torch.int32,
+                                              device="cpu")
+            else:
+                # For inference: select only the last token of each sequence for sampling
+                # NOTE(woosuk): Due to chunked prefills, the batch may contain
+                # partial requests. While we should not sample any token
+                # from these partial requests, we do so for simplicity.
+                # We will ignore the sampled tokens from the partial requests.
+                # TODO: Support prompt logprobs.
+                logits_indices = query_start_loc[1:] - 1
             num_draft_tokens = None
             spec_decode_metadata = None
         else:
@@ -1130,6 +1153,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         num_draft_tokens=self.num_draft_tokens.gpu[:num_reqs],
                     )
 
+                # Add is_training flag to metadata args for XFormers backend
+                if is_training_batch:
+                    extra_attn_metadata_args['is_training'] = True
+
                 if ubatch_slices is not None:
                     common_attn_metadata_list = split_attn_metadata(
                         ubatch_slices, common_attn_metadata)
@@ -1154,7 +1181,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Hot-Swap lora model
         if self.lora_config:
-            self.set_active_loras(self.input_batch, num_scheduled_tokens)
+            self.set_active_loras(self.input_batch, num_scheduled_tokens,
+                                  is_training_batch)
 
         return (attn_metadata, logits_indices, spec_decode_metadata,
                 num_scheduled_tokens, spec_decode_common_attn_metadata,
@@ -1837,6 +1865,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
             # then the embedding layer is not included in the CUDA graph.
+            # EXCEPTION: For training, we MUST use embeddings to enable gradients
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
@@ -2027,8 +2056,35 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             invalid_req_indices,
         )
 
-    @torch.inference_mode()
     def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        """Execute model - dispatches to training or inference based on request type.
+        
+        Args:
+            scheduler_output: Output from the scheduler
+            intermediate_tensors: Intermediate tensors from previous pipeline stage
+            
+        Returns:
+            ModelRunnerOutput (or async wrapper) or IntermediateTensors for PP
+        """
+        # Detect if this batch contains any training requests
+        has_training_requests = any(
+            req.is_training for req in scheduler_output.scheduled_new_reqs)
+
+        if has_training_requests:
+            # Dispatch to training execution (without @torch.inference_mode)
+            return self.execute_model_training(scheduler_output,
+                                               intermediate_tensors)
+        else:
+            # Dispatch to inference execution (with @torch.inference_mode)
+            return self.execute_model_inference(scheduler_output,
+                                                intermediate_tensors)
+
+    @torch.inference_mode()
+    def execute_model_inference(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
@@ -2232,6 +2288,458 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampled_token_ids=sampler_output.sampled_token_ids,
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
+        )
+
+    def execute_model_training(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> ModelRunnerOutput:
+        """Execute model for training requests.
+        
+        This is a specialized version of execute_model that:
+        1. Does NOT use torch.inference_mode() decorator
+        2. Skips KV cache allocation and management
+        3. Skips sampling and token generation
+        4. Computes and returns training loss
+        5. Enables gradient computation for backward pass
+        
+        Args:
+            scheduler_output: Output from the scheduler containing training requests
+            intermediate_tensors: Intermediate tensors from previous pipeline stage
+            
+        Returns:
+            ModelRunnerOutput with training losses instead of sampled tokens
+        """
+        with record_function_or_nullcontext("Preprocess"):
+            self._update_states(scheduler_output)
+            if not scheduler_output.total_num_scheduled_tokens:
+                # Return empty output if there's no work to do.
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+            if self.prepare_inputs_event is not None:
+                # Ensure prior step has finished with reused CPU tensors.
+                self.prepare_inputs_event.synchronize()
+            try:
+                # Prepare the decoder inputs.
+                # Note: For training, we still need attention metadata for the forward pass
+                (attn_metadata, logits_indices, spec_decode_metadata,
+                 num_scheduled_tokens_np, spec_decode_common_attn_metadata,
+                 max_query_len, ubatch_slices, num_tokens_after_padding
+                 ) = self._prepare_inputs(scheduler_output)
+
+            finally:
+                if self.prepare_inputs_event is not None:
+                    self.prepare_inputs_event.record()
+
+            (
+                num_scheduled_tokens,
+                num_input_tokens,
+                num_tokens_across_dp,
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
+                model_kwargs,
+            ) = self._preprocess(scheduler_output, intermediate_tensors,
+                                 ubatch_slices, num_tokens_after_padding)
+
+            if ubatch_slices is not None:
+                num_input_tokens = num_input_tokens // 2
+
+            uniform_decode = False  # Training always uses non-uniform decode
+            batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
+                                               uniform_decode=uniform_decode)
+            cudagraph_runtime_mode, batch_descriptor = \
+                self.cudagraph_dispatcher.dispatch(batch_descriptor)
+
+        # Run the model WITHOUT torch.inference_mode() to enable gradients
+        with (set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+                ubatch_slices=ubatch_slices,
+        ), record_function_or_nullcontext("Forward")):
+            # Enable gradient computation for training
+            # IMPORTANT: Keep torch.enable_grad() active for ENTIRE forward + loss computation
+            with torch.enable_grad():
+                # DEBUG: Check input tensors
+                print(
+                    f"[Grad Check] input_ids requires_grad: {input_ids.requires_grad if input_ids is not None else 'None'}"
+                )
+                print(
+                    f"[Grad Check] positions requires_grad: {positions.requires_grad}"
+                )
+                print(
+                    f"[Grad Check] inputs_embeds requires_grad: {inputs_embeds.requires_grad if inputs_embeds is not None else 'None'}"
+                )
+
+                # Check if this is a LoRA training request
+                is_lora_training = any(
+                    req.lora_request is not None
+                    for req in scheduler_output.scheduled_new_reqs)
+
+                # Set up parameter gradients for training
+                if is_lora_training and hasattr(self, 'training_manager'):
+                    # LoRA training: freeze base model, enable only LoRA parameters
+                    logger.info(
+                        "[Training] LoRA training mode - freezing base model parameters"
+                    )
+
+                    # Get the LoRA ID from the request
+                    lora_id = None
+                    for req in scheduler_output.scheduled_new_reqs:
+                        if req.lora_request is not None:
+                            lora_id = req.lora_request.lora_int_id
+                            break
+
+                    # If LoRA is loaded from disk, convert it to trainable Parameters
+                    if lora_id is not None:
+                        logger.info(
+                            f"[Training] Converting loaded LoRA {lora_id} to trainable Parameters..."
+                        )
+                        try:
+                            lora_stats = self.training_manager.make_lora_trainable(
+                                lora_id)
+                            logger.info(
+                                f"[Training] LoRA {lora_id} converted: "
+                                f"{lora_stats['trainable_params']}/{lora_stats['total_tensors']} "
+                                f"tensors now trainable")
+                        except Exception as e:
+                            logger.warning(
+                                f"[Training] Failed to convert LoRA {lora_id}: {e}"
+                            )
+
+                    # Freeze base model
+                    stats = self.training_manager.freeze_base_model(
+                        verbose=False)
+                    logger.info(
+                        f"[Training] Parameter setup: {stats['trainable']}/{stats['total']} parameters trainable "
+                        f"({100 * stats['trainable'] / stats['total']:.2f}%)")
+                else:
+                    # Full fine-tuning: enable all parameters
+                    logger.info(
+                        "[Training] Full fine-tuning mode - enabling all parameters"
+                    )
+                    param_count = 0
+                    grad_enabled_count = 0
+                    for name, param in self.model.named_parameters():
+                        param_count += 1
+                        if param.requires_grad:
+                            grad_enabled_count += 1
+                        param.requires_grad_(
+                            True)  # Force enable, even if already True
+
+                    logger.info(
+                        f"[Training] Model parameters: {param_count}, initially trainable: {grad_enabled_count}"
+                    )
+
+                # CRITICAL: For ALL training (LoRA or full), we need to use embeddings with gradient support
+                # The standard vLLM flow uses input_ids directly, which skips the embedding layer
+                # For gradient flow, we MUST compute embeddings explicitly so gradients can flow
+                if input_ids is not None:
+                    # Also ensure the model itself is in training mode
+                    self.model.train()
+                    logger.info(
+                        f"[Training] Model training mode: {self.model.training}"
+                    )
+
+                    # Get the embedding layer
+                    embed_layer = self.model.model.embed_tokens if hasattr(
+                        self.model, 'model') else self.model.embed_tokens
+                    logger.info(
+                        f"[Training] Embedding layer type: {type(embed_layer)}"
+                    )
+                    logger.info(
+                        f"[Training] Embedding weight requires_grad: {embed_layer.weight.requires_grad}"
+                    )
+
+                    # Use torch.nn.functional.embedding directly to compute embeddings
+                    # This is critical for gradient flow through embeddings
+                    embed_weight = embed_layer.weight
+                    if not embed_weight.requires_grad:
+                        # Temporarily enable gradients for the embedding lookup
+                        # This allows the gradient graph to be built through the embeddings
+                        embed_weight = embed_weight.detach().requires_grad_(
+                            True)
+                        logger.info(
+                            "[Training] Enabled gradients for embedding weight temporarily"
+                        )
+
+                    inputs_embeds = torch.nn.functional.embedding(
+                        input_ids, embed_weight)
+                    input_ids = None  # Clear input_ids so the model uses inputs_embeds
+
+                    logger.info(
+                        f"[Training] Computed embeddings: requires_grad={inputs_embeds.requires_grad}, has_grad_fn={inputs_embeds.grad_fn is not None}"
+                    )
+
+                # Check inputs_embeds one more time before model forward
+                if inputs_embeds is not None:
+                    logger.info(
+                        f"[Training] Before model forward - inputs_embeds requires_grad: {inputs_embeds.requires_grad}"
+                    )
+
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+
+                # DEBUG: Check model output
+                print(
+                    f"[Grad Check] After model forward - model_output requires_grad: {model_output.requires_grad}"
+                )
+                print(
+                    f"[Grad Check] After model forward - model_output has grad_fn: {model_output.grad_fn is not None}"
+                )
+                if model_output.grad_fn:
+                    print(
+                        f"[Grad Check] model_output.grad_fn: {model_output.grad_fn}"
+                    )
+                else:
+                    print(
+                        "[Grad Check] WARNING: Gradients lost in model forward pass!"
+                    )
+
+                # DEBUG: Log forward pass outputs
+                print(
+                    f"[vLLM Forward] model_output.shape={model_output.shape}")
+                print(
+                    f"[vLLM Forward] model_output[0,:5]={model_output[0,:5].tolist()}"
+                )
+
+                # For training, model_output should be hidden states
+                hidden_states = model_output
+
+                # Handle pipeline parallelism
+                if not get_pp_group().is_last_rank:
+                    # Return the intermediate tensors for next PP stage
+                    assert isinstance(hidden_states, IntermediateTensors)
+                    return hidden_states
+
+                # Select the hidden states for the tokens we want
+                # (logits_indices was prepared in _prepare_inputs - for training it includes ALL tokens)
+                hidden_states = hidden_states[logits_indices]
+                logger.info(
+                    f"[Training Debug] hidden_states.shape={hidden_states.shape}"
+                )
+
+                # Compute logits for loss calculation
+                # For training, we need logits for all tokens (achieved via logits_indices)
+                # MUST be inside torch.enable_grad() context!
+
+                # DEBUG: Check hidden states
+                print(
+                    f"[Grad Check] hidden_states requires_grad: {hidden_states.requires_grad}"
+                )
+                print(
+                    f"[Grad Check] hidden_states has grad_fn: {hidden_states.grad_fn is not None}"
+                )
+                if hidden_states.grad_fn:
+                    print(
+                        f"[Grad Check] hidden_states.grad_fn: {hidden_states.grad_fn}"
+                    )
+
+                logits = self.model.compute_logits(hidden_states, None)
+
+                # DEBUG: Check logits
+                print(
+                    f"[Grad Check] logits requires_grad: {logits.requires_grad}"
+                )
+                print(
+                    f"[Grad Check] logits has grad_fn: {logits.grad_fn is not None}"
+                )
+                if logits.grad_fn:
+                    print(f"[Grad Check] logits.grad_fn: {logits.grad_fn}")
+
+                # Collect losses and logits for each training request
+                # IMPORTANT: Loss computation must be inside torch.enable_grad() context!
+                losses = {}
+                logits_dict = {}
+                loss_tensors = []  # Keep loss tensors for backward pass
+                req_ids_output = []
+                req_id_to_index = {}
+
+                offset = 0
+                for i, req_id in enumerate(self.input_batch.req_ids):
+                    if req_id is None:
+                        continue
+
+                    req_state = self.requests.get(req_id)
+                    if req_state is None or not req_state.is_training:
+                        continue
+
+                    # Get the number of tokens for this request
+                    num_tokens = scheduler_output.num_scheduled_tokens.get(
+                        req_id, 0)
+                    if num_tokens == 0:
+                        continue
+
+                    # Extract logits and labels for this request
+                    request_logits = logits[offset:offset + num_tokens]
+
+                    # Store logits for this request (keep gradients for backward pass)
+                    logits_dict[req_id] = request_logits
+
+                    # Get labels from training config
+                    training_config = req_state.training_config
+                    if training_config is not None and training_config.labels is not None:
+                        labels = training_config.labels
+
+                        # Convert labels to tensor if needed and move to device
+                        if not isinstance(labels, torch.Tensor):
+                            labels = torch.tensor(labels,
+                                                  dtype=torch.long,
+                                                  device=self.device)
+                        else:
+                            labels = labels.to(self.device)
+
+                        # Ensure labels are the right length
+                        if len(labels) != num_tokens:
+                            logger.warning(
+                                f"Label length mismatch for request {req_id}: "
+                                f"expected {num_tokens}, got {len(labels)}")
+                            offset += num_tokens
+                            continue
+
+                        # Compute cross-entropy loss
+                        # Shift logits and labels for next-token prediction
+                        # logits: [seq_len, vocab_size], labels: [seq_len]
+                        logger.info(f"[Loss Debug] req_id={req_id}")
+                        logger.info(
+                            f"[Loss Debug] request_logits.shape={request_logits.shape}"
+                        )
+                        logger.info(
+                            f"[Loss Debug] labels.shape={labels.shape}")
+                        logger.info(
+                            f"[Loss Debug] labels[:10]={labels[:10].tolist()}")
+
+                        logger.info(
+                            f"[Loss Debug] request_logits[0, :5]={request_logits[0, :5].tolist()}"
+                        )
+
+                        shift_logits = request_logits[:-1, :].contiguous()
+                        shift_labels = labels[1:].contiguous()
+
+                        logger.info(
+                            f"[Loss Debug] shift_logits.shape={shift_logits.shape}"
+                        )
+                        logger.info(
+                            f"[Loss Debug] shift_labels.shape={shift_labels.shape}"
+                        )
+                        logger.info(
+                            f"[Loss Debug] shift_labels[:10]={shift_labels[:10].tolist()}"
+                        )
+
+                        loss_fct = torch.nn.CrossEntropyLoss()
+                        loss = loss_fct(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1))
+
+                        logger.info(f"[Loss Debug] loss={loss.item():.6f}")
+
+                        # DEBUG: Check loss tensor
+                        print(
+                            f"[Grad Check] loss requires_grad: {loss.requires_grad}"
+                        )
+                        print(
+                            f"[Grad Check] loss has grad_fn: {loss.grad_fn is not None}"
+                        )
+                        if loss.grad_fn:
+                            print(f"[Grad Check] loss.grad_fn: {loss.grad_fn}")
+
+                        # Store loss tensor for backward pass
+                        loss_tensors.append(loss)
+
+                        # Store scalar value for output
+                        losses[req_id] = loss.item()
+                    else:
+                        # No labels provided, cannot compute loss
+                        losses[req_id] = None
+
+                    req_ids_output.append(req_id)
+                    req_id_to_index[req_id] = len(req_ids_output) - 1
+                    offset += num_tokens
+
+        # Backward pass for training
+        # IMPORTANT: Backward must also be inside torch.enable_grad() context
+        with record_function_or_nullcontext("Backward"):
+            if loss_tensors:
+                with torch.enable_grad():
+                    # Combine all losses (average across requests)
+                    total_loss = torch.stack(loss_tensors).mean()
+
+                    logger.info(
+                        f"[Training] Starting backward pass. Total loss: {total_loss.item():.6f}"
+                    )
+
+                    # Compute gradients via backward pass
+                    total_loss.backward()
+
+                    logger.info("[Training] Backward pass completed")
+
+                    # Log gradient statistics
+                    grad_count = sum(1 for p in self.model.parameters()
+                                     if p.grad is not None)
+                    total_params = sum(1 for p in self.model.parameters())
+                    logger.info(
+                        f"[Training] Gradients computed for {grad_count}/{total_params} parameters"
+                    )
+
+                    # Collect and log LoRA-specific gradients if applicable
+                    if is_lora_training and hasattr(self, 'training_manager'):
+                        # Collect from loaded LoRA if we have an ID
+                        lora_gradients = self.training_manager.collect_lora_gradients(
+                            lora_id=lora_id)
+                        logger.info(
+                            f"[Training] Collected {len(lora_gradients)} LoRA gradients"
+                        )
+
+                        # Log gradient norms for LoRA parameters
+                        for name, grad in list(
+                                lora_gradients.items())[:5]:  # Log first 5
+                            grad_norm = grad.norm().item()
+                            grad_mean = grad.mean().item()
+                            logger.info(
+                                f"[Training] LoRA gradient {name}: "
+                                f"norm={grad_norm:.6f}, mean={grad_mean:.6f}, "
+                                f"shape={grad.shape}")
+                    else:
+                        # Log general gradient info for non-LoRA training
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None:
+                                grad_norm = param.grad.norm().item()
+                                logger.info(
+                                    f"[Training] Gradient {name}: norm={grad_norm:.6f}"
+                                )
+                                break  # Just log first grad as example
+
+        # Now detach logits for return (after backward pass)
+        logits_dict_detached = {
+            req_id: logits.detach().cpu()
+            for req_id, logits in logits_dict.items()
+        }
+
+        # Return training output
+        # Note: For training, we don't have sampled_token_ids or logprobs
+        return ModelRunnerOutput(
+            req_ids=req_ids_output,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=None,  # No sampling for training
+            logprobs=None,  # No logprobs for training
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=None,
+            num_nans_in_logits={},
+            training_losses=losses,  # Add training losses to output
+            training_logits=
+            logits_dict_detached,  # Add training logits to output
         )
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
@@ -2459,6 +2967,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                   self.scheduler_config,
                                                   self.lora_config,
                                                   self.device)
+                # Initialize TrainingManager for LoRA training
+                self._init_training_manager()
             if hasattr(self, "drafter"):
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
@@ -2517,6 +3027,40 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.NONE, self.device)
+
+    def _init_training_manager(self) -> None:
+        """Initialize the TrainingManager for LoRA training.
+        
+        This is called after the model is loaded with LoRA support.
+        The TrainingManager will extract layer dimensions from the model
+        and provide functionality to create random LoRA adapters for training.
+        """
+        from vllm.lora.training_manager import TrainingManager
+
+        # Determine rank and alpha from config or use defaults
+        rank = getattr(self.lora_config, 'max_lora_rank',
+                       8) if self.lora_config else 8
+        alpha = getattr(self.lora_config, 'lora_alpha',
+                        16) if self.lora_config else 16
+
+        # Default target modules for LoRA training (attention projections)
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+        self.training_manager = TrainingManager(
+            model=self.model,
+            lora_manager=self.lora_manager,
+            lora_config=self.lora_config,
+            device=self.device,
+            dtype=self.dtype,
+            sub_modules=None,
+            rank=rank,
+            alpha=alpha,
+            target_modules=target_modules,
+        )
+        logger.info(
+            f"TrainingManager initialized for LoRA training (rank={rank}, alpha={alpha})"
+        )
+        logger.info(f"Target modules for LoRA: {target_modules}")
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, \

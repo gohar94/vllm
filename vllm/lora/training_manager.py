@@ -1,0 +1,614 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+TrainingManager for managing LoRA adapters during training.
+
+This module provides functionality to create and manage LoRA adapters
+specifically for training purposes, including:
+- Initializing trainable LoRA parameters
+- Freezing base model parameters
+- Managing gradient flow for LoRA training
+"""
+
+import json
+import os
+from typing import Dict, List, Optional, Set
+
+import torch
+import torch.nn as nn
+from safetensors.torch import save_file
+
+from vllm.config.lora import LoRAConfig
+from vllm.logger import init_logger
+from vllm.lora.layers import BaseLayerWithLoRA
+from vllm.lora.lora import LoRALayerWeights
+from vllm.lora.models import LoRAModel
+from vllm.lora.worker_manager import WorkerLoRAManager
+from vllm.model_executor.models import SupportsLoRA
+
+logger = init_logger(__name__)
+
+# TODO(girfan): Make these configurable.
+RANK = 8
+ALPHA = 16
+
+
+class TrainingManager:
+    """Manages LoRA adapter training, including parameter initialization and gradient control."""
+
+    LoRA_PATH = "./llama3_dummy_lora"
+
+    def __init__(
+        self,
+        model: SupportsLoRA,
+        lora_manager: WorkerLoRAManager,
+        lora_config: LoRAConfig,
+        device: torch.device,
+        dtype: torch.dtype,
+        sub_modules: Optional[list[str]] = None,
+        rank: int = RANK,
+        alpha: int = ALPHA,
+        target_modules: Optional[List[str]] = None,
+    ):
+        """Initialize the Training Manager.
+        
+        Args:
+            model: The base model that supports LoRA
+            lora_manager: Worker LoRA manager for handling LoRA operations
+            lora_config: LoRA configuration
+            device: Device to place LoRA weights on
+            dtype: Data type for LoRA weights
+            sub_modules: Specific submodules to apply LoRA to (if None, use target_modules)
+            rank: LoRA rank (dimension of low-rank matrices)
+            alpha: LoRA alpha (scaling factor)
+            target_modules: List of module name patterns to apply LoRA (e.g., ["q_proj", "v_proj"])
+        """
+        self.model = model
+        self.lora_manager = lora_manager
+        self.lora_config = lora_config
+        self.device = device
+        self.dtype = dtype
+        self.rank = rank
+        self.alpha = alpha
+        self._next_lora_id = 1
+
+        # Track which modules have LoRA applied
+        self.lora_modules: Set[str] = set()
+        self.trainable_lora_params: Dict[str, nn.Parameter] = {}
+
+        # Determine target modules
+        if sub_modules:
+            self.sub_modules = sub_modules
+        elif target_modules:
+            self.sub_modules = self._find_target_modules(target_modules)
+        else:
+            # Default: apply to attention projection layers
+            self.sub_modules = self._find_target_modules(
+                ["q_proj", "k_proj", "v_proj", "o_proj"])
+
+        logger.info(
+            f"[TrainingManager] Initialized with {len(self.sub_modules)} target modules"
+        )
+        logger.info(
+            f"[TrainingManager] LoRA rank={self.rank}, alpha={self.alpha}")
+
+    def _find_target_modules(self, target_patterns: List[str]) -> List[str]:
+        """Find all module names that match the target patterns.
+        
+        Args:
+            target_patterns: List of patterns to match (e.g., ["q_proj", "v_proj"])
+            
+        Returns:
+            List of full module names that match any pattern
+        """
+        target_modules = []
+        for name, module in self.model.named_modules():
+            # Check if this module matches any target pattern
+            if any(pattern in name for pattern in target_patterns):
+                # Only include Linear layers and their LoRA variants
+                if isinstance(module, (nn.Linear, BaseLayerWithLoRA)):
+                    target_modules.append(name)
+                    logger.debug(
+                        f"[TrainingManager] Found target module: {name}")
+
+        logger.info(
+            f"[TrainingManager] Found {len(target_modules)} modules matching patterns {target_patterns}"
+        )
+        return target_modules
+
+    def create_lora(
+        self,
+        model: nn.Module,
+        sub_modules: list[str],
+        device: torch.device,
+        rank: Optional[int] = None,
+        alpha: Optional[int] = None,
+    ) -> LoRAModel:
+        """Create LoRA adapters for the specified submodules.
+        
+        Args:
+            model: The model to create LoRA adapters for
+            sub_modules: List of module names to apply LoRA to
+            device: Device to place LoRA weights on
+            rank: LoRA rank (uses self.rank if None)
+            alpha: LoRA alpha (uses self.alpha if None)
+            
+        Returns:
+            LoRAModel containing the created LoRA adapters
+        """
+        if rank is None:
+            rank = self.rank
+        if alpha is None:
+            alpha = self.alpha
+
+        loras: dict[str, LoRALayerWeights] = {}
+
+        for name in sub_modules:
+            try:
+                module = model.get_submodule(name)
+
+                # Get weight tensor from module
+                if hasattr(module, 'weight'):
+                    w = module.weight
+                elif isinstance(module, BaseLayerWithLoRA):
+                    # For LoRA layers, get base layer weight
+                    w = module.base_layer.weight
+                else:
+                    logger.warning(
+                        f"[TrainingManager] Module {name} has no weight, skipping"
+                    )
+                    continue
+
+                # Initialize LoRA weights following PEFT's default initialization:
+                # - lora_a (Matrix A): Kaiming uniform (same as nn.Linear)
+                # - lora_b (Matrix B): zeros
+                # This ensures ΔW = B @ A = 0 initially (zero-init principle)
+
+                # LoRA A: [input_dim, rank]
+                lora_a = torch.empty(
+                    [w.shape[1], rank],
+                    dtype=self.dtype,
+                    device=device,
+                    requires_grad=True  # CRITICAL: Enable gradients for training
+                )
+                torch.nn.init.kaiming_uniform_(lora_a, a=5**0.5)
+
+                # LoRA B: [rank, output_dim]
+                lora_b = torch.zeros(
+                    [rank, w.shape[0]],
+                    dtype=self.dtype,
+                    device=device,
+                    requires_grad=True  # CRITICAL: Enable gradients for training
+                )
+
+                loras[name] = LoRALayerWeights(
+                    name,
+                    rank,
+                    alpha,
+                    lora_a,
+                    lora_b,
+                )
+
+                # Track this as a LoRA module
+                self.lora_modules.add(name)
+
+                logger.info(
+                    f"[TrainingManager] Created LoRA for {name}: "
+                    f"A={lora_a.shape}, B={lora_b.shape}, "
+                    f"A_grad={lora_a.requires_grad}, B_grad={lora_b.requires_grad}"
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"[TrainingManager] Failed to create LoRA for {name}: {e}")
+                continue
+
+        lora_id = self._next_lora_id
+        self._next_lora_id += 1
+
+        lora_model = LoRAModel(lora_id, rank, loras)
+
+        logger.info(f"[TrainingManager] Created LoRAModel (id={lora_id}) with "
+                    f"{len(loras)} adapters, rank={rank}, alpha={alpha}")
+
+        return lora_model
+
+    def freeze_base_model(self, verbose: bool = True) -> Dict[str, int]:
+        """Freeze all base model parameters (non-LoRA).
+        
+        This ensures only LoRA parameters receive gradients during training.
+        
+        NOTE: When LoRA is loaded from disk, the LoRA parameters are managed
+        separately by vLLM's LoRA system and are NOT in model.named_parameters().
+        This function primarily freezes the base model. For training loaded LoRA
+        adapters, you need to access them through the LoRA manager.
+        
+        Args:
+            verbose: Whether to log detailed information
+            
+        Returns:
+            Dictionary with counts of frozen/trainable parameters
+        """
+        frozen_count = 0
+        total_count = 0
+        trainable_count = 0
+
+        # Debug: First, let's see what parameters we have
+        logger.info("[TrainingManager] Scanning model parameters...")
+        logger.info("[TrainingManager] Sample parameter names (first 10):")
+        for i, (name, param) in enumerate(self.model.named_parameters()):
+            if i < 10:
+                logger.info(
+                    f"[TrainingManager]   {i}: {name} (shape={param.shape})")
+
+        for name, param in self.model.named_parameters():
+            total_count += 1
+
+            # Check if this is a LoRA parameter
+            # LoRA parameters typically have 'lora_a' or 'lora_b' in their name
+            # or 'lora_a_stacked'/'lora_b_stacked' for vLLM's internal LoRA layers
+            is_lora_param = any([
+                'lora_a' in name.lower(), 'lora_b' in name.lower(),
+                'lora' in name.lower() and 'stacked' in name.lower(),
+                'lora' in name.lower()
+                and ('weight' in name.lower() or 'bias' in name.lower())
+            ])
+
+            if not is_lora_param:
+                param.requires_grad = False
+                frozen_count += 1
+                if verbose:
+                    logger.debug(f"[TrainingManager] Frozen: {name}")
+            else:
+                param.requires_grad = True
+                trainable_count += 1
+                self.trainable_lora_params[name] = param
+                if verbose:
+                    logger.info(
+                        f"[TrainingManager] Trainable: {name} (shape={param.shape})"
+                    )
+
+        # Check if we found any trainable LoRA parameters in model.named_parameters()
+        # Note: Loaded LoRA adapters are managed separately by LoRAModelManager and won't appear here
+        if trainable_count == 0 and hasattr(
+                self, 'lora_manager') and self.lora_manager:
+            logger.info(
+                "[TrainingManager] No LoRA parameters found in model.named_parameters(). "
+                "This is EXPECTED for loaded LoRA adapters - they are managed separately by LoRAModelManager. "
+                "LoRA parameters were already converted to trainable Parameters via make_lora_trainable()."
+            )
+
+        stats = {
+            'total': total_count,
+            'frozen': frozen_count,
+            'trainable': trainable_count,
+        }
+
+        logger.info(f"[TrainingManager] Parameter status: "
+                    f"{stats['frozen']}/{stats['total']} frozen, "
+                    f"{stats['trainable']}/{stats['total']} trainable "
+                    f"({100 * stats['trainable'] / stats['total']:.2f}%)")
+
+        return stats
+
+    def make_lora_trainable(self, lora_id: int) -> Dict[str, int]:
+        """Convert a loaded LoRA adapter to trainable Parameters.
+        
+        This method takes a LoRA adapter that was loaded from disk (stored as
+        tensors in LoRAModelManager) and converts its weights to nn.Parameters
+        with requires_grad=True, making them trainable.
+        
+        Args:
+            lora_id: The integer ID of the loaded LoRA adapter
+            
+        Returns:
+            Dictionary with statistics about converted parameters
+        """
+        if not self.lora_manager:
+            raise ValueError("LoRA manager not available")
+
+        # Get the loaded LoRA model from the manager
+        # Note: lora_manager.list_adapters() returns a set of IDs
+        # We need to access _adapter_manager to get the actual LoRAModel
+        lora_adapters = self.lora_manager.list_adapters()
+        if lora_id not in lora_adapters:
+            raise ValueError(
+                f"LoRA adapter {lora_id} not found in LoRA manager")
+
+        lora_model = self.lora_manager._adapter_manager.get_adapter(lora_id)
+        if lora_model is None:
+            raise ValueError(f"LoRA adapter {lora_id} could not be retrieved")
+
+        trainable_count = 0
+        total_tensors = 0
+
+        logger.info(
+            f"[TrainingManager] Converting LoRA {lora_id} to trainable Parameters..."
+        )
+
+        # Convert each LoRA weight tensor to a Parameter
+        for module_name, lora_weights in lora_model.loras.items():
+            # Check if this is a packed LoRA (lora_a and lora_b are lists)
+            is_packed = lora_weights.is_packed
+
+            if is_packed:
+                # PackedLoRALayerWeights: lora_a and lora_b are lists of tensors
+                logger.debug(
+                    f"[TrainingManager] Processing packed LoRA: {module_name}")
+
+                # Convert each tensor in the lora_a list
+                if lora_weights.lora_a is not None:
+                    for i, tensor in enumerate(lora_weights.lora_a):
+                        if tensor is not None:
+                            total_tensors += 1
+                            if not isinstance(tensor, nn.Parameter):
+                                # Convert to Parameter with requires_grad=True
+                                lora_weights.lora_a[i] = nn.Parameter(
+                                    tensor.clone().detach(),
+                                    requires_grad=True)
+                                trainable_count += 1
+                                logger.debug(
+                                    f"[TrainingManager] Converted {module_name}.lora_a[{i}] to Parameter "
+                                    f"(shape={lora_weights.lora_a[i].shape})")
+                            else:
+                                lora_weights.lora_a[i].requires_grad = True
+                                trainable_count += 1
+
+                # Convert each tensor in the lora_b list
+                if lora_weights.lora_b is not None:
+                    for i, tensor in enumerate(lora_weights.lora_b):
+                        if tensor is not None:
+                            total_tensors += 1
+                            if not isinstance(tensor, nn.Parameter):
+                                # Convert to Parameter with requires_grad=True
+                                lora_weights.lora_b[i] = nn.Parameter(
+                                    tensor.clone().detach(),
+                                    requires_grad=True)
+                                trainable_count += 1
+                                logger.debug(
+                                    f"[TrainingManager] Converted {module_name}.lora_b[{i}] to Parameter "
+                                    f"(shape={lora_weights.lora_b[i].shape})")
+                            else:
+                                lora_weights.lora_b[i].requires_grad = True
+                                trainable_count += 1
+            else:
+                # Regular LoRALayerWeights: lora_a and lora_b are single tensors
+                total_tensors += 2  # lora_a and lora_b
+
+                # Convert lora_a to Parameter
+                if lora_weights.lora_a is not None:
+                    if not isinstance(lora_weights.lora_a, nn.Parameter):
+                        # Convert tensor to Parameter with requires_grad=True
+                        lora_weights.lora_a = nn.Parameter(
+                            lora_weights.lora_a.clone().detach(),
+                            requires_grad=True)
+                        trainable_count += 1
+                        logger.debug(
+                            f"[TrainingManager] Converted {module_name}.lora_a to Parameter "
+                            f"(shape={lora_weights.lora_a.shape})")
+                    else:
+                        lora_weights.lora_a.requires_grad = True
+                        trainable_count += 1
+
+                # Convert lora_b to Parameter
+                if lora_weights.lora_b is not None:
+                    if not isinstance(lora_weights.lora_b, nn.Parameter):
+                        # Convert tensor to Parameter with requires_grad=True
+                        lora_weights.lora_b = nn.Parameter(
+                            lora_weights.lora_b.clone().detach(),
+                            requires_grad=True)
+                        trainable_count += 1
+                        logger.debug(
+                            f"[TrainingManager] Converted {module_name}.lora_b to Parameter "
+                            f"(shape={lora_weights.lora_b.shape})")
+                    else:
+                        lora_weights.lora_b.requires_grad = True
+                        trainable_count += 1
+
+        stats = {
+            'lora_id': lora_id,
+            'total_tensors': total_tensors,
+            'trainable_params': trainable_count,
+        }
+
+        logger.info(
+            f"[TrainingManager] LoRA {lora_id} conversion complete: "
+            f"{trainable_count}/{total_tensors} tensors converted to trainable Parameters"
+        )
+
+        # Debug: Print all converted layer names
+        logger.info(
+            f"[TrainingManager] Converted LoRA layers for adapter {lora_id}:")
+        for module_name, lora_weights in lora_model.loras.items():
+            is_packed = lora_weights.is_packed
+            if is_packed:
+                num_components = len(
+                    [t for t in lora_weights.lora_a
+                     if t is not None]) if lora_weights.lora_a else 0
+                logger.info(
+                    f"[TrainingManager]   - {module_name} (PACKED, {num_components} components)"
+                )
+            else:
+                logger.info(f"[TrainingManager]   - {module_name} (regular)")
+
+        # Verify that parameters have requires_grad=True
+        logger.info(
+            f"[TrainingManager] Verifying gradient settings for adapter {lora_id}:"
+        )
+        grad_enabled_count = 0
+        for module_name, lora_weights in lora_model.loras.items():
+            if lora_weights.is_packed:
+                # Check packed LoRA
+                for i, tensor in enumerate(lora_weights.lora_a or []):
+                    if tensor is not None and tensor.requires_grad:
+                        grad_enabled_count += 1
+                for i, tensor in enumerate(lora_weights.lora_b or []):
+                    if tensor is not None and tensor.requires_grad:
+                        grad_enabled_count += 1
+            else:
+                # Check regular LoRA
+                if lora_weights.lora_a is not None and lora_weights.lora_a.requires_grad:
+                    grad_enabled_count += 1
+                if lora_weights.lora_b is not None and lora_weights.lora_b.requires_grad:
+                    grad_enabled_count += 1
+
+        logger.info(
+            f"[TrainingManager] ✓ {grad_enabled_count}/{trainable_count} LoRA tensors have requires_grad=True"
+        )
+
+        return stats
+
+    def enable_lora_gradients(self, lora_model: LoRAModel) -> None:
+        """Ensure all LoRA parameters have gradients enabled.
+        
+        Args:
+            lora_model: The LoRA model to enable gradients for
+        """
+        for module_name, lora_weights in lora_model.loras.items():
+            if lora_weights.lora_a is not None:
+                lora_weights.lora_a.requires_grad = True
+                logger.debug(
+                    f"[TrainingManager] Enabled gradients for {module_name}.lora_a "
+                    f"(shape={lora_weights.lora_a.shape})")
+
+            if lora_weights.lora_b is not None:
+                lora_weights.lora_b.requires_grad = True
+                logger.debug(
+                    f"[TrainingManager] Enabled gradients for {module_name}.lora_b "
+                    f"(shape={lora_weights.lora_b.shape})")
+
+    def collect_lora_gradients(self,
+                               lora_id: Optional[int] = None
+                               ) -> Dict[str, torch.Tensor]:
+        """Collect gradients from LoRA parameters.
+        
+        Args:
+            lora_id: If provided, collect gradients from this specific loaded LoRA.
+                    If None, collect from model.named_parameters() (created LoRAs).
+        
+        Returns:
+            Dictionary mapping parameter names to their gradients
+        """
+        gradients = {}
+
+        if lora_id is not None:
+            # Collect gradients from loaded LoRA adapter
+            if not self.lora_manager:
+                logger.warning("[TrainingManager] LoRA manager not available")
+                return gradients
+
+            lora_adapters = self.lora_manager.list_adapters()
+            if lora_id not in lora_adapters:
+                logger.warning(f"[TrainingManager] LoRA {lora_id} not found")
+                return gradients
+
+            lora_model = self.lora_manager._adapter_manager.get_adapter(
+                lora_id)
+            if lora_model is None:
+                logger.warning(
+                    f"[TrainingManager] LoRA {lora_id} could not be retrieved")
+                return gradients
+
+            # Collect gradients from LoRA weights
+            for module_name, lora_weights in lora_model.loras.items():
+                is_packed = lora_weights.is_packed
+
+                if is_packed:
+                    # PackedLoRALayerWeights: collect from lists
+                    if lora_weights.lora_a is not None:
+                        for i, tensor in enumerate(lora_weights.lora_a):
+                            if tensor is not None and tensor.grad is not None:
+                                gradients[
+                                    f"{module_name}.lora_a[{i}]"] = tensor.grad.clone(
+                                    )
+
+                    if lora_weights.lora_b is not None:
+                        for i, tensor in enumerate(lora_weights.lora_b):
+                            if tensor is not None and tensor.grad is not None:
+                                gradients[
+                                    f"{module_name}.lora_b[{i}]"] = tensor.grad.clone(
+                                    )
+                else:
+                    # Regular LoRALayerWeights: collect from single tensors
+                    if lora_weights.lora_a is not None and lora_weights.lora_a.grad is not None:
+                        gradients[
+                            f"{module_name}.lora_a"] = lora_weights.lora_a.grad.clone(
+                            )
+
+                    if lora_weights.lora_b is not None and lora_weights.lora_b.grad is not None:
+                        gradients[
+                            f"{module_name}.lora_b"] = lora_weights.lora_b.grad.clone(
+                            )
+        else:
+            # Collect gradients from model parameters (created LoRAs)
+            for name, param in self.model.named_parameters():
+                if param.grad is not None and 'lora' in name.lower():
+                    gradients[name] = param.grad.clone()
+
+        logger.info(
+            f"[TrainingManager] Collected {len(gradients)} LoRA gradients")
+
+        return gradients
+
+    def get_trainable_parameters(self) -> Dict[str, nn.Parameter]:
+        """Get all trainable LoRA parameters.
+        
+        Returns:
+            Dictionary of trainable parameter names to parameters
+        """
+        trainable = {}
+
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and 'lora' in name.lower():
+                trainable[name] = param
+
+        return trainable
+
+    def save_lora_checkpoint(
+        self,
+        lora_model: LoRAModel,
+        output_dir: str,
+        adapter_name: str = "adapter",
+    ) -> str:
+        """Save LoRA adapter weights to disk.
+        
+        Args:
+            lora_model: The LoRA model to save
+            output_dir: Directory to save the adapter to
+            adapter_name: Name for the adapter
+            
+        Returns:
+            Path to the saved adapter directory
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Prepare tensors for saving
+        tensors = {}
+        for module_name, lora_weights in lora_model.loras.items():
+            # Save in PEFT format: base_model.model.{module_name}.lora_A.weight
+            base_name = f"base_model.model.{module_name}"
+            tensors[f"{base_name}.lora_A.weight"] = lora_weights.lora_a.cpu()
+            tensors[f"{base_name}.lora_B.weight"] = lora_weights.lora_b.cpu()
+
+        # Save adapter_config.json
+        config = {
+            "peft_type": "LORA",
+            "r": lora_model.rank,
+            "lora_alpha": self.alpha,
+            "lora_dropout": 0.0,
+            "target_modules": list(self.lora_modules),
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+        }
+
+        with open(os.path.join(output_dir, "adapter_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        # Save weights
+        save_file(tensors, os.path.join(output_dir,
+                                        "adapter_model.safetensors"))
+
+        logger.info(f"[TrainingManager] Saved LoRA adapter to {output_dir}")
+        logger.info(f"[TrainingManager] Saved {len(tensors)} tensors")
+
+        return output_dir
