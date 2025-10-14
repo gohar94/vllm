@@ -46,6 +46,9 @@ class TrainingConfig:
     # If provided, the model will use this LoRA adapter during training
     lora_request: Optional["LoRARequest"] = None
 
+    # Whether this is an evaluation request (skips backward pass)
+    is_eval: bool = False
+
 
 class Request:
 

@@ -421,12 +421,27 @@ class LLM:
         lora_path: Optional[str] = None,
         lora_name: Optional[str] = None,
         lora_int_id: Optional[int] = None,
-    ) -> list[dict[str, Any]]:
+        # Training configuration (for high-level API)
+        num_epochs: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        learning_rate: float = 1e-4,
+        gradient_accumulation_steps: int = 1,
+        warmup_steps: int = 0,
+        scheduler_type: str = "cosine",
+        weight_decay: float = 0.0,
+        # Evaluation configuration
+        eval_data: Optional[Sequence[dict[str, Any]]] = None,
+        eval_steps: Optional[int] = None,
+    ) -> Union[list[dict[str, Any]], dict[str, Any]]:
         """Train the model on the given training data.
 
-        This method processes training examples through the engine pipeline,
-        following the same input format as HuggingFace's SFTTrainer.
-        Each training example performs a forward pass with next-token prediction.
+        This method supports two modes:
+        
+        1. **High-level API** (num_epochs + batch_size provided):
+           Handles full training loop, optimizer setup, and optional evaluation.
+           
+        2. **Low-level API** (num_epochs + batch_size NOT provided):
+           Processes a single batch for fine-grained control.
 
         Args:
             training_data: Training examples. Each example should be a dictionary.
@@ -448,42 +463,49 @@ class LLM:
 
             use_tqdm: If `True`, shows a tqdm progress bar.
 
-            lora_request: LoRA request(s) to use for training. Can be:
-                - None: No LoRA adapter used
-                - Single LoRARequest: Same adapter used for all training examples
-                - List[LoRARequest]: One adapter per training example
+            lora_request: LoRA request(s) to use for training.
 
-            lora_path: Path to LoRA adapter weights. If provided along with
-                lora_name and lora_int_id, a LoRARequest will be created.
-                Mutually exclusive with lora_request parameter.
-
-            lora_name: Name for the LoRA adapter. Required if lora_path is provided.
-
+            lora_path: Path to LoRA adapter weights.
+            lora_name: Name for the LoRA adapter.
             lora_int_id: Integer ID for the LoRA adapter (must be > 0).
-                Required if lora_path is provided.
+
+            # High-level API parameters (optional):
+            num_epochs: Number of training epochs. If provided with batch_size,
+                enables high-level training loop.
+            batch_size: Batch size for training. If provided with num_epochs,
+                enables high-level training loop.
+            learning_rate: Learning rate for optimizer (default: 1e-4).
+            gradient_accumulation_steps: Steps to accumulate gradients (default: 1).
+            warmup_steps: Number of warmup steps (default: 0).
+            scheduler_type: "cosine" or "linear" (default: "cosine").
+            weight_decay: Weight decay for optimizer (default: 0.0).
+            eval_data: Optional evaluation data for periodic validation.
+            eval_steps: Run evaluation every N steps (requires eval_data).
 
         Returns:
-            A list of training results, each containing:
+            Low-level API: List of training results per batch.
+            High-level API: Dictionary with training history:
             {
-                'request_id': str,
-                'loss': float,  # Training loss value
-                'logits': torch.Tensor,  # Model logits [seq_len, vocab_size]
-                'num_tokens': int,
+                'train_losses': List of training losses per step,
+                'eval_losses': List of evaluation losses,
+                'metrics': Final training metrics
             }
 
-        Example:
-            >>> llm = LLM(model="meta-llama/Llama-3.2-1B-Instruct")
-            >>> # SFTTrainer-compatible format
-            >>> training_data = [
-            ...     {'text': "User: Hello\\nAssistant: Hi there!"},
-            ... ]
-            >>> # Train with LoRA adapter
+        Examples:
+            # High-level API (recommended):
             >>> results = llm.train(
             ...     training_data,
-            ...     lora_path="/path/to/lora/adapter",
-            ...     lora_name="my_adapter",
-            ...     lora_int_id=1
+            ...     lora_request=lora_request,
+            ...     num_epochs=3,
+            ...     batch_size=4,
+            ...     learning_rate=1e-4,
+            ...     eval_data=eval_data,
+            ...     eval_steps=100,
             ... )
+            
+            # Low-level API (advanced):
+            >>> for batch in my_batches:
+            ...     results = llm.train(batch, lora_request=lora_request)
         """
         if not envs.VLLM_USE_V1:
             raise NotImplementedError(
@@ -526,6 +548,27 @@ class LLM:
                     "'text' (SFTTrainer format), 'messages' (chat format), "
                     "or 'prompt'/'prompt_token_ids' (legacy format)")
 
+        # Determine which API mode to use
+        high_level_mode = num_epochs is not None and batch_size is not None
+        
+        if high_level_mode:
+            # High-level API: Handle full training loop
+            return self._train_high_level(
+                training_data=training_data,
+                lora_request=lora_request,
+                num_epochs=num_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=warmup_steps,
+                scheduler_type=scheduler_type,
+                weight_decay=weight_decay,
+                eval_data=eval_data,
+                eval_steps=eval_steps,
+                use_tqdm=use_tqdm,
+            )
+        
+        # Low-level API: Process single batch
         # Add training requests to the engine and collect their IDs
         request_ids = self._add_training_requests(
             training_data=training_data,
@@ -574,6 +617,372 @@ class LLM:
                 'request_id': req_id,
                 'loss': training_loss,
                 'logits': training_logits,
+                'num_tokens': num_tokens,
+            })
+
+        return results
+
+    def _train_high_level(
+        self,
+        training_data: Sequence[dict[str, Any]],
+        lora_request: Optional[LoRARequest],
+        num_epochs: int,
+        batch_size: int,
+        learning_rate: float,
+        gradient_accumulation_steps: int,
+        warmup_steps: int,
+        scheduler_type: str,
+        weight_decay: float,
+        eval_data: Optional[Sequence[dict[str, Any]]],
+        eval_steps: Optional[int],
+        use_tqdm: bool,
+    ) -> dict[str, Any]:
+        """High-level training API that handles the full training loop.
+        
+        This method:
+        1. Automatically sets up optimizer and scheduler
+        2. Handles epoch loop and batching
+        3. Performs periodic evaluation
+        4. Returns comprehensive training history
+        """
+        import numpy as np
+        
+        # Setup training manager
+        worker = self.llm_engine.model_executor.driver_worker
+        model_runner = worker.model_runner
+        
+        if not hasattr(model_runner, "training_manager"):
+            model_runner._init_training_manager()
+        
+        training_manager = model_runner.training_manager
+        
+        # Calculate training steps
+        num_steps_per_epoch = len(training_data) // batch_size
+        total_steps = num_steps_per_epoch * num_epochs
+        
+        # Setup optimizer and scheduler via make_lora_trainable
+        if lora_request:
+            lora_id = lora_request.lora_int_id
+            
+            # Load LoRA into manager if not already loaded
+            # Use add_adapter to load without processing data
+            if lora_id not in training_manager.lora_manager.list_adapters():
+                training_manager.lora_manager.add_adapter(lora_request)
+            
+            # Now setup optimizer and scheduler
+            training_manager.make_lora_trainable(
+                lora_id=lora_id,
+                learning_rate=learning_rate,
+                num_training_steps=total_steps,
+                num_warmup_steps=warmup_steps,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                weight_decay=weight_decay,
+                scheduler_type=scheduler_type,
+            )
+            
+            # Freeze base model
+            training_manager.freeze_base_model(verbose=False)
+        
+        # Training history
+        train_losses = []
+        eval_losses = []
+        global_step = 0
+        
+        # Progress bar setup
+        if use_tqdm:
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            pbar = tqdm_func(total=total_steps, desc="Training")
+        
+        # Epoch loop
+        for epoch in range(num_epochs):
+            epoch_losses = []
+            
+            # Batch the data
+            for i in range(0, len(training_data), batch_size):
+                batch = training_data[i:i + batch_size]
+                
+                # Low-level train call (single batch)
+                batch_results = self.train(
+                    batch,
+                    lora_request=lora_request,
+                    use_tqdm=False,
+                )
+                
+                # Extract loss
+                batch_loss = np.mean([
+                    r['loss'] for r in batch_results if r['loss'] is not None
+                ])
+                epoch_losses.append(batch_loss)
+                
+                train_losses.append({
+                    "step": global_step,
+                    "epoch": epoch,
+                    "loss": batch_loss,
+                })
+                
+                # Periodic evaluation
+                if eval_data and eval_steps and global_step > 0 and global_step % eval_steps == 0:
+                    eval_batch = eval_data[:min(len(eval_data), batch_size * 4)]
+                    eval_results = self.eval(
+                        eval_batch,
+                        lora_request=lora_request,
+                        use_tqdm=False,
+                    )
+                    eval_loss = np.mean([
+                        r['loss'] for r in eval_results if r['loss'] is not None
+                    ])
+                    eval_losses.append({
+                        "step": global_step,
+                        "epoch": epoch,
+                        "eval_loss": eval_loss,
+                    })
+                
+                global_step += 1
+                
+                if use_tqdm:
+                    pbar.update(1)
+                    pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
+            
+            # End of epoch evaluation
+            if eval_data:
+                eval_batch = eval_data[:min(len(eval_data), batch_size * 8)]
+                eval_results = self.eval(
+                    eval_batch,
+                    lora_request=lora_request,
+                    use_tqdm=False,
+                )
+                eval_loss = np.mean([
+                    r['loss'] for r in eval_results if r['loss'] is not None
+                ])
+                eval_losses.append({
+                    "step": global_step,
+                    "epoch": epoch,
+                    "eval_loss": eval_loss,
+                })
+        
+        if use_tqdm:
+            pbar.close()
+        
+        # Return comprehensive results
+        return {
+            'train_losses': train_losses,
+            'eval_losses': eval_losses,
+            'metrics': {
+                'total_steps': global_step,
+                'num_epochs': num_epochs,
+                'final_train_loss': train_losses[-1]['loss'] if train_losses else None,
+                'final_eval_loss': eval_losses[-1]['eval_loss'] if eval_losses else None,
+            }
+        }
+
+    def eval(
+        self,
+        eval_data: Union[dict[str, Any], Sequence[dict[str, Any]]],
+        *,
+        use_tqdm: Union[bool, Callable[..., tqdm]] = True,
+        lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+        # Optional: Individual LoRA configuration parameters
+        lora_path: Optional[str] = None,
+        lora_name: Optional[str] = None,
+        lora_int_id: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Evaluate the model on the given data (without gradient computation).
+
+        This method is similar to train() but skips the backward pass,
+        making it suitable for validation/evaluation during training.
+
+        Args:
+            eval_data: Evaluation examples in the same format as train().
+                Each example should be a dictionary with one of:
+                - {'text': str}  # SFTTrainer format
+                - {'messages': list}  # Chat format
+                - {'prompt': str, 'labels': list[int]}  # Legacy format
+
+            use_tqdm: If `True`, shows a tqdm progress bar.
+
+            lora_request: LoRA request(s) to use for evaluation.
+
+            lora_path: Path to LoRA adapter weights.
+            lora_name: Name for the LoRA adapter.
+            lora_int_id: Integer ID for the LoRA adapter (must be > 0).
+
+        Returns:
+            A list of evaluation results, each containing:
+            {
+                'request_id': str,
+                'loss': float,  # Evaluation loss value
+                'logits': torch.Tensor,  # Model logits
+                'num_tokens': int,
+            }
+
+        Example:
+            >>> llm = LLM(model="meta-llama/Llama-3.2-1B-Instruct")
+            >>> eval_data = [{'text': "User: Hello\\nAssistant: Hi!"}]
+            >>> results = llm.eval(
+            ...     eval_data,
+            ...     lora_path="/path/to/lora/adapter",
+            ...     lora_name="my_adapter",
+            ...     lora_int_id=1
+            ... )
+        """
+        if not envs.VLLM_USE_V1:
+            raise NotImplementedError(
+                "Evaluation API is only supported in V1 engine. "
+                "Set VLLM_USE_V1=1 to enable it.")
+
+        # Handle LoRA configuration (same as train())
+        if lora_request is not None and any(
+            [lora_path, lora_name, lora_int_id]):
+            raise ValueError(
+                "Cannot provide both 'lora_request' and individual LoRA parameters "
+                "(lora_path, lora_name, lora_int_id). Use one or the other.")
+
+        # Create LoRARequest from individual parameters if provided
+        if lora_path is not None:
+            if lora_name is None or lora_int_id is None:
+                raise ValueError(
+                    "If 'lora_path' is provided, must also provide "
+                    "'lora_name' and 'lora_int_id'.")
+            lora_request = LoRARequest(
+                lora_name=lora_name,
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+
+        # Convert single example to list
+        if isinstance(eval_data, dict):
+            eval_data = [eval_data]
+
+        # Validate eval data (same format as training data)
+        for i, example in enumerate(eval_data):
+            has_text = 'text' in example
+            has_messages = 'messages' in example
+            has_prompt = 'prompt' in example or 'prompt_token_ids' in example
+
+            if not (has_text or has_messages or has_prompt):
+                raise ValueError(
+                    f"Evaluation example {i} must have one of: "
+                    "'text' (SFTTrainer format), 'messages' (chat format), "
+                    "or 'prompt'/'prompt_token_ids' (legacy format)")
+
+        # CRITICAL FIX: Ensure LoRA weights are synced to stacked tensors for evaluation
+        # After training updates Parameters, we need to copy them to stacked tensors
+        # so that evaluation (which uses inference path) sees the updated weights
+        if lora_request:
+            worker = self.llm_engine.model_executor.driver_worker
+            model_runner = worker.model_runner
+            
+            if hasattr(model_runner, "training_manager"):
+                training_manager = model_runner.training_manager
+                lora_id = lora_request.lora_int_id
+                
+                # Load LoRA into manager if not already loaded
+                if lora_id not in training_manager.lora_manager.list_adapters():
+                    logger.info(f"[Evaluation] Loading LoRA adapter {lora_id} for evaluation")
+                    training_manager.lora_manager.add_adapter(lora_request)
+                else:
+                    # LoRA already loaded - ensure Parameters are synced to stacked tensors
+                    # This is critical because training may have updated the Parameters
+                    logger.info(f"[Evaluation] Syncing LoRA {lora_id} Parameters to stacked tensors for evaluation")
+                    # DEBUG: Check the lora_index_to_id mapping
+                    lora_index_to_id = training_manager.lora_manager._adapter_manager.lora_index_to_id
+                    logger.info(f"[Evaluation] lora_index_to_id mapping: {lora_index_to_id}")
+                    param_sync_stats = training_manager.copy_parameters_to_stacked(lora_id)
+                    logger.info(f"[Evaluation] Sync complete: {param_sync_stats}")
+
+        # Add evaluation requests to the engine (same as training but with is_eval=True)
+        request_ids = self._add_training_requests(
+            training_data=eval_data,
+            use_tqdm=use_tqdm,
+            lora_request=lora_request,
+            is_eval=True,  # Mark as evaluation
+        )
+
+        # CRITICAL: Re-sync parameters after request processing
+        # The _add_training_requests may trigger activate_adapter which resets stacked tensors
+        if lora_request:
+            worker = self.llm_engine.model_executor.driver_worker
+            model_runner = worker.model_runner
+            
+            if hasattr(model_runner, "training_manager"):
+                training_manager = model_runner.training_manager
+                lora_id = lora_request.lora_int_id
+                logger.info(f"[Evaluation] Re-syncing LoRA {lora_id} Parameters after request processing")
+                param_sync_stats = training_manager.copy_parameters_to_stacked(lora_id)
+                logger.info(f"[Evaluation] Re-sync complete: {param_sync_stats}")
+                
+                # VERIFICATION TEST: Check if tensor IDs match between TrainingManager and forward model
+                try:
+                    tm_model = training_manager.model
+                    fwd_model = model_runner.model
+                    
+                    # Get first LoRA module from both
+                    tm_module = next((m for n,m in tm_model.named_modules() if hasattr(m, 'lora_a_stacked')), None)
+                    fwd_module = next((m for n,m in fwd_model.named_modules() if hasattr(m, 'lora_a_stacked')), None)
+                    
+                    if tm_module and fwd_module:
+                        tm_tensor_id = id(tm_module.lora_a_stacked[0])
+                        fwd_tensor_id = id(fwd_module.lora_a_stacked[0])
+                        logger.error(f"[VERIFICATION] TM tensor ID: {tm_tensor_id}")
+                        logger.error(f"[VERIFICATION] FWD tensor ID: {fwd_tensor_id}")
+                        if tm_tensor_id != fwd_tensor_id:
+                            logger.error(f"[VERIFICATION] ❌ TENSOR MISMATCH CONFIRMED!")
+                        else:
+                            logger.error(f"[VERIFICATION] ✅ Tensor IDs match!")
+                            
+                        # MEMORY DEBUG: Check tensor values after verification
+                        tm_checksum = tm_module.lora_a_stacked[0][0, 0, :, :].sum().item()
+                        fwd_checksum = fwd_module.lora_a_stacked[0][0, 0, :, :].sum().item()
+                        logger.error(f"[MEMORY_DEBUG] TM checksum: {tm_checksum:.6f}")
+                        logger.error(f"[MEMORY_DEBUG] FWD checksum: {fwd_checksum:.6f}")
+                        
+                        # Check if tensors are on same device
+                        logger.error(f"[MEMORY_DEBUG] TM device: {tm_module.lora_a_stacked[0].device}")
+                        logger.error(f"[MEMORY_DEBUG] FWD device: {fwd_module.lora_a_stacked[0].device}")
+                        
+                except Exception as e:
+                    logger.error(f"[VERIFICATION] Error during tensor ID check: {e}")
+
+        # Run the engine to process evaluation requests
+        outputs = self._run_engine(use_tqdm=use_tqdm)
+
+        # Collect evaluation results
+        output_map = {output.request_id: output for output in outputs}
+
+        tokenizer = self.get_tokenizer()
+        results = []
+        for req_id, example in zip(request_ids, eval_data):
+            # Get the output for this request
+            output = output_map.get(req_id)
+            eval_loss = output.training_loss if output and hasattr(
+                output, 'training_loss') else None
+            eval_logits = output.training_logits if output and hasattr(
+                output, 'training_logits') else None
+
+            # Calculate num_tokens based on the format
+            if 'text' in example:
+                num_tokens = len(tokenizer.encode(example['text']))
+            elif 'messages' in example:
+                text = tokenizer.apply_chat_template(
+                    example['messages'],
+                    add_generation_prompt=False,
+                    tokenize=False,
+                )
+                num_tokens = len(tokenizer.encode(text))
+            elif 'labels' in example:
+                num_tokens = len(example['labels']) if isinstance(
+                    example['labels'], list) else len(example['labels'])
+            elif 'prompt_token_ids' in example:
+                num_tokens = len(example['prompt_token_ids'])
+            elif 'prompt' in example:
+                num_tokens = len(tokenizer.encode(example['prompt']))
+            else:
+                num_tokens = 0
+
+            results.append({
+                'request_id': req_id,
+                'loss': eval_loss,
+                'logits': eval_logits,
                 'num_tokens': num_tokens,
             })
 
@@ -1756,10 +2165,17 @@ class LLM:
         *,
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: LoRARequest = None,
+        is_eval: bool = False,
     ) -> list[str]:
         """Validate and add training requests to the engine.
 
         Processes training data in SFTTrainer-compatible format.
+
+        Args:
+            training_data: Sequence of training/evaluation examples
+            use_tqdm: Whether to show progress bar
+            lora_request: Optional LoRA request
+            is_eval: If True, marks as evaluation (no backward pass)
 
         Returns:
             List of request IDs for the added training requests.
@@ -1834,6 +2250,7 @@ class LLM:
                 compute_loss=True,
                 loss_fn="cross_entropy",
                 lora_request=lora_request,
+                is_eval=is_eval,
             )
 
             # Add training request and collect its ID

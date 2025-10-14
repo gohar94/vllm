@@ -176,23 +176,20 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """PyTorch-native implementation equivalent to forward()."""
-        print(f"[RMSNorm forward_native] Input x requires_grad: {x.requires_grad}, grad_fn: {x.grad_fn is not None}")
         orig_dtype = x.dtype
-        
+
         # CRITICAL FIX: Create a grad_fn by adding a zero tensor (identity operation that creates computation graph)
         # This is needed because operations on leaf tensors don't track gradients
         if x.requires_grad and x.grad_fn is None:
             x = x + torch.zeros_like(x, requires_grad=False)  # This creates a grad_fn while being numerically identical
-            print(f"[RMSNorm forward_native] After adding grad_fn: requires_grad: {x.requires_grad}, grad_fn: {x.grad_fn is not None}")
-        
+
         # CRITICAL: Preserve requires_grad through dtype conversion
         # .to() doesn't preserve requires_grad for leaf tensors, so we need to explicitly handle it
         requires_grad = x.requires_grad
         x = x.to(torch.float32)
         if requires_grad and not x.requires_grad:
             x.requires_grad_(True)
-        
-        print(f"[RMSNorm forward_native] After to(float32) x requires_grad: {x.requires_grad}, grad_fn: {x.grad_fn is not None}")
+
         if residual is not None:
             residual_requires_grad = residual.requires_grad
             residual_float = residual.to(torch.float32)
@@ -223,35 +220,29 @@ class RMSNorm(CustomOp):
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         if x.requires_grad and not variance.requires_grad:
             variance.requires_grad_(True)
-        print(f"[RMSNorm forward_native] variance requires_grad: {variance.requires_grad}, grad_fn: {variance.grad_fn is not None}")
-        
+
         scale = torch.rsqrt(variance + self.variance_epsilon)
         if variance.requires_grad and not scale.requires_grad:
             scale.requires_grad_(True)
-        print(f"[RMSNorm forward_native] scale requires_grad: {scale.requires_grad}, grad_fn: {scale.grad_fn is not None}")
-        print(f"[RMSNorm forward_native] Before multiply - x requires_grad: {x.requires_grad}, grad_fn: {x.grad_fn is not None}")
-        
+
         x_prev_requires_grad = x.requires_grad
         x = x * scale
         if (x_prev_requires_grad or scale.requires_grad) and not x.requires_grad:
             x.requires_grad_(True)
-        print(f"[RMSNorm forward_native] After normalize x requires_grad: {x.requires_grad}, grad_fn: {x.grad_fn is not None}")
-        
+
         # Preserve requires_grad through dtype conversion back to original
         x_requires_grad = x.requires_grad
         x = x.to(orig_dtype)
         if x_requires_grad and not x.requires_grad:
             x.requires_grad_(True)
-        
-        print(f"[RMSNorm forward_native] After to(orig_dtype) x requires_grad: {x.requires_grad}, grad_fn: {x.grad_fn is not None}")
+
         if self.has_weight:
-            print(f"[RMSNorm forward_native] weight requires_grad: {self.weight.requires_grad}, is Parameter: {isinstance(self.weight, nn.Parameter)}")
             x_prev_requires_grad = x.requires_grad
             x = x * self.weight
             # CRITICAL: Multiplication of two leaf tensors doesn't track gradients automatically
             if (x_prev_requires_grad or self.weight.requires_grad) and not x.requires_grad:
                 x.requires_grad_(True)
-            print(f"[RMSNorm forward_native] After weight multiply x requires_grad: {x.requires_grad}, grad_fn: {x.grad_fn is not None}")
+
         if residual is None:
             return x
         else:
@@ -270,14 +261,10 @@ class RMSNorm(CustomOp):
         grad_enabled = torch.is_grad_enabled()
         x_requires_grad = x.requires_grad
         residual_requires_grad = residual is not None and residual.requires_grad
-        
-        print(f"[RMSNorm Grad Check] grad_enabled: {grad_enabled}, x.requires_grad: {x_requires_grad}, residual: {residual is not None}, residual.requires_grad: {residual_requires_grad}")
-        
+
         if grad_enabled and (x_requires_grad or residual_requires_grad):
-            print(f"[RMSNorm Grad Check] Using NATIVE implementation for gradient support")
             return self.forward_native(x, residual)
-        
-        print(f"[RMSNorm Grad Check] Using CUSTOM CUDA op (will break gradients)")
+
         add_residual = residual is not None
         if add_residual:
             return fused_add_rms_norm(x, residual, self.weight.data,

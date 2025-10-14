@@ -405,7 +405,9 @@ class LoRAModelManager:
         lora_id: int,
     ) -> bool:
         """Move LoRA into a GPU buffer to be used in the forward pass."""
+        logger.debug(f"[LoRAModelManager] activate_adapter: lora_id={lora_id}, active_adapters={list(self._active_adapters.keys())}")
         if lora_id in self._active_adapters:
+            logger.debug(f"[LoRAModelManager] LoRA {lora_id} already active, skipping activation")
             return False
         first_free_slot = next(
             ((i, lora_id) for i, lora_id in enumerate(self.lora_index_to_id)
@@ -418,25 +420,52 @@ class LoRAModelManager:
         logger.debug("Activating LoRA. int id: %d, slot index: %d",
                      lora_model.id, index)
         self.lora_index_to_id[index] = lora_model.id
+        
+        # Check if we have a TrainingManager with trained parameters
+        training_manager = getattr(self, '_training_manager', None)
+        has_trained_params = False
+        logger.info(f"[activate_adapter] Checking for TrainingManager: {training_manager is not None}")
+        if training_manager:
+            logger.info(f"[activate_adapter] TrainingManager current_lora_id: {training_manager.current_lora_id}")
+            # Check if this LoRA has been trained (using persistent trained_lora_ids set)
+            if (hasattr(training_manager, 'trained_lora_ids') and
+                lora_id in training_manager.trained_lora_ids):
+                has_trained_params = True
+                logger.info(f"[FIX] Found trained LoRA {lora_id} in trained_lora_ids: {training_manager.trained_lora_ids}")
+            else:
+                logger.info(f"[activate_adapter] LoRA {lora_id} not in trained_lora_ids: {getattr(training_manager, 'trained_lora_ids', 'not found')}")
+        
         for module_name, module in self.modules.items():
             module_lora = self._get_lora_layer_weights(lora_model, module_name)
             if module_lora:
-                module_lora.optimize()
-                # Bias is not explicitly enabled with the flag enable_lora_bias.
-                bias = module_lora.bias
-                if ((torch.is_tensor(bias) or
-                     (isinstance(bias, Sequence) and any(b is not None
-                                                         for b in bias)))
-                        and not self.lora_config.bias_enabled):
-                    module_lora.bias = None
-                    raise ValueError(
-                        f"Adapter bias cannot be used for {module_name}"
-                        " without --enable-lora-bias.")
-                module.set_lora(index, module_lora.lora_a, module_lora.lora_b,
-                                module_lora.embeddings_tensor,
-                                module_lora.bias)
+                # Check if we should skip set_lora for trained parameters
+                should_skip_set_lora = (has_trained_params and training_manager and 
+                                       module_name in training_manager.target_modules)
+                
+                if should_skip_set_lora:
+                    logger.info(f"[FIX] Skipping set_lora for {module_name} - has trained parameters")
+                else:
+                    module_lora.optimize()
+                    # Bias is not explicitly enabled with the flag enable_lora_bias.
+                    bias = module_lora.bias
+                    if ((torch.is_tensor(bias) or
+                         (isinstance(bias, Sequence) and any(b is not None
+                                                             for b in bias)))
+                            and not self.lora_config.bias_enabled):
+                        module_lora.bias = None
+                        raise ValueError(
+                            f"Adapter bias cannot be used for {module_name}"
+                            " without --enable-lora-bias.")
+                    module.set_lora(index, module_lora.lora_a, module_lora.lora_b,
+                                    module_lora.embeddings_tensor,
+                                    module_lora.bias)
             else:
-                module.reset_lora(index)
+                # Only reset LoRA if we don't have trained parameters for this module
+                # If we have trained parameters, the stacked tensors should already be synced
+                if has_trained_params and training_manager and module_name in training_manager.target_modules:
+                    logger.debug(f"Skipping reset_lora for {module_name} - has trained parameters")
+                else:
+                    module.reset_lora(index)
         return True
 
     def _deactivate_adapter(self, lora_id: int):
@@ -761,6 +790,7 @@ class LRUCacheLoRAModelManager(LoRAModelManager):
         self,
         lora_id: int,
     ) -> bool:
+        logger.debug(f"[LRUCacheLoRAModelManager] activate_adapter called for lora_id={lora_id}")
         if lora_id not in self._active_adapters and len(
                 self._active_adapters) >= self.lora_slots:
             self._active_adapters.remove_oldest()

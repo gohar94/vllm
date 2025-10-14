@@ -2075,9 +2075,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req.is_training for req in scheduler_output.scheduled_new_reqs)
 
         if has_training_requests:
+            # Check if any request is marked as evaluation
+            is_eval = any(
+                req.training_config and req.training_config.is_eval
+                for req in scheduler_output.scheduled_new_reqs
+                if req.is_training
+            )
             # Dispatch to training execution (without @torch.inference_mode)
             return self.execute_model_training(scheduler_output,
-                                               intermediate_tensors)
+                                               intermediate_tensors,
+                                               is_eval=is_eval)
         else:
             # Dispatch to inference execution (with @torch.inference_mode)
             return self.execute_model_inference(scheduler_output,
@@ -2294,6 +2301,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        is_eval: bool = False,
     ) -> ModelRunnerOutput:
         """Execute model for training requests.
         
@@ -2307,6 +2315,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Args:
             scheduler_output: Output from the scheduler containing training requests
             intermediate_tensors: Intermediate tensors from previous pipeline stage
+            is_eval: If True, skips backward pass (evaluation mode)
             
         Returns:
             ModelRunnerOutput with training losses instead of sampled tokens
@@ -2366,28 +2375,28 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Enable gradient computation for training
             # IMPORTANT: Keep torch.enable_grad() active for ENTIRE forward + loss computation
             with torch.enable_grad():
-                # DEBUG: Check input tensors
-                print(
-                    f"[Grad Check] input_ids requires_grad: {input_ids.requires_grad if input_ids is not None else 'None'}"
-                )
-                print(
-                    f"[Grad Check] positions requires_grad: {positions.requires_grad}"
-                )
-                print(
-                    f"[Grad Check] inputs_embeds requires_grad: {inputs_embeds.requires_grad if inputs_embeds is not None else 'None'}"
-                )
-
                 # Check if this is a LoRA training request
                 is_lora_training = any(
                     req.lora_request is not None
                     for req in scheduler_output.scheduled_new_reqs)
 
+                # Check if this is evaluation mode (from training_config)
+                # Note: is_eval parameter takes precedence, but we also check training_config
+                batch_is_eval = is_eval
+                if not batch_is_eval:
+                    # Check if any request has is_eval set in training_config
+                    for req in scheduler_output.scheduled_new_reqs:
+                        if req.training_config and req.training_config.is_eval:
+                            batch_is_eval = True
+                            break
+
+                if batch_is_eval:
+                    logger.debug("[Evaluation] Running in evaluation mode (no backward pass)")
+
                 # Set up parameter gradients for training
                 if is_lora_training and hasattr(self, 'training_manager'):
                     # LoRA training: freeze base model, enable only LoRA parameters
-                    logger.info(
-                        "[Training] LoRA training mode - freezing base model parameters"
-                    )
+                    logger.debug("[Training] LoRA training mode - freezing base model parameters")
 
                     # Get the LoRA ID from the request
                     lora_id = None
@@ -2397,45 +2406,27 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             break
 
                     # If LoRA is loaded from disk, convert it to trainable Parameters
-                    if lora_id is not None:
-                        logger.info(
-                            f"[Training] Converting loaded LoRA {lora_id} to trainable Parameters..."
-                        )
+                    # Skip this during evaluation to avoid resetting trained parameters
+                    logger.info(f"[DEBUG] execute_model_training: lora_id={lora_id}, is_eval={is_eval}")
+                    if lora_id is not None and not is_eval:
                         try:
-                            lora_stats = self.training_manager.make_lora_trainable(
-                                lora_id)
-                            logger.info(
-                                f"[Training] LoRA {lora_id} converted: "
-                                f"{lora_stats['trainable_params']}/{lora_stats['total_tensors']} "
-                                f"tensors now trainable")
+                            lora_stats = self.training_manager.make_lora_trainable(lora_id)
                         except Exception as e:
-                            logger.warning(
-                                f"[Training] Failed to convert LoRA {lora_id}: {e}"
-                            )
+                            logger.warning(f"[Training] Failed to convert LoRA {lora_id}: {e}")
+                    elif lora_id is not None and is_eval:
+                        logger.info(f"[Evaluation] Skipping make_lora_trainable for LoRA {lora_id} during evaluation")
 
                     # Freeze base model
-                    stats = self.training_manager.freeze_base_model(
-                        verbose=False)
-                    logger.info(
-                        f"[Training] Parameter setup: {stats['trainable']}/{stats['total']} parameters trainable "
-                        f"({100 * stats['trainable'] / stats['total']:.2f}%)")
+                    stats = self.training_manager.freeze_base_model(verbose=False)
                 else:
                     # Full fine-tuning: enable all parameters
-                    logger.info(
-                        "[Training] Full fine-tuning mode - enabling all parameters"
-                    )
                     param_count = 0
                     grad_enabled_count = 0
                     for name, param in self.model.named_parameters():
                         param_count += 1
                         if param.requires_grad:
                             grad_enabled_count += 1
-                        param.requires_grad_(
-                            True)  # Force enable, even if already True
-
-                    logger.info(
-                        f"[Training] Model parameters: {param_count}, initially trainable: {grad_enabled_count}"
-                    )
+                        param.requires_grad_(True)  # Force enable, even if already True
 
                 # CRITICAL: For ALL training (LoRA or full), we need to use embeddings with gradient support
                 # The standard vLLM flow uses input_ids directly, which skips the embedding layer
@@ -2443,19 +2434,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if input_ids is not None:
                     # Also ensure the model itself is in training mode
                     self.model.train()
-                    logger.info(
-                        f"[Training] Model training mode: {self.model.training}"
-                    )
 
                     # Get the embedding layer
-                    embed_layer = self.model.model.embed_tokens if hasattr(
-                        self.model, 'model') else self.model.embed_tokens
-                    logger.info(
-                        f"[Training] Embedding layer type: {type(embed_layer)}"
-                    )
-                    logger.info(
-                        f"[Training] Embedding weight requires_grad: {embed_layer.weight.requires_grad}"
-                    )
+                    embed_layer = self.model.model.embed_tokens if hasattr(self.model, 'model') else self.model.embed_tokens
 
                     # Use torch.nn.functional.embedding directly to compute embeddings
                     # This is critical for gradient flow through embeddings
@@ -2463,25 +2444,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     if not embed_weight.requires_grad:
                         # Temporarily enable gradients for the embedding lookup
                         # This allows the gradient graph to be built through the embeddings
-                        embed_weight = embed_weight.detach().requires_grad_(
-                            True)
-                        logger.info(
-                            "[Training] Enabled gradients for embedding weight temporarily"
-                        )
+                        embed_weight = embed_weight.detach().requires_grad_(True)
 
-                    inputs_embeds = torch.nn.functional.embedding(
-                        input_ids, embed_weight)
+                    inputs_embeds = torch.nn.functional.embedding(input_ids, embed_weight)
                     input_ids = None  # Clear input_ids so the model uses inputs_embeds
 
-                    logger.info(
-                        f"[Training] Computed embeddings: requires_grad={inputs_embeds.requires_grad}, has_grad_fn={inputs_embeds.grad_fn is not None}"
-                    )
-
-                # Check inputs_embeds one more time before model forward
-                if inputs_embeds is not None:
-                    logger.info(
-                        f"[Training] Before model forward - inputs_embeds requires_grad: {inputs_embeds.requires_grad}"
-                    )
 
                 model_output = self.model(
                     input_ids=input_ids,
@@ -2489,29 +2456,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
-                )
-
-                # DEBUG: Check model output
-                print(
-                    f"[Grad Check] After model forward - model_output requires_grad: {model_output.requires_grad}"
-                )
-                print(
-                    f"[Grad Check] After model forward - model_output has grad_fn: {model_output.grad_fn is not None}"
-                )
-                if model_output.grad_fn:
-                    print(
-                        f"[Grad Check] model_output.grad_fn: {model_output.grad_fn}"
-                    )
-                else:
-                    print(
-                        "[Grad Check] WARNING: Gradients lost in model forward pass!"
-                    )
-
-                # DEBUG: Log forward pass outputs
-                print(
-                    f"[vLLM Forward] model_output.shape={model_output.shape}")
-                print(
-                    f"[vLLM Forward] model_output[0,:5]={model_output[0,:5].tolist()}"
                 )
 
                 # For training, model_output should be hidden states
@@ -2526,37 +2470,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Select the hidden states for the tokens we want
                 # (logits_indices was prepared in _prepare_inputs - for training it includes ALL tokens)
                 hidden_states = hidden_states[logits_indices]
-                logger.info(
-                    f"[Training Debug] hidden_states.shape={hidden_states.shape}"
-                )
 
                 # Compute logits for loss calculation
                 # For training, we need logits for all tokens (achieved via logits_indices)
                 # MUST be inside torch.enable_grad() context!
-
-                # DEBUG: Check hidden states
-                print(
-                    f"[Grad Check] hidden_states requires_grad: {hidden_states.requires_grad}"
-                )
-                print(
-                    f"[Grad Check] hidden_states has grad_fn: {hidden_states.grad_fn is not None}"
-                )
-                if hidden_states.grad_fn:
-                    print(
-                        f"[Grad Check] hidden_states.grad_fn: {hidden_states.grad_fn}"
-                    )
-
                 logits = self.model.compute_logits(hidden_states, None)
-
-                # DEBUG: Check logits
-                print(
-                    f"[Grad Check] logits requires_grad: {logits.requires_grad}"
-                )
-                print(
-                    f"[Grad Check] logits has grad_fn: {logits.grad_fn is not None}"
-                )
-                if logits.grad_fn:
-                    print(f"[Grad Check] logits.grad_fn: {logits.grad_fn}")
 
                 # Collect losses and logits for each training request
                 # IMPORTANT: Loss computation must be inside torch.enable_grad() context!
@@ -2608,51 +2526,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             offset += num_tokens
                             continue
 
-                        # Compute cross-entropy loss
-                        # Shift logits and labels for next-token prediction
-                        # logits: [seq_len, vocab_size], labels: [seq_len]
-                        logger.info(f"[Loss Debug] req_id={req_id}")
-                        logger.info(
-                            f"[Loss Debug] request_logits.shape={request_logits.shape}"
-                        )
-                        logger.info(
-                            f"[Loss Debug] labels.shape={labels.shape}")
-                        logger.info(
-                            f"[Loss Debug] labels[:10]={labels[:10].tolist()}")
-
-                        logger.info(
-                            f"[Loss Debug] request_logits[0, :5]={request_logits[0, :5].tolist()}"
-                        )
-
                         shift_logits = request_logits[:-1, :].contiguous()
                         shift_labels = labels[1:].contiguous()
-
-                        logger.info(
-                            f"[Loss Debug] shift_logits.shape={shift_logits.shape}"
-                        )
-                        logger.info(
-                            f"[Loss Debug] shift_labels.shape={shift_labels.shape}"
-                        )
-                        logger.info(
-                            f"[Loss Debug] shift_labels[:10]={shift_labels[:10].tolist()}"
-                        )
 
                         loss_fct = torch.nn.CrossEntropyLoss()
                         loss = loss_fct(
                             shift_logits.view(-1, shift_logits.size(-1)),
                             shift_labels.view(-1))
-
-                        logger.info(f"[Loss Debug] loss={loss.item():.6f}")
-
-                        # DEBUG: Check loss tensor
-                        print(
-                            f"[Grad Check] loss requires_grad: {loss.requires_grad}"
-                        )
-                        print(
-                            f"[Grad Check] loss has grad_fn: {loss.grad_fn is not None}"
-                        )
-                        if loss.grad_fn:
-                            print(f"[Grad Check] loss.grad_fn: {loss.grad_fn}")
 
                         # Store loss tensor for backward pass
                         loss_tensors.append(loss)
@@ -2667,58 +2547,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     req_id_to_index[req_id] = len(req_ids_output) - 1
                     offset += num_tokens
 
-        # Backward pass for training
+        # Backward pass for training (skip for evaluation)
         # IMPORTANT: Backward must also be inside torch.enable_grad() context
-        with record_function_or_nullcontext("Backward"):
-            if loss_tensors:
-                with torch.enable_grad():
-                    # Combine all losses (average across requests)
-                    total_loss = torch.stack(loss_tensors).mean()
+        if not batch_is_eval:
+            with record_function_or_nullcontext("Backward"):
+                if loss_tensors:
+                    with torch.enable_grad():
+                        # Combine all losses (average across requests)
+                        total_loss = torch.stack(loss_tensors).mean()
 
-                    logger.info(
-                        f"[Training] Starting backward pass. Total loss: {total_loss.item():.6f}"
-                    )
+                        # Compute gradients via backward pass
+                        total_loss.backward()
 
-                    # Compute gradients via backward pass
-                    total_loss.backward()
-
-                    logger.info("[Training] Backward pass completed")
-
-                    # Log gradient statistics
-                    grad_count = sum(1 for p in self.model.parameters()
-                                     if p.grad is not None)
-                    total_params = sum(1 for p in self.model.parameters())
-                    logger.info(
-                        f"[Training] Gradients computed for {grad_count}/{total_params} parameters"
-                    )
-
-                    # Collect and log LoRA-specific gradients if applicable
+                    # Automatically perform optimizer step with gradient accumulation
                     if is_lora_training and hasattr(self, 'training_manager'):
-                        # Collect from loaded LoRA if we have an ID
-                        lora_gradients = self.training_manager.collect_lora_gradients(
-                            lora_id=lora_id)
-                        logger.info(
-                            f"[Training] Collected {len(lora_gradients)} LoRA gradients"
-                        )
-
-                        # Log gradient norms for LoRA parameters
-                        for name, grad in list(
-                                lora_gradients.items())[:5]:  # Log first 5
-                            grad_norm = grad.norm().item()
-                            grad_mean = grad.mean().item()
-                            logger.info(
-                                f"[Training] LoRA gradient {name}: "
-                                f"norm={grad_norm:.6f}, mean={grad_mean:.6f}, "
-                                f"shape={grad.shape}")
-                    else:
-                        # Log general gradient info for non-LoRA training
-                        for name, param in self.model.named_parameters():
-                            if param.grad is not None:
-                                grad_norm = param.grad.norm().item()
-                                logger.info(
-                                    f"[Training] Gradient {name}: norm={grad_norm:.6f}"
-                                )
-                                break  # Just log first grad as example
+                        if self.training_manager.optimizer is not None:
+                            opt_stats = self.training_manager.step_with_accumulation(max_grad_norm=1.0)
+        else:
+            logger.debug("[Evaluation] Skipping backward pass (eval mode)")
 
         # Now detach logits for return (after backward pass)
         logits_dict_detached = {
@@ -2967,8 +2813,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                   self.scheduler_config,
                                                   self.lora_config,
                                                   self.device)
-                # Initialize TrainingManager for LoRA training
-                self._init_training_manager()
+                # Note: TrainingManager initialization moved to after model wrapping
             if hasattr(self, "drafter"):
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
@@ -3027,6 +2872,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.NONE, self.device)
+        
+        # Initialize TrainingManager AFTER model wrapping (if LoRA is enabled)
+        # This ensures TrainingManager gets the wrapped model and can unwrap it correctly
+        if self.lora_config:
+            logger.info("[FIX] Initializing TrainingManager after model wrapping")
+            self._init_training_manager()
 
     def _init_training_manager(self) -> None:
         """Initialize the TrainingManager for LoRA training.
@@ -3047,7 +2898,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
         self.training_manager = TrainingManager(
-            model=self.model,
+            model_runner=self,
             lora_manager=self.lora_manager,
             lora_config=self.lora_config,
             device=self.device,

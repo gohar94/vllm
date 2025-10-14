@@ -16,11 +16,10 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder, CommonAttentionMetadata,
     reorder_batch_to_split_decodes_and_prefills, split_decodes_and_prefills)
 from vllm.v1.kv_cache_interface import AttentionSpec
-
 try:
     from xformers import ops as xops
     from xformers.ops.fmha.attn_bias import (
-        AttentionBias, PagedBlockDiagonalCausalWithOffsetPaddedKeysMask)
+        AttentionBias, PagedBlockDiagonalCausalWithOffsetPaddedKeysMask, LowerTriangularMask)
 
     XFORMERS_AVAILABLE = True
 except ImportError:
@@ -481,11 +480,6 @@ class XFormersAttentionImpl(AttentionImpl):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
-        # DEBUG: Check input tensors
-        print(f"[Attention Grad Check] query requires_grad: {query.requires_grad}, grad_fn: {query.grad_fn is not None}")
-        print(f"[Attention Grad Check] key requires_grad: {key.requires_grad}, grad_fn: {key.grad_fn is not None}")
-        print(f"[Attention Grad Check] value requires_grad: {value.requires_grad}, grad_fn: {value.grad_fn is not None}")
-        
         num_tokens = query.shape[0]
 
         # For training, we process all tokens together
@@ -512,7 +506,6 @@ class XFormersAttentionImpl(AttentionImpl):
         # Create causal mask for training
         # LowerTriangular creates a causal mask where each token can only attend to
         # previous tokens and itself
-        from xformers.ops.fmha.attn_bias import LowerTriangularMask
         attn_bias = LowerTriangularMask()
 
         # Use xformers memory_efficient_attention (NOT _forward) for training
@@ -526,16 +519,8 @@ class XFormersAttentionImpl(AttentionImpl):
             scale=self.scale,
         )
         
-        # DEBUG: Check attention output
-        print(f"[Attention Grad Check] attn_output requires_grad: {attn_output.requires_grad}, grad_fn: {attn_output.grad_fn is not None}")
-        if attn_output.grad_fn:
-            print(f"[Attention Grad Check] attn_output.grad_fn: {attn_output.grad_fn}")
-
         # Reshape output from [1, num_tokens, num_heads, head_size]
         # back to [num_tokens, num_heads, head_size]
         output[:] = attn_output.squeeze(0)
-        
-        # DEBUG: Check final output
-        print(f"[Attention Grad Check] output requires_grad: {output.requires_grad}, grad_fn: {output.grad_fn is not None}")
 
         return output
