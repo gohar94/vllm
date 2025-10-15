@@ -2543,6 +2543,30 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         # Check for potential NaN causes
                         valid_labels = (shift_labels != -100).sum().item()
                         
+                        # [VLLM/LOSS] Print loss computation details (first step only)
+                        if not hasattr(self, '_vllm_first_loss_printed'):
+                            self._vllm_first_loss_printed = False
+                        
+                        if not self._vllm_first_loss_printed:
+                            print("\n" + "=" * 70)
+                            print("[VLLM/LOSS] First Loss Computation Details")
+                            print("=" * 70)
+                            print(f"[VLLM/LOSS] Request ID: {req_id}")
+                            print(f"[VLLM/LOSS] Logits shape (before shift): {request_logits.shape}")
+                            print(f"[VLLM/LOSS] Logits dtype: {request_logits.dtype}")
+                            print(f"[VLLM/LOSS] Labels shape (before shift): {labels.shape}")
+                            print(f"[VLLM/LOSS] Labels dtype: {labels.dtype}")
+                            print(f"[VLLM/LOSS] Shift logits shape: {shift_logits.shape}")
+                            print(f"[VLLM/LOSS] Shift labels shape: {shift_labels.shape}")
+                            total_labels = shift_labels.numel()
+                            masked_labels = (shift_labels == -100).sum().item()
+                            print(f"[VLLM/LOSS] Number of valid labels: {valid_labels} out of {total_labels}")
+                            print(f"[VLLM/LOSS] Number of -100 labels: {masked_labels}")
+                            print(f"[VLLM/LOSS] Percentage masked: {100.0 * masked_labels / total_labels:.2f}%")
+                            print(f"[VLLM/LOSS] Labels (first 30): {labels[:30].tolist()}")
+                            print(f"[VLLM/LOSS] Label mask pattern (first 30, 0=valid, 1=masked): {(shift_labels[:30] == -100).int().tolist()}")
+                            print("=" * 70)
+                        
                         # CRITICAL FIX: Skip loss computation if no valid labels
                         if valid_labels == 0:
                             losses[req_id] = None
@@ -2553,6 +2577,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 shift_labels.view(-1))
 
                             loss_value = loss.item()
+                            
+                            # [VLLM/LOSS] Print loss value (first step only)
+                            if not self._vllm_first_loss_printed:
+                                print(f"[VLLM/LOSS] Computed loss: {loss_value:.6f}")
+                                self._vllm_first_loss_printed = True
                             
                             # CRITICAL FIX: Skip NaN/inf losses
                             if torch.isnan(loss) or torch.isinf(loss):
@@ -2579,6 +2608,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     with torch.enable_grad():
                         # Combine all losses (average across requests)
                         total_loss = torch.stack(loss_tensors).mean()
+                        
+                        # [VLLM/LOSS] Print total loss before backward
+                        if not hasattr(self, '_vllm_first_backward_printed'):
+                            self._vllm_first_backward_printed = False
+                        
+                        if not self._vllm_first_backward_printed:
+                            print(f"[VLLM/LOSS] Total loss (averaged): {total_loss.item():.6f}")
+                            print(f"[VLLM/LOSS] Number of loss tensors: {len(loss_tensors)}")
+                            self._vllm_first_backward_printed = True
 
                         # Compute gradients via backward pass
                         total_loss.backward()

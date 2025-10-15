@@ -236,6 +236,48 @@ class TrainingManager:
                 trainable_count += 1
 
         # Setup complete
+        
+        # [VLLM/LORA] Print trainable LoRA parameters details
+        print("\n" + "=" * 70)
+        print("[VLLM/LORA] Trainable LoRA Parameters (After make_lora_trainable)")
+        print("=" * 70)
+        print(f"[VLLM/LORA] Total trainable parameters: {trainable_count}")
+        for param_name, param_tensor in self.trainable_lora_params.items():
+            print(f"[VLLM/LORA]   {param_name}:")
+            print(f"[VLLM/LORA]     Shape: {param_tensor.shape}, dtype: {param_tensor.dtype}")
+            print(f"[VLLM/LORA]     Stats: mean={param_tensor.mean().item():.6f}, "
+                  f"std={param_tensor.std().item():.6f}, "
+                  f"min={param_tensor.min().item():.6f}, "
+                  f"max={param_tensor.max().item():.6f}")
+            checksum = param_tensor.sum().item()
+            print(f"[VLLM/LORA]     Checksum (sum): {checksum:.6f}")
+            
+            # If this is a packed qkv parameter, analyze its structure
+            if 'qkv_proj' in param_name:
+                print(f"[VLLM/LORA/QKV] Analyzing packed QKV structure for {param_name}")
+                # For lora_a, the output dim is stacked [rank, rank, rank]
+                # For lora_b, the input dim is stacked, output dim is [hidden, hidden, hidden]
+                if 'lora_a' in param_name:
+                    # lora_a shape is typically [hidden_size, 3*rank] for packed qkv
+                    if param_tensor.shape[1] % 3 == 0:
+                        slice_size = param_tensor.shape[1] // 3
+                        q_slice = param_tensor.data[:, :slice_size]
+                        k_slice = param_tensor.data[:, slice_size:2*slice_size]
+                        v_slice = param_tensor.data[:, 2*slice_size:]
+                        print(f"[VLLM/LORA/QKV]   Q slice: shape={q_slice.shape}, mean={q_slice.mean().item():.6f}, std={q_slice.std().item():.6f}, checksum={q_slice.sum().item():.6f}")
+                        print(f"[VLLM/LORA/QKV]   K slice: shape={k_slice.shape}, mean={k_slice.mean().item():.6f}, std={k_slice.std().item():.6f}, checksum={k_slice.sum().item():.6f}")
+                        print(f"[VLLM/LORA/QKV]   V slice: shape={v_slice.shape}, mean={v_slice.mean().item():.6f}, std={v_slice.std().item():.6f}, checksum={v_slice.sum().item():.6f}")
+                elif 'lora_b' in param_name:
+                    # lora_b shape is typically [3*rank, hidden_size] for packed qkv
+                    if param_tensor.shape[0] % 3 == 0:
+                        slice_size = param_tensor.shape[0] // 3
+                        q_slice = param_tensor.data[:slice_size, :]
+                        k_slice = param_tensor.data[slice_size:2*slice_size, :]
+                        v_slice = param_tensor.data[2*slice_size:, :]
+                        print(f"[VLLM/LORA/QKV]   Q slice: shape={q_slice.shape}, mean={q_slice.mean().item():.6f}, std={q_slice.std().item():.6f}, checksum={q_slice.sum().item():.6f}")
+                        print(f"[VLLM/LORA/QKV]   K slice: shape={k_slice.shape}, mean={k_slice.mean().item():.6f}, std={k_slice.std().item():.6f}, checksum={k_slice.sum().item():.6f}")
+                        print(f"[VLLM/LORA/QKV]   V slice: shape={v_slice.shape}, mean={v_slice.mean().item():.6f}, std={v_slice.std().item():.6f}, checksum={v_slice.sum().item():.6f}")
+        print("=" * 70)
 
         # Setup optimizer and scheduler
         self.current_lora_id = lora_id
@@ -360,17 +402,64 @@ class TrainingManager:
             logger.warning(f"[TrainingManager] No gradients found in {len(self.trainable_lora_params)} LoRA parameters")
             return None
 
+        # [VLLM/GRAD] Print gradient information (first step only)
+        if self.training_step == 0:
+            print("\n" + "=" * 70)
+            print("[VLLM/GRAD] Gradients After Backward Pass (First Step)")
+            print("=" * 70)
+            print(f"[VLLM/GRAD] Gradient accumulation steps: {self.gradient_accumulation_steps}")
+            print(f"[VLLM/GRAD] Current accumulation counter: {self.gradient_accumulation_counter}")
+            total_grad_norm = 0.0
+            for param_name, param in self.trainable_lora_params.items():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    grad_mean = param.grad.mean().item()
+                    grad_std = param.grad.std().item()
+                    grad_min = param.grad.min().item()
+                    grad_max = param.grad.max().item()
+                    total_grad_norm += grad_norm ** 2
+                    print(f"[VLLM/GRAD] {param_name}:")
+                    print(f"[VLLM/GRAD]   Grad norm: {grad_norm:.6e}, mean: {grad_mean:.6e}, std: {grad_std:.6e}")
+                    print(f"[VLLM/GRAD]   Grad min: {grad_min:.6e}, max: {grad_max:.6e}")
+                    print(f"[VLLM/GRAD]   Param dtype: {param.dtype}, grad dtype: {param.grad.dtype}")
+                else:
+                    print(f"[VLLM/GRAD] {param_name}: NO GRADIENT")
+            print(f"[VLLM/GRAD] Total gradient norm (all params): {(total_grad_norm ** 0.5):.6e}")
+            print("=" * 70)
+
         self.gradient_accumulation_counter += 1
         self.training_step += 1
 
         # Check if we should perform an optimizer step
         if self.gradient_accumulation_counter >= self.gradient_accumulation_steps:
+            # [VLLM/GRAD] Save parameters before optimizer step (first step only)
+            if self.training_step == 1:
+                params_before = {}
+                for param_name, param in self.trainable_lora_params.items():
+                    params_before[param_name] = param.data.clone()
+            
             # Perform optimizer step (directly updates the stacked tensor parameters)
             stats = self.optimizer_step(
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
                 max_grad_norm=max_grad_norm,
             )
+            
+            # [VLLM/GRAD] Check parameter updates after first optimizer step
+            if self.training_step == 1:
+                print("\n" + "=" * 70)
+                print("[VLLM/GRAD] After First Optimizer Step")
+                print("=" * 70)
+                for param_name, param in self.trainable_lora_params.items():
+                    if param_name in params_before:
+                        param_delta = (param.data - params_before[param_name]).abs()
+                        delta_mean = param_delta.mean().item()
+                        delta_max = param_delta.max().item()
+                        new_mean = param.data.mean().item()
+                        print(f"[VLLM/GRAD] {param_name}:")
+                        print(f"[VLLM/GRAD]   Delta mean: {delta_mean:.6e}, max: {delta_max:.6e}")
+                        print(f"[VLLM/GRAD]   New param mean: {new_mean:.6f}")
+                print("=" * 70)
             
             # Zero gradients and reset accumulation counter
             self.zero_grad(self.optimizer)

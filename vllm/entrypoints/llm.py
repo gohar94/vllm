@@ -720,6 +720,9 @@ class LLM:
                     "loss": batch_loss,
                 })
                 
+                # [VLLM/LOSS] Print loss for each step
+                print(f"[VLLM/LOSS] Step {global_step}, Epoch {epoch}, Loss: {batch_loss:.6f}")
+                
                 # Periodic evaluation
                 if eval_data and eval_steps and global_step > 0 and global_step % eval_steps == 0:
                     eval_batch = eval_data[:min(len(eval_data), batch_size * 4)]
@@ -736,6 +739,7 @@ class LLM:
                         "epoch": epoch,
                         "eval_loss": eval_loss,
                     })
+                    print(f"[VLLM/LOSS] Step {global_step}, Eval Loss: {eval_loss:.6f}")
                 
                 global_step += 1
                 
@@ -759,6 +763,7 @@ class LLM:
                     "epoch": epoch,
                     "eval_loss": eval_loss,
                 })
+                print(f"[VLLM/LOSS] End of Epoch {epoch}, Eval Loss: {eval_loss:.6f}")
         
         if use_tqdm:
             pbar.close()
