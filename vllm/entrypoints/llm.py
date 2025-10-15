@@ -2199,8 +2199,9 @@ class LLM:
                     
                     if response_start_pos != -1:
                         # Tokenize text up to response start
+                        # FIX: Use add_special_tokens=False to match PEFT's behavior
                         instruction_text = text[:response_start_pos + len(response_start_text)]
-                        instruction_tokens = tokenizer.encode(instruction_text)
+                        instruction_tokens = tokenizer.encode(instruction_text, add_special_tokens=False)
                         instruction_tokens_count = len(instruction_tokens)
                         response_tokens_count = len(prompt_token_ids) - instruction_tokens_count
                         

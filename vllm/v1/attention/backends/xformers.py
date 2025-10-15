@@ -504,9 +504,24 @@ class XFormersAttentionImpl(AttentionImpl):
             v = value.unsqueeze(0)
 
         # Create causal mask for training
-        # LowerTriangular creates a causal mask where each token can only attend to
-        # previous tokens and itself
-        attn_bias = LowerTriangularMask()
+        # CRITICAL FIX: Use BlockDiagonalCausalMask to prevent cross-sample attention
+        # Each sample in the batch should only attend to its own tokens!
+        if hasattr(attn_metadata, 'query_start_loc') and hasattr(attn_metadata, 'seq_lens'):
+            # Extract sequence lengths for each sample in the batch
+            query_start_loc = attn_metadata.query_start_loc
+            if query_start_loc is not None and len(query_start_loc) > 1:
+                # Multiple samples in batch - create block diagonal mask
+                # query_start_loc gives us the cumulative token counts
+                # seq_lens = torch.diff(query_start_loc) gives individual lengths
+                seqlens = torch.diff(query_start_loc).tolist()
+                from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
+                attn_bias = BlockDiagonalCausalMask.from_seqlens(seqlens)
+            else:
+                # Single sample - use simple causal mask
+                attn_bias = LowerTriangularMask()
+        else:
+            # Fallback to simple causal mask if metadata unavailable
+            attn_bias = LowerTriangularMask()
 
         # Use xformers memory_efficient_attention (NOT _forward) for training
         # This function supports both forward and backward passes
@@ -514,7 +529,7 @@ class XFormersAttentionImpl(AttentionImpl):
             q,
             k,
             v,
-            attn_bias=attn_bias,  # Use causal mask
+            attn_bias=attn_bias,  # Use proper mask (block diagonal or causal)
             p=0.0,  # No dropout
             scale=self.scale,
         )
