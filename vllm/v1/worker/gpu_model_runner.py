@@ -2501,6 +2501,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                     # Extract logits and labels for this request
                     request_logits = logits[offset:offset + num_tokens]
+                    
+                    # [VLLM/EVAL DEBUG] Check offset calculation for first few samples
+                    if batch_is_eval and hasattr(self, '_vllm_eval_sample_count') and self._vllm_eval_sample_count < 5:
+                        print(f"[VLLM/EVAL DEBUG] Sample {self._vllm_eval_sample_count} - Logits slicing:")
+                        print(f"[VLLM/EVAL DEBUG]   req_id={req_id}, offset={offset}, num_tokens={num_tokens}")
+                        print(f"[VLLM/EVAL DEBUG]   Extracting logits[{offset}:{offset+num_tokens}] from total shape {logits.shape}")
 
                     # Store logits for this request (keep gradients for backward pass)
                     logits_dict[req_id] = request_logits
@@ -2567,6 +2573,30 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             print(f"[VLLM/LOSS] Label mask pattern (first 30, 0=valid, 1=masked): {(shift_labels[:30] == -100).int().tolist()}")
                             print("=" * 70)
                         
+                        # [VLLM/EVAL] Print additional details during evaluation
+                        if not hasattr(self, '_vllm_first_eval_loss_printed'):
+                            self._vllm_first_eval_loss_printed = False
+                        if not hasattr(self, '_vllm_eval_sample_count'):
+                            self._vllm_eval_sample_count = 0
+                        
+                        # Debug first 5 eval samples  
+                        if batch_is_eval and self._vllm_eval_sample_count < 5:
+                            print("\n" + "=" * 70)
+                            print(f"[VLLM/EVAL] Sample {self._vllm_eval_sample_count} - Loss Computation")
+                            print("=" * 70)
+                            print(f"[VLLM/EVAL] Request ID: {req_id}")
+                            print(f"[VLLM/EVAL] Total tokens: {num_tokens}")
+                            print(f"[VLLM/EVAL] Valid labels: {valid_labels}")
+                            print(f"[VLLM/EVAL] Masked labels: {(shift_labels == -100).sum().item()}")
+                            print(f"[VLLM/EVAL] Logits shape: {shift_logits.shape}")
+                            print(f"[VLLM/EVAL] Logits mean: {shift_logits.mean().item():.6f}")
+                            print(f"[VLLM/EVAL] Logits std: {shift_logits.std().item():.6f}")
+                            print(f"[VLLM/EVAL] Logits dtype: {shift_logits.dtype}")
+                            print(f"[VLLM/EVAL] Labels (non--100, first 20): {shift_labels[shift_labels != -100][:20].tolist()}")
+                            print(f"[VLLM/EVAL] Full logits mean (unshifted): {request_logits.mean().item():.6f}")
+                            print(f"[VLLM/EVAL] Full logits std (unshifted): {request_logits.std().item():.6f}")
+                            print("=" * 70)
+                        
                         # CRITICAL FIX: Skip loss computation if no valid labels
                         if valid_labels == 0:
                             losses[req_id] = None
@@ -2583,6 +2613,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 print(f"[VLLM/LOSS] Computed loss: {loss_value:.6f}")
                                 self._vllm_first_loss_printed = True
                             
+                            # [VLLM/EVAL] Print eval loss details for first 5 samples
+                            if batch_is_eval and self._vllm_eval_sample_count < 5:
+                                # Compute per-token losses for analysis
+                                loss_fct_per_token = torch.nn.CrossEntropyLoss(reduction='none')
+                                per_token_losses = loss_fct_per_token(
+                                    shift_logits.view(-1, shift_logits.size(-1)),
+                                    shift_labels.view(-1)
+                                )
+                                valid_per_token = per_token_losses[shift_labels.view(-1) != -100]
+                                
+                                print(f"[VLLM/EVAL] Sample {self._vllm_eval_sample_count} - Computed loss: {loss_value:.6f}")
+                                print(f"[VLLM/EVAL] Loss reduction: 'mean' over {valid_labels} valid tokens")
+                                print(f"[VLLM/EVAL] Per-token loss stats:")
+                                print(f"[VLLM/EVAL]   Mean: {valid_per_token.mean().item():.6f}")
+                                print(f"[VLLM/EVAL]   Std: {valid_per_token.std().item():.6f}")
+                                print(f"[VLLM/EVAL]   Min: {valid_per_token.min().item():.6f}")
+                                print(f"[VLLM/EVAL]   Max: {valid_per_token.max().item():.6f}")
+                                print(f"[VLLM/EVAL]   First 10: {valid_per_token[:10].tolist()}")
+                                self._vllm_eval_sample_count += 1
+                            
                             # CRITICAL FIX: Skip NaN/inf losses
                             if torch.isnan(loss) or torch.isinf(loss):
                                 losses[req_id] = None
@@ -2591,8 +2641,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 loss_tensors.append(loss)
                                 # Store scalar value for output
                                 losses[req_id] = loss_value
+                                
+                                # [VLLM/EVAL FIX] Store valid token count for weighted averaging
+                                if batch_is_eval:
+                                    if not hasattr(self, '_vllm_eval_valid_tokens'):
+                                        self._vllm_eval_valid_tokens = {}
+                                    self._vllm_eval_valid_tokens[req_id] = valid_labels
                     else:
                         # No labels provided, cannot compute loss
+                        if batch_is_eval and hasattr(self, '_vllm_eval_sample_count') and self._vllm_eval_sample_count < 10:
+                            print(f"[VLLM/EVAL DEBUG] ⚠️  Request {req_id}: labels=None, loss set to None")
                         losses[req_id] = None
 
                     # CRITICAL FIX: Always add req_id to mappings to prevent scheduler KeyError

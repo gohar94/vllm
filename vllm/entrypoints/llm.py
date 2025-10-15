@@ -725,7 +725,8 @@ class LLM:
                 
                 # Periodic evaluation
                 if eval_data and eval_steps and global_step > 0 and global_step % eval_steps == 0:
-                    eval_batch = eval_data[:min(len(eval_data), batch_size * 4)]
+                    # [VLLM/EVAL FIX] Evaluate on ALL eval data
+                    eval_batch = eval_data  # Use all eval data
                     eval_results = self.eval(
                         eval_batch,
                         lora_request=lora_request,
@@ -749,15 +750,35 @@ class LLM:
             
             # End of epoch evaluation
             if eval_data:
-                eval_batch = eval_data[:min(len(eval_data), batch_size * 8)]
+                # [VLLM/EVAL FIX] Evaluate on ALL eval data, not just first batch_size*8 samples
+                eval_batch = eval_data  # Use all eval data
                 eval_results = self.eval(
                     eval_batch,
                     lora_request=lora_request,
                     use_tqdm=False,
                 )
-                eval_loss = np.mean([
-                    r['loss'] for r in eval_results if r['loss'] is not None
-                ])
+                
+                # [VLLM/EVAL FIX] Weight losses by number of valid tokens (like PEFT does)
+                individual_losses = [r['loss'] for r in eval_results if r['loss'] is not None]
+                individual_tokens = [r['num_tokens'] for r in eval_results if r['loss'] is not None]
+                
+                # Compute weighted average (weight by valid token count)
+                total_weighted_loss = sum(loss * tokens for loss, tokens in zip(individual_losses, individual_tokens))
+                total_tokens = sum(individual_tokens)
+                eval_loss = total_weighted_loss / total_tokens if total_tokens > 0 else 0
+                
+                # Also compute unweighted mean for comparison
+                unweighted_mean = np.mean(individual_losses) if individual_losses else 0
+                
+                if epoch == 0:  # Print only for first epoch
+                    print(f"\n[VLLM/EVAL DEBUG] End of Epoch {epoch}")
+                    print(f"[VLLM/EVAL DEBUG] Num eval samples: {len(eval_batch)}")
+                    print(f"[VLLM/EVAL DEBUG] Num eval results: {len(eval_results)}")
+                    print(f"[VLLM/EVAL DEBUG] Individual losses (first 10): {individual_losses[:10]}")
+                    print(f"[VLLM/EVAL DEBUG] Individual tokens (first 10): {individual_tokens[:10]}")
+                    print(f"[VLLM/EVAL DEBUG] Unweighted mean loss: {unweighted_mean:.6f}")
+                    print(f"[VLLM/EVAL DEBUG] ✅ WEIGHTED mean loss (by tokens): {eval_loss:.6f}")
+                    print(f"[VLLM/EVAL DEBUG] Total valid tokens: {total_tokens}\n")
                 eval_losses.append({
                     "step": global_step,
                     "epoch": epoch,
@@ -876,14 +897,14 @@ class LLM:
         if lora_request:
             worker = self.llm_engine.model_executor.driver_worker
             model_runner = worker.model_runner
-            
+
             if hasattr(model_runner, "training_manager"):
                 training_manager = model_runner.training_manager
                 lora_id = lora_request.lora_int_id
-                
-            # Load LoRA into manager if not already loaded
-            if lora_id not in training_manager.lora_manager.list_adapters():
-                training_manager.lora_manager.add_adapter(lora_request)
+
+                # Load LoRA into manager if not already loaded
+                if lora_id not in training_manager.lora_manager.list_adapters():
+                    training_manager.lora_manager.add_adapter(lora_request)
 
         # Add evaluation requests to the engine (same as training but with is_eval=True)
         request_ids = self._add_training_requests(
@@ -901,6 +922,15 @@ class LLM:
         # Collect evaluation resul
         output_map = {output.request_id: output for output in outputs}
 
+        # [VLLM/EVAL FIX] Get valid token counts from model runner
+        worker = self.llm_engine.model_executor.driver_worker
+        model_runner = worker.model_runner
+        valid_tokens_map = {}
+        if hasattr(model_runner, '_vllm_eval_valid_tokens'):
+            valid_tokens_map = model_runner._vllm_eval_valid_tokens.copy()
+            # Clear for next eval
+            model_runner._vllm_eval_valid_tokens = {}
+
         tokenizer = self.get_tokenizer()
         results = []
         for req_id, example in zip(request_ids, eval_data):
@@ -911,8 +941,10 @@ class LLM:
             eval_logits = output.training_logits if output and hasattr(
                 output, 'training_logits') else None
 
-            # Calculate num_tokens based on the format
-            if 'text' in example:
+            # [VLLM/EVAL FIX] Use valid token count if available, otherwise calculate total
+            if req_id in valid_tokens_map:
+                num_tokens = valid_tokens_map[req_id]
+            elif 'text' in example:
                 num_tokens = len(tokenizer.encode(example['text']))
             elif 'messages' in example:
                 text = tokenizer.apply_chat_template(
@@ -935,7 +967,7 @@ class LLM:
                 'request_id': req_id,
                 'loss': eval_loss,
                 'logits': eval_logits,
-                'num_tokens': num_tokens,
+                'num_tokens': num_tokens,  # Now contains VALID token count
             })
 
         return results
@@ -2172,8 +2204,18 @@ class LLM:
                         instruction_tokens_count = len(instruction_tokens)
                         response_tokens_count = len(prompt_token_ids) - instruction_tokens_count
                         
+                        # [VLLM/EVAL DEBUG] Check response boundary for first few samples
+                        if is_eval and len(request_ids) < 5:
+                            print(f"[VLLM/EVAL DEBUG] Sample {len(request_ids)} - Response boundary:")
+                            print(f"[VLLM/EVAL DEBUG]   Found '### Response:' at position {response_start_pos}")
+                            print(f"[VLLM/EVAL DEBUG]   Text around marker: ...{text[max(0,response_start_pos-15):response_start_pos+35]}...")
+                            print(f"[VLLM/EVAL DEBUG]   instruction_tokens: {instruction_tokens_count}, response_tokens: {response_tokens_count}")
+                        
                         # CRITICAL FIX: Skip samples with insufficient response tokens
                         if response_tokens_count < 2:  # Need at least 2 tokens for loss computation (due to shifting)
+                            if is_eval and len(request_ids) < 10:
+                                print(f"[VLLM/EVAL DEBUG] ⚠️  Sample {len(request_ids)} SKIPPED: response_tokens={response_tokens_count} < 2")
+                                print(f"[VLLM/EVAL DEBUG]     Total tokens={len(prompt_token_ids)}, instruction_tokens={instruction_tokens_count}")
                             # Still need to add a request to avoid scheduler issues
                             training_config = TrainingConfig(labels=None)
                             request_id = self._add_training_request(
@@ -2186,6 +2228,21 @@ class LLM:
                         
                         # Mask instruction tokens with -100 (like PEFT does)
                         labels[:len(instruction_tokens)] = -100
+                        
+                        # [VLLM/EVAL DEBUG] Log label masking for first few eval samples
+                        if is_eval and len(request_ids) < 5:
+                            num_valid = (labels != -100).sum().item()
+                            num_masked = (labels == -100).sum().item()
+                            # Find where masking ends (first non--100 token)
+                            mask_end_idx = 0
+                            for i, label in enumerate(labels):
+                                if label != -100:
+                                    mask_end_idx = i
+                                    break
+                            print(f"[VLLM/EVAL DEBUG] Sample {len(request_ids)}: total_tokens={len(labels)}, valid={num_valid}, masked={num_masked}, mask_pct={100*num_masked/len(labels):.1f}%")
+                            print(f"[VLLM/EVAL DEBUG]   Masking ends at index {mask_end_idx}, instruction_tokens={len(instruction_tokens)}")
+                            print(f"[VLLM/EVAL DEBUG]   First 10 labels: {labels[:10].tolist()}")
+                            print(f"[VLLM/EVAL DEBUG]   Labels around mask boundary [{mask_end_idx-2}:{mask_end_idx+5}]: {labels[max(0,mask_end_idx-2):mask_end_idx+5].tolist()}")
 
             # Format 2: 'messages' field (chat format)
             elif 'messages' in example:
