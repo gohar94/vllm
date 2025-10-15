@@ -424,16 +424,11 @@ class LoRAModelManager:
         # Check if we have a TrainingManager with trained parameters
         training_manager = getattr(self, '_training_manager', None)
         has_trained_params = False
-        logger.info(f"[activate_adapter] Checking for TrainingManager: {training_manager is not None}")
         if training_manager:
-            logger.info(f"[activate_adapter] TrainingManager current_lora_id: {training_manager.current_lora_id}")
             # Check if this LoRA has been trained (using persistent trained_lora_ids set)
             if (hasattr(training_manager, 'trained_lora_ids') and
                 lora_id in training_manager.trained_lora_ids):
                 has_trained_params = True
-                logger.info(f"[FIX] Found trained LoRA {lora_id} in trained_lora_ids: {training_manager.trained_lora_ids}")
-            else:
-                logger.info(f"[activate_adapter] LoRA {lora_id} not in trained_lora_ids: {getattr(training_manager, 'trained_lora_ids', 'not found')}")
         
         for module_name, module in self.modules.items():
             module_lora = self._get_lora_layer_weights(lora_model, module_name)

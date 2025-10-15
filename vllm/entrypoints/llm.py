@@ -876,19 +876,9 @@ class LLM:
                 training_manager = model_runner.training_manager
                 lora_id = lora_request.lora_int_id
                 
-                # Load LoRA into manager if not already loaded
-                if lora_id not in training_manager.lora_manager.list_adapters():
-                    logger.info(f"[Evaluation] Loading LoRA adapter {lora_id} for evaluation")
-                    training_manager.lora_manager.add_adapter(lora_request)
-                else:
-                    # LoRA already loaded - ensure Parameters are synced to stacked tensors
-                    # This is critical because training may have updated the Parameters
-                    logger.info(f"[Evaluation] Syncing LoRA {lora_id} Parameters to stacked tensors for evaluation")
-                    # DEBUG: Check the lora_index_to_id mapping
-                    lora_index_to_id = training_manager.lora_manager._adapter_manager.lora_index_to_id
-                    logger.info(f"[Evaluation] lora_index_to_id mapping: {lora_index_to_id}")
-                    param_sync_stats = training_manager.copy_parameters_to_stacked(lora_id)
-                    logger.info(f"[Evaluation] Sync complete: {param_sync_stats}")
+            # Load LoRA into manager if not already loaded
+            if lora_id not in training_manager.lora_manager.list_adapters():
+                training_manager.lora_manager.add_adapter(lora_request)
 
         # Add evaluation requests to the engine (same as training but with is_eval=True)
         request_ids = self._add_training_requests(
@@ -898,55 +888,12 @@ class LLM:
             is_eval=True,  # Mark as evaluation
         )
 
-        # CRITICAL: Re-sync parameters after request processing
-        # The _add_training_requests may trigger activate_adapter which resets stacked tensors
-        if lora_request:
-            worker = self.llm_engine.model_executor.driver_worker
-            model_runner = worker.model_runner
-            
-            if hasattr(model_runner, "training_manager"):
-                training_manager = model_runner.training_manager
-                lora_id = lora_request.lora_int_id
-                logger.info(f"[Evaluation] Re-syncing LoRA {lora_id} Parameters after request processing")
-                param_sync_stats = training_manager.copy_parameters_to_stacked(lora_id)
-                logger.info(f"[Evaluation] Re-sync complete: {param_sync_stats}")
-                
-                # VERIFICATION TEST: Check if tensor IDs match between TrainingManager and forward model
-                try:
-                    tm_model = training_manager.model
-                    fwd_model = model_runner.model
-                    
-                    # Get first LoRA module from both
-                    tm_module = next((m for n,m in tm_model.named_modules() if hasattr(m, 'lora_a_stacked')), None)
-                    fwd_module = next((m for n,m in fwd_model.named_modules() if hasattr(m, 'lora_a_stacked')), None)
-                    
-                    if tm_module and fwd_module:
-                        tm_tensor_id = id(tm_module.lora_a_stacked[0])
-                        fwd_tensor_id = id(fwd_module.lora_a_stacked[0])
-                        logger.error(f"[VERIFICATION] TM tensor ID: {tm_tensor_id}")
-                        logger.error(f"[VERIFICATION] FWD tensor ID: {fwd_tensor_id}")
-                        if tm_tensor_id != fwd_tensor_id:
-                            logger.error(f"[VERIFICATION] ❌ TENSOR MISMATCH CONFIRMED!")
-                        else:
-                            logger.error(f"[VERIFICATION] ✅ Tensor IDs match!")
-                            
-                        # MEMORY DEBUG: Check tensor values after verification
-                        tm_checksum = tm_module.lora_a_stacked[0][0, 0, :, :].sum().item()
-                        fwd_checksum = fwd_module.lora_a_stacked[0][0, 0, :, :].sum().item()
-                        logger.error(f"[MEMORY_DEBUG] TM checksum: {tm_checksum:.6f}")
-                        logger.error(f"[MEMORY_DEBUG] FWD checksum: {fwd_checksum:.6f}")
-                        
-                        # Check if tensors are on same device
-                        logger.error(f"[MEMORY_DEBUG] TM device: {tm_module.lora_a_stacked[0].device}")
-                        logger.error(f"[MEMORY_DEBUG] FWD device: {fwd_module.lora_a_stacked[0].device}")
-                        
-                except Exception as e:
-                    logger.error(f"[VERIFICATION] Error during tensor ID check: {e}")
+            # LoRA is ready for evaluation (stacked tensors are trained directly)
 
         # Run the engine to process evaluation requests
         outputs = self._run_engine(use_tqdm=use_tqdm)
 
-        # Collect evaluation results
+        # Collect evaluation resul
         output_map = {output.request_id: output for output in outputs}
 
         tokenizer = self.get_tokenizer()
@@ -2197,11 +2144,43 @@ class LLM:
             if 'text' in example:
                 text = example['text']
                 prompt_token_ids = tokenizer.encode(text)
-                # For causal LM, labels = input_ids (standard practice)
-                labels = torch.tensor(prompt_token_ids,
-                                      dtype=torch.long,
-                                      device='cpu')
+                
+                # FIXED: Implement proper instruction masking like PEFT
+                labels = torch.tensor(prompt_token_ids, dtype=torch.long, device='cpu')
+                
+                # Create prompt dict early (needed for skipped samples)
                 prompt = {'prompt_token_ids': prompt_token_ids}
+                
+                # Parse Alpaca format to identify instruction vs response
+                instruction_tokens_count = 0
+                response_tokens_count = len(prompt_token_ids)
+                
+                if "### Response:" in text:
+                    # Find where the response starts
+                    response_start_text = "### Response:"
+                    response_start_pos = text.find(response_start_text)
+                    
+                    if response_start_pos != -1:
+                        # Tokenize text up to response start
+                        instruction_text = text[:response_start_pos + len(response_start_text)]
+                        instruction_tokens = tokenizer.encode(instruction_text)
+                        instruction_tokens_count = len(instruction_tokens)
+                        response_tokens_count = len(prompt_token_ids) - instruction_tokens_count
+                        
+                        # CRITICAL FIX: Skip samples with insufficient response tokens
+                        if response_tokens_count < 2:  # Need at least 2 tokens for loss computation (due to shifting)
+                            # Still need to add a request to avoid scheduler issues
+                            training_config = TrainingConfig(labels=None)
+                            request_id = self._add_training_request(
+                                prompt=prompt,
+                                training_config=training_config,
+                                lora_request=lora_request
+                            )
+                            request_ids.append(request_id)
+                            continue
+                        
+                        # Mask instruction tokens with -100 (like PEFT does)
+                        labels[:len(instruction_tokens)] = -100
 
             # Format 2: 'messages' field (chat format)
             elif 'messages' in example:

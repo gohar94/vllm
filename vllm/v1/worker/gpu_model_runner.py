@@ -2407,17 +2407,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                     # If LoRA is loaded from disk, convert it to trainable Parameters
                     # Skip this during evaluation to avoid resetting trained parameters
-                    logger.info(f"[DEBUG] execute_model_training: lora_id={lora_id}, is_eval={is_eval}")
                     if lora_id is not None and not is_eval:
                         try:
                             lora_stats = self.training_manager.make_lora_trainable(lora_id)
                         except Exception as e:
                             logger.warning(f"[Training] Failed to convert LoRA {lora_id}: {e}")
-                    elif lora_id is not None and is_eval:
-                        logger.info(f"[Evaluation] Skipping make_lora_trainable for LoRA {lora_id} during evaluation")
+                    # Skip make_lora_trainable during evaluation
 
-                    # Freeze base model
-                    stats = self.training_manager.freeze_base_model(verbose=False)
+                    # Freeze base model (only log once per LoRA setup)
+                    if not hasattr(self, '_base_model_frozen'):
+                        stats = self.training_manager.freeze_base_model(verbose=False)
+                        self._base_model_frozen = True
                 else:
                     # Full fine-tuning: enable all parameters
                     param_count = 0
@@ -2518,31 +2518,55 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         else:
                             labels = labels.to(self.device)
 
-                        # Ensure labels are the right length
+                        # Handle variable length sequences like PEFT does
                         if len(labels) != num_tokens:
-                            logger.warning(
-                                f"Label length mismatch for request {req_id}: "
+                            logger.debug(
+                                f"Adjusting labels for request {req_id}: "
                                 f"expected {num_tokens}, got {len(labels)}")
-                            offset += num_tokens
-                            continue
+                            
+                            # Pad or truncate labels to match sequence length
+                            if len(labels) < num_tokens:
+                                # Pad with -100 (ignored in loss computation)
+                                pad_length = num_tokens - len(labels)
+                                padding = torch.full((pad_length,), -100, 
+                                                   dtype=labels.dtype, device=labels.device)
+                                labels = torch.cat([labels, padding])
+                            else:
+                                # Truncate to fit
+                                labels = labels[:num_tokens]
+                            
+                            logger.debug(f"Adjusted labels length: {len(labels)}")
 
                         shift_logits = request_logits[:-1, :].contiguous()
                         shift_labels = labels[1:].contiguous()
 
-                        loss_fct = torch.nn.CrossEntropyLoss()
-                        loss = loss_fct(
-                            shift_logits.view(-1, shift_logits.size(-1)),
-                            shift_labels.view(-1))
+                        # Check for potential NaN causes
+                        valid_labels = (shift_labels != -100).sum().item()
+                        
+                        # CRITICAL FIX: Skip loss computation if no valid labels
+                        if valid_labels == 0:
+                            losses[req_id] = None
+                        else:
+                            loss_fct = torch.nn.CrossEntropyLoss()
+                            loss = loss_fct(
+                                shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_labels.view(-1))
 
-                        # Store loss tensor for backward pass
-                        loss_tensors.append(loss)
-
-                        # Store scalar value for output
-                        losses[req_id] = loss.item()
+                            loss_value = loss.item()
+                            
+                            # CRITICAL FIX: Skip NaN/inf losses
+                            if torch.isnan(loss) or torch.isinf(loss):
+                                losses[req_id] = None
+                            else:
+                                # Store loss tensor for backward pass
+                                loss_tensors.append(loss)
+                                # Store scalar value for output
+                                losses[req_id] = loss_value
                     else:
                         # No labels provided, cannot compute loss
                         losses[req_id] = None
 
+                    # CRITICAL FIX: Always add req_id to mappings to prevent scheduler KeyError
                     req_ids_output.append(req_id)
                     req_id_to_index[req_id] = len(req_ids_output) - 1
                     offset += num_tokens

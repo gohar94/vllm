@@ -19,8 +19,6 @@ from .utils import _get_lora_device
 
 # DEBUG FLAG: Force PyTorch path instead of Punica for ALL forward passes
 # This helps debug if Punica kernels are preventing evaluation from seeing updated weights
-# Set to True to always use PyTorch ops (slower but supports autograd and uses Parameters directly)
-FORCE_PYTORCH_LORA_PATH = True
 
 
 class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
@@ -149,13 +147,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             pass
 
         if is_eval_mode:
-            logger.info(f"[FINAL_FIX] Skipping reset_lora during evaluation mode for index={index}")
             return
-
-        logger.warning(f"[DEBUG] reset_lora called! Zeroing stacked tensors at index={index}")
-        # Add stack trace to see where this is called from
-        import traceback
-        logger.warning(f"[DEBUG] reset_lora stack trace:\n{''.join(traceback.format_stack()[-3:])}")
         for s_index in range(self.n_slices):
             self.lora_a_stacked[s_index][index] = 0
             self.lora_b_stacked[s_index][index] = 0
@@ -240,62 +232,14 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
 
         # TRAINING MODE: Punica kernels don't support autograd, use PyTorch ops instead
         # For training, tensors will have requires_grad=True
-        # For evaluation during training, we also want to use PyTorch path to see updated Parameters
-        # DEBUG: Can force PyTorch path globally with FORCE_PYTORCH_LORA_PATH flag
-        if FORCE_PYTORCH_LORA_PATH or x.requires_grad or output.requires_grad:
-            # Log once that we're using forced PyTorch path (if flag is set)
-            if FORCE_PYTORCH_LORA_PATH and not hasattr(self, '_logged_force_pytorch'):
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.info("[DEBUG] FORCE_PYTORCH_LORA_PATH=True: Using PyTorch ops instead of Punica for ALL batches")
-                self._logged_force_pytorch = True
+        # Use PyTorch path for training (requires_grad=True) to support autograd
+        if x.requires_grad or output.requires_grad:
             
             # Training path: bypass Punica, use plain PyTorch matmul for gradient flow
             # Always apply LoRA during training (even if weights are zero) to enable gradient flow
             
             if len(self.lora_a_stacked) > 0:
                 max_loras = self.lora_a_stacked[0].shape[0]
-                
-                # DEBUG: Log which LoRAs are being applied (always log for evaluation debugging)
-                if FORCE_PYTORCH_LORA_PATH:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    if not hasattr(self, '_logged_lora_application'):
-                        logger.info(f"[DEBUG] Applying LoRAs: max_loras={max_loras}, stacked_shape={self.lora_a_stacked[0].shape}")
-                        logger.info(f"[TENSOR_ID_FORWARD] {id(self.lora_a_stacked[0])}")
-                        logger.info(f"[TRACE] Forward pass in module: type={type(self).__name__}")
-                        logger.info(f"[KERNEL_DEBUG] Using PyTorch LoRA path (FORCE_PYTORCH_LORA_PATH=True)")
-                        self._logged_lora_application = True
-                    
-                    # PRE-FORWARD VERIFICATION: Check tensor values right before forward pass
-                    if not x.requires_grad:  # Evaluation mode
-                        # Force CUDA sync before reading
-                        if self.lora_a_stacked[0].is_cuda:
-                            torch.cuda.synchronize()
-                        
-                        pre_forward_checksum = self.lora_a_stacked[0][0, 0, :, :].sum().item()
-                        logger.info(f"[PRE_FORWARD_VERIFY] Tensor {id(self.lora_a_stacked[0])}: checksum={pre_forward_checksum:.6f}")
-                        
-                        if abs(pre_forward_checksum) < 1e-6:
-                            logger.error(f"[PRE_FORWARD_ERROR] ❌ Tensor is ZERO right before forward pass!")
-                        else:
-                            logger.info(f"[PRE_FORWARD_SUCCESS] ✅ Tensor has non-zero values before forward pass")
-                    
-                    # Always check LoRA checksums during evaluation (when requires_grad=False)
-                    if not x.requires_grad:  # This indicates evaluation mode
-                        # INDEX DEBUG: Log which indices we're checking in forward pass
-                        if not hasattr(self, '_logged_forward_indices'):
-                            logger.info(f"[INDEX_DEBUG] FORWARD: max_loras={max_loras}, checking indices 0 to {max_loras-1}")
-                            self._logged_forward_indices = True
-                        
-                        for idx in range(max_loras):
-                            checksum = self.lora_a_stacked[0][idx, 0, :, :].sum().item()
-                            if abs(checksum) > 1e-6:  # Only log non-zero checksums
-                                logger.info(f"[EVAL] LoRA idx={idx}, lora_a checksum={checksum:.6f}")
-                                logger.info(f"[INDEX_DEBUG] FORWARD: Found non-zero at idx={idx}")
-                            elif idx == 0:  # Always log index 0 for debugging
-                                logger.info(f"[EVAL] LoRA idx={idx}, lora_a checksum={checksum:.6f} (ZERO!)")
-                                logger.info(f"[INDEX_DEBUG] FORWARD: Index 0 is ZERO!")
                 
                 # Apply ALL LoRAs in the stacked tensors (supports parallel training)
                 # We apply even zero-initialized LoRAs to enable gradient flow from scratch
@@ -328,18 +272,6 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             return output
 
         # INFERENCE MODE: Use Punica kernels (fast but no autograd)
-        # KERNEL DEBUG: Log when Punica path is used
-        import logging
-        logger = logging.getLogger(__name__)
-        if not hasattr(self, '_logged_punica_usage'):
-            logger.info(f"[KERNEL_DEBUG] Using Punica kernel path for LoRA application")
-            logger.info(f"[KERNEL_DEBUG] x.requires_grad={x.requires_grad}, output.requires_grad={output.requires_grad}")
-            logger.info(f"[KERNEL_DEBUG] FORCE_PYTORCH_LORA_PATH={FORCE_PYTORCH_LORA_PATH}")
-            # Check tensor values before Punica
-            if len(self.lora_a_stacked) > 0:
-                punica_checksum = self.lora_a_stacked[0][0, 0, :, :].sum().item()
-                logger.info(f"[PUNICA_PRE] Tensor {id(self.lora_a_stacked[0])}: checksum={punica_checksum:.6f}")
-            self._logged_punica_usage = True
 
         lora_output: Optional[
             torch.Tensor] = self.punica_wrapper.add_lora_linear(
