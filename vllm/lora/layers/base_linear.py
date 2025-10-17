@@ -144,7 +144,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                 not self.lora_a_stacked[0].requires_grad):
                 is_eval_mode = True
         except:
-            pass
+            print("Error checking if we're in eval mode")
 
         if is_eval_mode:
             return
@@ -231,8 +231,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             x = x.flatten(0, 1)
 
         # TRAINING MODE: Punica kernels don't support autograd, use PyTorch ops instead
-        # For training, tensors will have requires_grad=True
-        # Use PyTorch path for training (requires_grad=True) to support autograd
+        # Use PyTorch path when inputs participate in autograd to ensure gradients on LoRA weights
         if x.requires_grad or output.requires_grad:
             
             # Training path: bypass Punica, use plain PyTorch matmul for gradient flow
@@ -253,20 +252,97 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                         # Apply this LoRA using PyTorch ops (supports autograd)
                         # For packed layers (e.g., QKV), apply each component to its output slice
                         output_offset = 0
-                        for i in range(len(self.lora_a_stacked)):
+                        # Determine which slices to apply (Q/V only for packed QKV)
+                        try:
+                            from vllm.lora.layers.column_parallel_linear import (
+                                MergedQKVParallelLinearWithLoRA,
+                                QKVParallelLinearWithLoRA,
+                            )
+                            is_merged_qkv = isinstance(self, MergedQKVParallelLinearWithLoRA)
+                            is_single_qkv = isinstance(self, QKVParallelLinearWithLoRA)
+                        except Exception:
+                            is_merged_qkv, is_single_qkv = False, False
+
+                        indices = list(range(len(self.lora_a_stacked)))
+                        if is_merged_qkv and len(indices) >= 3:
+                            indices = [0, 2]  # Q and V
+
+                        # LoRA scale matching PEFT: alpha / r
+                        lora_scale = 1.0
+                        if hasattr(self, 'lora_config') and getattr(self, 'lora_config') is not None:
+                            alpha = getattr(self.lora_config, 'lora_alpha', 1.0)
+                            rank = getattr(self.lora_config, 'max_lora_rank', 1.0)
+                            if rank:
+                                lora_scale = float(alpha) / float(rank)
+
+                        for i in indices:
                             lora_a = self.lora_a_stacked[i][lora_idx, 0, :, :]  # [rank, input_size]
                             lora_b = self.lora_b_stacked[i][lora_idx, 0, :, :]  # [output_size, rank]
-                            
-                            # LoRA: lora_output = x @ lora_a.T @ lora_b.T
-                            # This creates a computation graph even if weights are zero
-                            lora_output = x @ lora_a.T @ lora_b.T  # [seq_len, output_size]
-                            
+
+                            # For single-slice packed QKV, zero K-slice contributions via a multiplicative mask (keeps grad flow)
+                            if is_single_qkv and i == 0 and hasattr(self, 'q_proj_shard_size') and hasattr(self, 'kv_proj_shard_size'):
+                                try:
+                                    q_size = int(getattr(self, 'q_proj_shard_size'))
+                                    kv_size = int(getattr(self, 'kv_proj_shard_size'))
+                                    # Build and cache a persistent mask on first use
+                                    if not hasattr(self, '_lora_b_kzero_mask') or self._lora_b_kzero_mask.shape != lora_b.shape:
+                                        mask = torch.ones_like(lora_b)
+                                        mask[q_size:q_size + kv_size, :] = 0
+                                        self._lora_b_kzero_mask = mask
+                                    lora_b_used = lora_b * self._lora_b_kzero_mask
+                                except Exception:
+                                    lora_b_used = lora_b
+                            else:
+                                lora_b_used = lora_b
+
+                            # LoRA output with scale: (x @ A^T) * scale @ B^T
+                            # Debug: input and weight stats
+                            try:
+                                import logging
+                                logger = logging.getLogger(__name__)
+                                if not hasattr(self, '_lora_dbg2_emitted'):
+                                    self._lora_dbg2_emitted = 0
+                                if self._lora_dbg2_emitted < 5:
+                                    xa = float(x.mean().detach().cpu())
+                                    xs = float(x.std().detach().cpu())
+                                    an = float(lora_a.norm().detach().cpu())
+                                    bn = float(lora_b_used.norm().detach().cpu())
+                                    nnz_b = int((lora_b_used != 0).sum().detach().cpu())
+                                    logger.info(
+                                        f"[LORA/DBG] {getattr(self, 'layer_name', 'unknown')}: i={i}, "
+                                        f"x_mean={xa:.3e}, x_std={xs:.3e}, ||A||={an:.3e}, ||B||={bn:.3e}, nnz(B)={nnz_b}, "
+                                        f"requires_grad: x={x.requires_grad}, A={lora_a.requires_grad}, B={lora_b_used.requires_grad}, out={output.requires_grad}"
+                                    )
+                                    self._lora_dbg2_emitted += 1
+                            except Exception:
+                                print("Error logging LoRA debug info")
+
+                            # Note: Scaling is applied when optimize() is called (lora.py).
+                            # We don't apply scaling again here to avoid double-scaling.
+                            lora_hidden = (x.to(torch.float32) @ lora_a.T.to(torch.float32)) # * float(lora_scale)
+                            lora_output = lora_hidden @ lora_b_used.T.to(torch.float32)
+                            lora_output = lora_output.to(output.dtype)
+                            # Debug: per-layer LoRA stats
+                            try:
+                                import logging
+                                logger = logging.getLogger(__name__)
+                                if not hasattr(self, '_lora_dbg_emitted'):
+                                    self._lora_dbg_emitted = 0
+                                if self._lora_dbg_emitted < 5:
+                                    logger.info(
+                                        f"[LORA/FWD] {getattr(self, 'layer_name', 'unknown')}: i={i}, mean={float(lora_output.mean().detach().cpu()):.6e}, std={float(lora_output.std().detach().cpu()):.6e}, scale={lora_scale}"
+                                    )
+                                    self._lora_dbg_emitted += 1
+                            except Exception:
+                                print("Error logging LoRA forward stats")
+
                             # Get the output slice size for this component
                             slice_size = self.output_slices[i]
-                            
-                            # Add LoRA output to the corresponding slice of the base output
-                            # CRITICAL: Use in-place addition to ensure gradients flow back
-                            output[:, output_offset:output_offset + slice_size] = output[:, output_offset:output_offset + slice_size] + lora_output
+
+                            # Add LoRA output to corresponding slice (build delta to avoid in-place on view)
+                            delta = torch.zeros_like(output)
+                            delta[:, output_offset:output_offset + slice_size] = lora_output
+                            output = output + delta
                             output_offset += slice_size
             
             return output

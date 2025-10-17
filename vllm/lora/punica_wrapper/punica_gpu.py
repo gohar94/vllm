@@ -81,7 +81,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             scale (float): Scaling factor for the operation
         """
 
-        x = x.view(-1, x.shape[-1])
+        # Ensure contiguity for Triton kernel
+        x = x.contiguous().view(-1, x.shape[-1])
         lora_shrink(
             x,
             lora_a_stacked,

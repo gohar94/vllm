@@ -687,6 +687,71 @@ class LLM:
         train_losses = []
         eval_losses = []
         global_step = 0
+
+        # Helper to count valid label tokens for weighting (matches masking logic)
+        tokenizer = self.get_tokenizer()
+        def _count_valid_labels(example: dict[str, Any]) -> int:
+            # SFT text format with instruction masking
+            if 'text' in example:
+                text = example['text']
+                prompt_token_ids = tokenizer.encode(text)
+                instr_count = 0
+                if "### Response:" in text:
+                    prefix = text[: text.find("### Response:") + len("### Response:")]
+                    # Match masking logic: add_special_tokens=False
+                    instr_count = len(tokenizer.encode(prefix, add_special_tokens=False))
+                # Shift by one for next-token prediction
+                return max(0, len(prompt_token_ids) - instr_count - 1)
+            # Chat format (no masking implemented here)
+            if 'messages' in example:
+                text = tokenizer.apply_chat_template(
+                    example['messages'], add_generation_prompt=False, tokenize=False)
+                prompt_token_ids = tokenizer.encode(text)
+                return max(0, len(prompt_token_ids) - 1)
+            # Legacy prompt/labels
+            if 'labels' in example:
+                labels = example['labels']
+                if isinstance(labels, list):
+                    # Count non -100 labels, then account for shift
+                    valid = sum(1 for v in labels if v != -100)
+                    return max(0, valid - 1)
+                return 0
+            if 'prompt_token_ids' in example:
+                return max(0, len(example['prompt_token_ids']) - 1)
+            if 'prompt' in example:
+                prompt_token_ids = tokenizer.encode(example['prompt'])
+                return max(0, len(prompt_token_ids) - 1)
+            return 0
+        
+        # ✅ PEFT MATCHING: Evaluate BEFORE training starts (initial baseline)
+        if eval_data:
+            print("\n" + "="*70)
+            print("[VLLM/INIT] Initial Evaluation (before training)")
+            print("="*70)
+            model_runner.model.eval()
+            with torch.no_grad():
+                eval_batch = eval_data
+                initial_eval_results = self.eval(
+                    eval_batch,
+                    lora_request=lora_request,
+                    use_tqdm=False,
+                )
+            model_runner.model.train()
+            
+            # Weighted by valid labels
+            initial_eval_losses_and_weights = [
+                (r['loss'], _count_valid_labels(ex))
+                for r, ex in zip(initial_eval_results, eval_batch)
+                if r['loss'] is not None
+            ]
+            if initial_eval_losses_and_weights:
+                total_w = sum(w for _, w in initial_eval_losses_and_weights) or 1
+                initial_eval_loss = sum(l * w for l, w in initial_eval_losses_and_weights) / total_w
+            else:
+                initial_eval_loss = 0.0
+            
+            print(f"[VLLM/INIT] Initial eval loss (untrained): {initial_eval_loss:.4f}")
+            print("="*70 + "\n")
         
         # Progress bar setup
         if use_tqdm:
@@ -694,14 +759,38 @@ class LLM:
             pbar = tqdm_func(total=total_steps, desc="Training")
         
         # Epoch loop
+        # ✅ FIX: Implement proper gradient accumulation
+        accumulation_counter = 0
+        accumulated_losses = []
+        
+        # ✅ PEFT MATCHING: Add loss smoothing window (matching PEFT logging_steps=25)
+        LOGGING_STEPS = 25
+        loss_smoothing_window = []
+        
         for epoch in range(num_epochs):
             epoch_losses = []
             
+            # ✅ PEFT MATCHING: Shuffle training data at the start of each epoch
+            # This matches PEFT/Transformers' RandomSampler behavior
+            import random
+            epoch_training_data = training_data.copy()
+            # ✅ DETERMINISTIC: Disable shuffling for fair comparison with PEFT
+            # random.shuffle(epoch_training_data)
+            print(f"\n[VLLM/DETERMINISTIC] Epoch {epoch}: Using {len(epoch_training_data)} training samples (NO SHUFFLING)")
+            
             # Batch the data
-            for i in range(0, len(training_data), batch_size):
-                batch = training_data[i:i + batch_size]
+            for i in range(0, len(epoch_training_data), batch_size):
+                batch = epoch_training_data[i:i + batch_size]
                 
-                # Low-level train call (single batch)
+                # Determine if this is the last batch of accumulation
+                is_last_accumulation_step = (accumulation_counter + 1) >= gradient_accumulation_steps
+                is_last_batch_of_epoch = (i + batch_size) >= len(epoch_training_data)
+                should_step = is_last_accumulation_step or is_last_batch_of_epoch
+                
+                # ✅ FIX: Set flag on training manager for gradient accumulation
+                training_manager._should_step_optimizer = should_step
+                
+                # Low-level train call (single batch) - will accumulate gradients
                 batch_results = self.train(
                     batch,
                     lora_request=lora_request,
@@ -709,76 +798,135 @@ class LLM:
                 )
                 
                 # Extract loss
-                batch_loss = np.mean([
-                    r['loss'] for r in batch_results if r['loss'] is not None
-                ])
+                # Weighted by valid label tokens per sample
+                losses_and_weights = [
+                    (r['loss'], _count_valid_labels(ex))
+                    for r, ex in zip(batch_results, batch)
+                    if r['loss'] is not None
+                ]
+                if losses_and_weights:
+                    total_w = sum(w for _, w in losses_and_weights) or 1
+                    batch_loss = sum(l * w for l, w in losses_and_weights) / total_w
+                else:
+                    batch_loss = 0.0
                 epoch_losses.append(batch_loss)
+                accumulated_losses.append(batch_loss)
+                accumulation_counter += 1
                 
-                train_losses.append({
-                    "step": global_step,
-                    "epoch": epoch,
-                    "loss": batch_loss,
-                })
-                
-                # [VLLM/LOSS] Print loss for each step
-                print(f"[VLLM/LOSS] Step {global_step}, Epoch {epoch}, Loss: {batch_loss:.6f}")
-                
-                # Periodic evaluation
-                if eval_data and eval_steps and global_step > 0 and global_step % eval_steps == 0:
-                    # [VLLM/EVAL FIX] Evaluate on ALL eval data
-                    eval_batch = eval_data  # Use all eval data
+                # ✅ FIX: Only log and increment global_step when optimizer steps
+                if should_step:
+                    # Average loss over accumulated batches
+                    avg_accumulated_loss = np.mean(accumulated_losses) if accumulated_losses else batch_loss
+                    
+                    # ✅ PEFT MATCHING: Add to smoothing window (matching PEFT logging_steps)
+                    loss_smoothing_window.append(avg_accumulated_loss)
+                    
+                    # Only log when we have accumulated LOGGING_STEPS worth of losses
+                    # This matches PEFT's logging_steps=25 behavior
+                    if len(loss_smoothing_window) >= LOGGING_STEPS or is_last_batch_of_epoch:
+                        smoothed_loss = np.mean(loss_smoothing_window)
+                        
+                        # ✅ FIX: Only append to train_losses when we actually log (every 25 steps)
+                        # This matches PEFT which only reports loss every logging_steps=25
+                        train_losses.append({
+                            "step": global_step,
+                            "epoch": epoch,
+                            "loss": smoothed_loss,
+                        })
+                        
+                        # [VLLM/LOSS] Print smoothed loss (matching PEFT's logging behavior)
+                        print(f"[VLLM/LOSS] Step {global_step}, Epoch {epoch}, Loss: {smoothed_loss:.6f} (smoothed over {len(loss_smoothing_window)} steps)")
+                        
+                        # Clear smoothing window
+                        loss_smoothing_window = []
+                    # ✅ FIX: Do NOT append to train_losses when still accumulating
+                    # Previously this was recording every step, making plots messy
+
+                    # [VLLM/DEBUG] Log LR and simple integrity checks around problematic window
+                    try:
+                        if 120 <= global_step <= 200:
+                            lr = None
+                            if hasattr(training_manager, 'optimizer') and training_manager.optimizer is not None:
+                                lr = training_manager.optimizer.param_groups[0]['lr']
+                            print(f"[VLLM/DEBUG] Global step={global_step} lr={lr}")
+                    except Exception as _:
+                        pass
+                    
+                    # Periodic evaluation
+                    if eval_data and eval_steps and global_step > 0 and global_step % eval_steps == 0:
+                        # Evaluate entire eval set in eval mode without grad
+                        model_runner.model.eval()
+                        with torch.no_grad():
+                            eval_batch = eval_data
+                            eval_results = self.eval(
+                                eval_batch,
+                                lora_request=lora_request,
+                                use_tqdm=False,
+                            )
+                        model_runner.model.train()
+
+                        # Weighted by valid labels
+                        eval_losses_and_weights = [
+                            (r['loss'], _count_valid_labels(ex))
+                            for r, ex in zip(eval_results, eval_batch)
+                            if r['loss'] is not None
+                        ]
+                        if eval_losses_and_weights:
+                            total_w = sum(w for _, w in eval_losses_and_weights) or 1
+                            eval_loss = sum(l * w for l, w in eval_losses_and_weights) / total_w
+                        else:
+                            eval_loss = 0.0
+                        eval_losses.append({
+                            "step": global_step,
+                            "epoch": epoch,
+                            "eval_loss": eval_loss,
+                        })
+                        print(f"[VLLM/LOSS] Step {global_step}, Eval Loss: {eval_loss:.6f}")
+                    
+                    # Reset accumulation
+                    global_step += 1
+                    accumulation_counter = 0
+                    accumulated_losses = []
+                    
+                    if use_tqdm:
+                        pbar.update(1)
+                        # Show smoothed loss in progress bar if available, else avg loss
+                        display_loss = smoothed_loss if len(loss_smoothing_window) == 0 else avg_accumulated_loss
+                        pbar.set_postfix({"loss": f"{display_loss:.4f}"})
+            
+            # End of epoch evaluation
+            if eval_data:
+                # Evaluate entire eval set in eval mode without grad
+                model_runner.model.eval()
+                with torch.no_grad():
+                    eval_batch = eval_data
                     eval_results = self.eval(
                         eval_batch,
                         lora_request=lora_request,
                         use_tqdm=False,
                     )
-                    eval_loss = np.mean([
-                        r['loss'] for r in eval_results if r['loss'] is not None
-                    ])
-                    eval_losses.append({
-                        "step": global_step,
-                        "epoch": epoch,
-                        "eval_loss": eval_loss,
-                    })
-                    print(f"[VLLM/LOSS] Step {global_step}, Eval Loss: {eval_loss:.6f}")
-                
-                global_step += 1
-                
-                if use_tqdm:
-                    pbar.update(1)
-                    pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
-            
-            # End of epoch evaluation
-            if eval_data:
-                # [VLLM/EVAL FIX] Evaluate on ALL eval data, not just first batch_size*8 samples
-                eval_batch = eval_data  # Use all eval data
-                eval_results = self.eval(
-                    eval_batch,
-                    lora_request=lora_request,
-                    use_tqdm=False,
-                )
-                
-                # [VLLM/EVAL FIX] Weight losses by number of valid tokens (like PEFT does)
-                individual_losses = [r['loss'] for r in eval_results if r['loss'] is not None]
-                individual_tokens = [r['num_tokens'] for r in eval_results if r['loss'] is not None]
-                
-                # Compute weighted average (weight by valid token count)
-                total_weighted_loss = sum(loss * tokens for loss, tokens in zip(individual_losses, individual_tokens))
-                total_tokens = sum(individual_tokens)
-                eval_loss = total_weighted_loss / total_tokens if total_tokens > 0 else 0
-                
-                # Also compute unweighted mean for comparison
-                unweighted_mean = np.mean(individual_losses) if individual_losses else 0
-                
+                model_runner.model.train()
+
+                # Weighted by valid labels (like PEFT)
+                eval_losses_and_weights = [
+                    (r['loss'], _count_valid_labels(ex))
+                    for r, ex in zip(eval_results, eval_batch)
+                    if r['loss'] is not None
+                ]
+                if eval_losses_and_weights:
+                    total_w = sum(w for _, w in eval_losses_and_weights) or 1
+                    eval_loss = sum(l * w for l, w in eval_losses_and_weights) / total_w
+                else:
+                    eval_loss = 0.0
+
                 if epoch == 0:  # Print only for first epoch
+                    unweighted = [r['loss'] for r in eval_results if r['loss'] is not None]
+                    unweighted_mean = np.mean(unweighted) if unweighted else 0
                     print(f"\n[VLLM/EVAL DEBUG] End of Epoch {epoch}")
                     print(f"[VLLM/EVAL DEBUG] Num eval samples: {len(eval_batch)}")
                     print(f"[VLLM/EVAL DEBUG] Num eval results: {len(eval_results)}")
-                    print(f"[VLLM/EVAL DEBUG] Individual losses (first 10): {individual_losses[:10]}")
-                    print(f"[VLLM/EVAL DEBUG] Individual tokens (first 10): {individual_tokens[:10]}")
                     print(f"[VLLM/EVAL DEBUG] Unweighted mean loss: {unweighted_mean:.6f}")
-                    print(f"[VLLM/EVAL DEBUG] ✅ WEIGHTED mean loss (by tokens): {eval_loss:.6f}")
-                    print(f"[VLLM/EVAL DEBUG] Total valid tokens: {total_tokens}\n")
+                    print(f"[VLLM/EVAL DEBUG] ✅ WEIGHTED mean loss (valid labels): {eval_loss:.6f}\n")
                 eval_losses.append({
                     "step": global_step,
                     "epoch": epoch,
@@ -902,9 +1050,18 @@ class LLM:
                 training_manager = model_runner.training_manager
                 lora_id = lora_request.lora_int_id
 
-                # Load LoRA into manager if not already loaded
+                # ✅ FIX: Do NOT reload LoRA from disk during eval - it overwrites trained weights!
+                # The LoRA is already in memory from training and stacked tensors are updated
+                # Only add adapter if it truly doesn't exist (first eval before any training)
                 if lora_id not in training_manager.lora_manager.list_adapters():
-                    training_manager.lora_manager.add_adapter(lora_request)
+                    # Check if this is actually the first eval - if training has happened, skip reload
+                    if hasattr(training_manager, 'training_step') and training_manager.training_step > 0:
+                        # LoRA has been trained - stacked tensors are already up to date
+                        # Do NOT reload from disk as it would overwrite trained weights
+                        pass
+                    else:
+                        # First evaluation before training - safe to load from disk
+                        training_manager.lora_manager.add_adapter(lora_request)
 
         # Add evaluation requests to the engine (same as training but with is_eval=True)
         request_ids = self._add_training_requests(
@@ -2173,6 +2330,11 @@ class LLM:
             it = tqdm_func(it, desc="Adding training requests")
 
         tokenizer = self.get_tokenizer()
+        
+        # ✅ PEFT MATCHING: Set pad token if not already set (required for padding)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
         request_ids = []
 
         for i, example in enumerate(it):
@@ -2180,10 +2342,23 @@ class LLM:
             # Format 1: 'text' field (SFTTrainer standard)
             if 'text' in example:
                 text = example['text']
-                prompt_token_ids = tokenizer.encode(text)
+                # ✅ PEFT MATCHING: Add padding to match PEFT's behavior (reduces variance)
+                # This ensures all sequences have the same length, making batch processing uniform
+                prompt_token_ids = tokenizer.encode(
+                    text,
+                    padding='max_length',
+                    max_length=512,
+                    truncation=True
+                )
+                # Old (no padding): prompt_token_ids = tokenizer.encode(text)
                 
                 # FIXED: Implement proper instruction masking like PEFT
                 labels = torch.tensor(prompt_token_ids, dtype=torch.long, device='cpu')
+                
+                # ✅ PEFT MATCHING: Mask padding tokens with -100 (ignored in loss)
+                # Find the padding token ID and mask all padding tokens in labels
+                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                labels[labels == pad_token_id] = -100
                 
                 # Create prompt dict early (needed for skipped samples)
                 prompt = {'prompt_token_ids': prompt_token_ids}

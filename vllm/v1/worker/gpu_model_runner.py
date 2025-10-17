@@ -2601,9 +2601,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         if valid_labels == 0:
                             losses[req_id] = None
                         else:
+                            # Ensure numerically stable loss by upcasting logits to float32
                             loss_fct = torch.nn.CrossEntropyLoss()
+                            logits_fp32 = shift_logits.float()
                             loss = loss_fct(
-                                shift_logits.view(-1, shift_logits.size(-1)),
+                                logits_fp32.view(-1, logits_fp32.size(-1)),
                                 shift_labels.view(-1))
 
                             loss_value = loss.item()

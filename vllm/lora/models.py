@@ -440,7 +440,8 @@ class LoRAModelManager:
                 if should_skip_set_lora:
                     logger.info(f"[FIX] Skipping set_lora for {module_name} - has trained parameters")
                 else:
-                    module_lora.optimize()
+                    # TRAINING FIX: Skip optimize() to avoid double scaling
+                    # module_lora.optimize()
                     # Bias is not explicitly enabled with the flag enable_lora_bias.
                     bias = module_lora.bias
                     if ((torch.is_tensor(bias) or
