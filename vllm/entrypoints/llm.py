@@ -659,21 +659,27 @@ class LLM:
         # Calculate training steps
         num_steps_per_epoch = len(training_data) // batch_size
         total_steps = num_steps_per_epoch * num_epochs
-        
+
+        # ✅ FIX: Account for gradient accumulation when calculating optimizer steps
+        # The scheduler needs to know the actual number of optimizer.step() calls,
+        # not the number of forward/backward passes.
+        # With gradient_accumulation_steps > 1, we do fewer optimizer steps.
+        total_optimizer_steps = total_steps // gradient_accumulation_steps
+
         # Setup optimizer and scheduler via make_lora_trainable
         if lora_request:
             lora_id = lora_request.lora_int_id
-            
+
             # Load LoRA into manager if not already loaded
             # Use add_adapter to load without processing data
             if lora_id not in training_manager.lora_manager.list_adapters():
                 training_manager.lora_manager.add_adapter(lora_request)
-            
+
             # Now setup optimizer and scheduler
             training_manager.make_lora_trainable(
                 lora_id=lora_id,
                 learning_rate=learning_rate,
-                num_training_steps=total_steps,
+                num_training_steps=total_optimizer_steps,  # ✅ FIX: Use optimizer steps, not batch steps
                 num_warmup_steps=warmup_steps,
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 weight_decay=weight_decay,
@@ -766,7 +772,22 @@ class LLM:
         # ✅ PEFT MATCHING: Add loss smoothing window (matching PEFT logging_steps=25)
         LOGGING_STEPS = 25
         loss_smoothing_window = []
-        
+
+        # ============================================================================
+        print("\n" + "="*80)
+        print("🚀 VLLM TRAINING STARTING NOW - ALL LOGS AFTER THIS ARE ACTUAL TRAINING")
+        print("="*80)
+        print(f"Configuration:")
+        print(f"  - Training samples: {len(training_data)}")
+        print(f"  - Batch size: {batch_size}")
+        print(f"  - Gradient accumulation: {gradient_accumulation_steps}")
+        print(f"  - Num epochs: {num_epochs}")
+        print(f"  - Expected batches per epoch: {num_steps_per_epoch}")
+        print(f"  - Expected optimizer steps per epoch: {num_steps_per_epoch // gradient_accumulation_steps}")
+        print(f"  - Total optimizer steps: {total_optimizer_steps}")
+        print("="*80 + "\n")
+        # ============================================================================
+
         for epoch in range(num_epochs):
             epoch_losses = []
             
@@ -774,9 +795,10 @@ class LLM:
             # This matches PEFT/Transformers' RandomSampler behavior
             import random
             epoch_training_data = training_data.copy()
-            # ✅ DETERMINISTIC: Disable shuffling for fair comparison with PEFT
-            # random.shuffle(epoch_training_data)
-            print(f"\n[VLLM/DETERMINISTIC] Epoch {epoch}: Using {len(epoch_training_data)} training samples (NO SHUFFLING)")
+            # ✅ ENABLE SHUFFLING: Matches PEFT/Transformers behavior
+            # Shuffling prevents memorization of data order and reduces cyclic loss patterns
+            random.shuffle(epoch_training_data)
+            print(f"\n[VLLM/SHUFFLE] Epoch {epoch}: Using {len(epoch_training_data)} training samples (shuffled)")
             
             # Batch the data
             for i in range(0, len(epoch_training_data), batch_size):
@@ -2354,27 +2376,67 @@ class LLM:
             it = tqdm_func(it, desc="Adding training requests")
 
         tokenizer = self.get_tokenizer()
-        
+
         # ✅ PEFT MATCHING: Set pad token if not already set (required for padding)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        
+
+        # ✅ DYNAMIC PADDING: First pass to find max length in this batch
+        # This matches PEFT's behavior where padding is based on actual batch max, not fixed max_model_len
+        training_data_list = list(training_data)  # Ensure it's a list for multiple passes
+        batch_max_length = 0
+
+        for example in training_data_list:
+            # Get text from different formats
+            if 'text' in example:
+                text = example['text']
+                # Tokenize without padding OR truncation to get ACTUAL length
+                # ✅ FIX: Use add_special_tokens=False since data already has special tokens
+                # ✅ CRITICAL FIX: Remove truncation in first pass! We're finding the max, not limiting it
+                temp_tokens = tokenizer.encode(text, add_special_tokens=False)
+                batch_max_length = max(batch_max_length, len(temp_tokens))
+            elif 'messages' in example:
+                text = tokenizer.apply_chat_template(
+                    example['messages'],
+                    add_generation_prompt=False,
+                    tokenize=False,
+                )
+                temp_tokens = tokenizer.encode(text, add_special_tokens=False)
+                batch_max_length = max(batch_max_length, len(temp_tokens))
+            elif 'prompt_token_ids' in example:
+                batch_max_length = max(batch_max_length, len(example['prompt_token_ids']))
+            elif 'prompt' in example:
+                prompt = example['prompt']
+                if isinstance(prompt, str):
+                    temp_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+                    batch_max_length = max(batch_max_length, len(temp_tokens))
+
+        # Log the dynamic padding decision
+        if not hasattr(self, '_dynamic_padding_logged'):
+            self._dynamic_padding_logged = 0
+        if self._dynamic_padding_logged < 3:
+            print(f"[VLLM/DYNAMIC_PADDING] Batch size: {len(training_data_list)}, max_length in batch: {batch_max_length}")
+            print(f"[VLLM/DYNAMIC_PADDING] Using batch max instead of fixed max_model_len=512 (PEFT matching)")
+            self._dynamic_padding_logged += 1
+
         request_ids = []
 
-        for i, example in enumerate(it):
+        for i, example in enumerate(training_data_list):
             # Process example based on format
             # Format 1: 'text' field (SFTTrainer standard)
             if 'text' in example:
                 text = example['text']
-                # ✅ PEFT MATCHING: Add padding to match PEFT's behavior (reduces variance)
-                # This ensures all sequences have the same length, making batch processing uniform
+                # ✅ DYNAMIC PADDING: Use batch max length instead of fixed 512 (matches PEFT)
+                # This ensures all sequences in the batch have the same length, but minimizes padding tokens
+                # ✅ FIX: Use add_special_tokens=False since data already has special tokens
                 prompt_token_ids = tokenizer.encode(
                     text,
                     padding='max_length',
-                    max_length=512,
-                    truncation=True
+                    max_length=batch_max_length,
+                    truncation=True,
+                    add_special_tokens=False
                 )
-                # Old (no padding): prompt_token_ids = tokenizer.encode(text)
+                # Old (fixed padding): max_length=512
                 
                 # FIXED: Implement proper instruction masking like PEFT
                 labels = torch.tensor(prompt_token_ids, dtype=torch.long, device='cpu')
@@ -2452,10 +2514,21 @@ class LLM:
                     add_generation_prompt=False,
                     tokenize=False,
                 )
-                prompt_token_ids = tokenizer.encode(text)
+                # ✅ DYNAMIC PADDING: Use batch max length
+                # ✅ FIX: Use add_special_tokens=False since chat template already adds them
+                prompt_token_ids = tokenizer.encode(
+                    text,
+                    padding='max_length',
+                    max_length=batch_max_length,
+                    truncation=True,
+                    add_special_tokens=False
+                )
                 labels = torch.tensor(prompt_token_ids,
                                       dtype=torch.long,
                                       device='cpu')
+                # Mask padding tokens
+                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                labels[labels == pad_token_id] = -100
                 prompt = {'prompt_token_ids': prompt_token_ids}
 
             # Format 3: Legacy 'prompt' + 'labels' format

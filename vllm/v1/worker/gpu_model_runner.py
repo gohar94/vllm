@@ -2435,6 +2435,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # The standard vLLM flow uses input_ids directly, which skips the embedding layer
                 # For gradient flow, we MUST compute embeddings explicitly so gradients can flow
                 if input_ids is not None:
+                    # DEBUG: Log input shape before processing
+                    if not hasattr(self, '_shape_logged'):
+                        self._shape_logged = 0
+                    if self._shape_logged < 5:
+                        print(f"[VLLM/TRAINING/INPUT] input_ids shape: {input_ids.shape}")
+                        print(f"[VLLM/TRAINING/INPUT] num_input_tokens: {num_input_tokens}")
+                        print(f"[VLLM/TRAINING/INPUT] num_scheduled_tokens: {num_scheduled_tokens}")
+                        print(f"[VLLM/TRAINING/INPUT] num_requests: {len(scheduler_output.scheduled_new_reqs)}")
+                        self._shape_logged += 1
+
                     # Also ensure the model itself is in training mode
                     self.model.train()
 
@@ -2484,6 +2494,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 losses = {}
                 logits_dict = {}
                 loss_tensors = []  # Keep loss tensors for backward pass
+                loss_weights = []  # Track valid token counts for weighted averaging
                 req_ids_output = []
                 req_id_to_index = {}
 
@@ -2612,7 +2623,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 shift_labels.view(-1))
 
                             loss_value = loss.item()
-                            
+
+                            # [VLLM/LOSS/DEBUG] Initialize step counter for per-request logging
+                            if not hasattr(self, '_vllm_loss_step_counter'):
+                                self._vllm_loss_step_counter = 0
+
+                            # [VLLM/LOSS/DEBUG] Log per-request loss details for step 0
+                            if self._vllm_loss_step_counter == 0:
+                                if not hasattr(self, '_vllm_loss_request_details'):
+                                    self._vllm_loss_request_details = []
+
+                                total_tokens = shift_labels.numel()
+                                self._vllm_loss_request_details.append({
+                                    'req_id': req_id,
+                                    'total_tokens': total_tokens,
+                                    'valid_labels': valid_labels,
+                                    'loss': loss_value
+                                })
+                                print(f"[VLLM/LOSS/DEBUG] Request {req_id}: total_tokens={total_tokens}, valid_labels={valid_labels}, loss={loss_value:.6f}")
+
                             # [VLLM/LOSS] Print loss value (first step only)
                             if not self._vllm_first_loss_printed:
                                 print(f"[VLLM/LOSS] Computed loss: {loss_value:.6f}")
@@ -2644,6 +2673,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             else:
                                 # Store loss tensor for backward pass
                                 loss_tensors.append(loss)
+                                loss_weights.append(valid_labels)  # Store valid token count for weighting
+
+                                # [VLLM/LOSS/DEBUG] Log which losses are added to loss_tensors
+                                if hasattr(self, '_vllm_loss_step_counter') and self._vllm_loss_step_counter == 0:
+                                    print(f"[VLLM/LOSS/DEBUG] Adding to loss_tensors: req_id={req_id}, loss={loss_value:.6f}, weight={valid_labels}, loss_tensors count={len(loss_tensors)}")
+
                                 # Store scalar value for output
                                 losses[req_id] = loss_value
                                 
@@ -2669,37 +2704,124 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             with record_function_or_nullcontext("Backward"):
                 if loss_tensors:
                     with torch.enable_grad():
-                        # Combine all losses (average across requests)
-                        total_loss = torch.stack(loss_tensors).mean()
-                        
-                        # ✅ CRITICAL FIX: Scale loss by gradient accumulation steps
-                        # This prevents gradients from being 2x too large when accumulating
-                        # Matches PEFT/Transformers behavior
+                        # [VLLM/LOSS/DEBUG] Log individual loss values before stacking
+                        if not hasattr(self, '_vllm_step_counter') or (hasattr(self, '_vllm_step_counter') and self._vllm_step_counter == 0):
+                            print(f"\n[VLLM/LOSS/DEBUG] === Before Stacking ===")
+                            print(f"[VLLM/LOSS/DEBUG] Number of loss tensors to stack: {len(loss_tensors)}")
+                            for i, lt in enumerate(loss_tensors):
+                                print(f"[VLLM/LOSS/DEBUG]   loss_tensors[{i}] = {lt.item():.6f}, weight={loss_weights[i]}")
+
+                        # ✅ FIX: Use token-weighted averaging instead of simple mean
+                        # This matches PEFT/Transformers behavior where tokens get equal weight, not requests
+                        if loss_weights and sum(loss_weights) > 0:
+                            # Convert weights to tensor
+                            weights_tensor = torch.tensor(loss_weights, dtype=torch.float32, device=loss_tensors[0].device)
+                            # Normalize weights to sum to 1
+                            weights_normalized = weights_tensor / weights_tensor.sum()
+                            # Compute weighted average
+                            total_loss = sum(loss * weight for loss, weight in zip(loss_tensors, weights_normalized))
+
+                            if not hasattr(self, '_vllm_step_counter') or self._vllm_step_counter == 0:
+                                simple_mean = torch.stack(loss_tensors).mean().item()
+                                weighted_mean = total_loss.item()
+                                print(f"[VLLM/LOSS/DEBUG] Simple mean (old): {simple_mean:.6f}")
+                                print(f"[VLLM/LOSS/DEBUG] Token-weighted mean (new): {weighted_mean:.6f}")
+                                print(f"[VLLM/LOSS/DEBUG] Difference: {abs(simple_mean - weighted_mean):.6f}")
+                        else:
+                            # Fallback to simple mean if no weights
+                            total_loss = torch.stack(loss_tensors).mean()
+
+                        # Initialize step counter for detailed logging
+                        if not hasattr(self, '_vllm_step_counter'):
+                            self._vllm_step_counter = 0
+
+                        # [VLLM/LOSS/DEBUG] Analyze loss averaging for step 0
+                        if self._vllm_step_counter == 0 and hasattr(self, '_vllm_loss_request_details'):
+                            print(f"\n[VLLM/LOSS/DEBUG] === Loss Averaging Analysis (Step 0) ===")
+                            total_valid_labels = sum(d['valid_labels'] for d in self._vllm_loss_request_details)
+                            total_tokens = sum(d['total_tokens'] for d in self._vllm_loss_request_details)
+
+                            print(f"[VLLM/LOSS/DEBUG] Number of requests: {len(self._vllm_loss_request_details)}")
+                            print(f"[VLLM/LOSS/DEBUG] Total valid labels across all requests: {total_valid_labels}")
+                            print(f"[VLLM/LOSS/DEBUG] Total tokens across all requests: {total_tokens}")
+
+                            # Show per-request losses
+                            for i, detail in enumerate(self._vllm_loss_request_details):
+                                print(f"[VLLM/LOSS/DEBUG]   Request {i}: {detail['valid_labels']} valid labels, loss={detail['loss']:.6f}")
+
+                            # Show what simple averaging does
+                            simple_avg = sum(d['loss'] for d in self._vllm_loss_request_details) / len(self._vllm_loss_request_details)
+                            print(f"[VLLM/LOSS/DEBUG] Simple average of per-request losses: {simple_avg:.6f}")
+
+                            # Show what weighted averaging would give
+                            weighted_sum = sum(d['loss'] * d['valid_labels'] for d in self._vllm_loss_request_details)
+                            weighted_avg = weighted_sum / total_valid_labels if total_valid_labels > 0 else 0
+                            print(f"[VLLM/LOSS/DEBUG] Weighted average (by valid labels): {weighted_avg:.6f}")
+
+                            print(f"[VLLM/LOSS/DEBUG] Actual combined loss (from stack+mean): {total_loss.item():.6f}")
+                            print(f"[VLLM/LOSS/DEBUG] ===")
+
+                        # [VLLM/STEP] Detailed logging for first 3 steps (matching PEFT)
+                        if self._vllm_step_counter < 3:
+                            current_step = self._vllm_step_counter
+                            print(f"\n[VLLM/STEP {current_step}] === Backward Pass Details ===")
+                            print(f"[VLLM/STEP {current_step}] Loss (before GA division): {total_loss.item():.6f}")
+                            print(f"[VLLM/STEP {current_step}] Number of loss tensors: {len(loss_tensors)}")
+
+                        # ✅ FIX: Divide loss by gradient accumulation steps to match PEFT/Transformers
+                        # Evidence: transformers/trainer.py line 4099:
+                        #   loss = loss / self.current_gradient_accumulation_steps
+                        #   self.accelerator.backward(loss, **kwargs)
+                        # This ensures that when gradients accumulate over multiple backward() calls,
+                        # the final accumulated gradient has the correct magnitude (averaged over accumulation steps).
                         if is_lora_training and hasattr(self, 'training_manager'):
                             gradient_accumulation_steps = getattr(
                                 self.training_manager, 'gradient_accumulation_steps', 1
                             )
+
+                            # Log gradient accumulation details for first 3 steps
+                            if self._vllm_step_counter < 3:
+                                print(f"[VLLM/STEP {self._vllm_step_counter}] Gradient accumulation steps: {gradient_accumulation_steps}")
+                                print(f"[VLLM/STEP {self._vllm_step_counter}] Loss before division: {total_loss.item():.6f}")
+
+                            # Apply PEFT-matching loss scaling
                             if gradient_accumulation_steps > 1:
                                 total_loss = total_loss / gradient_accumulation_steps
-                        
-                        # [VLLM/LOSS] Print total loss before backward
-                        if not hasattr(self, '_vllm_first_backward_printed'):
-                            self._vllm_first_backward_printed = False
-                        
-                        if not self._vllm_first_backward_printed:
-                            print(f"[VLLM/LOSS] Total loss (averaged): {total_loss.item():.6f}")
-                            print(f"[VLLM/LOSS] Number of loss tensors: {len(loss_tensors)}")
-                            if is_lora_training and hasattr(self, 'training_manager'):
-                                gradient_accumulation_steps = getattr(
-                                    self.training_manager, 'gradient_accumulation_steps', 1
-                                )
-                                print(f"[VLLM/LOSS] Gradient accumulation steps: {gradient_accumulation_steps}")
-                                if gradient_accumulation_steps > 1:
-                                    print(f"[VLLM/LOSS] Loss scaled by 1/{gradient_accumulation_steps} for gradient accumulation")
-                            self._vllm_first_backward_printed = True
+
+                                if self._vllm_step_counter < 3:
+                                    print(f"[VLLM/STEP {self._vllm_step_counter}] Loss after division by {gradient_accumulation_steps}: {total_loss.item():.6f} (matches PEFT)")
 
                         # Compute gradients via backward pass
+                        if self._vllm_step_counter < 3:
+                            print(f"[VLLM/STEP {self._vllm_step_counter}] Calling backward()...")
+
                         total_loss.backward()
+
+                        # Log gradient information after backward (first 3 steps)
+                        if self._vllm_step_counter < 3 and is_lora_training and hasattr(self, 'training_manager'):
+                            lora_params_with_grad = 0
+                            total_grad_norm = 0.0
+                            print(f"[VLLM/STEP {self._vllm_step_counter}] Gradients after backward():")
+
+                            for name, param in self.training_manager.trainable_lora_params.items():
+                                if 'lora' in name.lower() and param.grad is not None:
+                                    grad_norm = param.grad.norm().item()
+                                    total_grad_norm += grad_norm ** 2
+                                    lora_params_with_grad += 1
+
+                                    # Print first 3 parameters with gradients
+                                    if lora_params_with_grad <= 3:
+                                        print(f"[VLLM/STEP {self._vllm_step_counter}] Gradient for {name}: norm={grad_norm:.6f}, mean={param.grad.mean().item():.6f}")
+
+                            total_grad_norm = total_grad_norm ** 0.5
+                            print(f"[VLLM/STEP {self._vllm_step_counter}] Total LoRA params with gradients: {lora_params_with_grad}, Total grad norm: {total_grad_norm:.6f}")
+
+                        # Increment step counter
+                        self._vllm_step_counter += 1
+
+                        # Increment loss step counter for next iteration
+                        if hasattr(self, '_vllm_loss_step_counter'):
+                            self._vllm_loss_step_counter += 1
 
                     # Automatically perform optimizer step with gradient accumulation
                     if is_lora_training and hasattr(self, 'training_manager'):
@@ -3042,7 +3164,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         16) if self.lora_config else 16
 
         # Default target modules for LoRA training (attention projections)
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        # IMPORTANT: Must match PEFT adapter config (q_proj, k_proj, v_proj only - NO o_proj)
+        target_modules = ["q_proj", "k_proj", "v_proj"]
 
         self.training_manager = TrainingManager(
             model_runner=self,

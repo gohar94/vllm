@@ -117,6 +117,9 @@ class TrainingManager:
 
     def _find_target_modules(self, target_patterns: List[str]) -> List[str]:
         """Find all module names that match the target patterns."""
+        # Store target patterns for later use in determining QKV indices
+        self.target_patterns = target_patterns
+
         target_modules = []
         for name, module in self.model.named_modules():
             if any(pattern in name for pattern in target_patterns):
@@ -125,6 +128,36 @@ class TrainingManager:
 
         logger.info(f"[TrainingManager] Found {len(target_modules)} modules matching patterns {target_patterns}")
         return target_modules
+
+    def _get_qkv_indices_for_training(self) -> tuple[list[int], list[int]]:
+        """
+        Determine which Q/K/V indices to train based on target_patterns.
+        Returns (a_indices, b_indices) where indices map to: 0=Q, 1=K, 2=V.
+
+        This makes training configurable - only specified projections are trained.
+        """
+        # Map projection names to indices
+        projection_map = {"q_proj": 0, "k_proj": 1, "v_proj": 2}
+
+        # Determine which indices to enable based on target_patterns
+        enabled_indices = []
+        for pattern in getattr(self, 'target_patterns', []):
+            for proj_name, idx in projection_map.items():
+                if proj_name in pattern:
+                    enabled_indices.append(idx)
+                    break
+
+        # Remove duplicates and sort
+        enabled_indices = sorted(list(set(enabled_indices)))
+
+        # If no specific projections found, default to all (backward compatibility)
+        if not enabled_indices:
+            enabled_indices = [0, 1, 2]
+
+        logger.info(f"[TrainingManager] QKV training indices: {enabled_indices} "
+                   f"(Q=0, K=1, V=2) based on target_patterns={getattr(self, 'target_patterns', [])}")
+
+        return enabled_indices, enabled_indices
 
     def freeze_base_model(self, verbose: bool = True) -> Dict[str, int]:
         """Freeze all base model parameters (non-LoRA)."""
@@ -233,9 +266,20 @@ class TrainingManager:
 
             # Determine slice indices to train per module
             if isinstance(module, MergedQKVParallelLinearWithLoRA):
-                # Train Q (idx 0) and V (idx 2); keep K (idx 1) frozen
-                a_indices = [0, 2] if len(module.lora_a_stacked) >= 3 else [0]
-                b_indices = [0, 2] if len(module.lora_b_stacked) >= 3 else [0]
+                # ✅ FIX: Make Q/K/V training configurable (not hardcoded)
+                # Use target_patterns to determine which projections to train
+                # This allows users to train any subset of Q, K, V via the training API
+                config_a_indices, config_b_indices = self._get_qkv_indices_for_training()
+
+                # Only use indices that exist in the stacked tensors
+                a_indices = [i for i in config_a_indices if i < len(module.lora_a_stacked)]
+                b_indices = [i for i in config_b_indices if i < len(module.lora_b_stacked)]
+
+                # Fallback if no valid indices
+                if not a_indices:
+                    a_indices = [0]
+                if not b_indices:
+                    b_indices = [0]
             else:
                 # Single-slice (includes QKVParallelLinearWithLoRA which packs qkv into one slice)
                 a_indices = [0] if len(module.lora_a_stacked) > 0 else []
@@ -245,17 +289,13 @@ class TrainingManager:
             for idx in a_indices:
                 stacked_tensor = module.lora_a_stacked[idx]
                 stacked_tensor.requires_grad_(True)
-                
-                # If packed single-slice QKV, mask K-slice grads on LoRA-A as well
-                if isinstance(module, QKVParallelLinearWithLoRA):
-                    q_size = getattr(module, 'q_proj_shard_size', None)
-                    kv_size = getattr(module, 'kv_proj_shard_size', None)
-                    if isinstance(q_size, int) and isinstance(kv_size, int):
-                        def _mask_k_grad_a(grad, q_size=q_size, kv_size=kv_size):
-                            if grad is not None and grad.dim() >= 3:
-                                grad[:, :, q_size:q_size + kv_size, :].zero_()
-                            return grad
-                        stacked_tensor.register_hook(_mask_k_grad_a)
+
+                # ✅ FIX #4: Removed K-projection gradient masking hooks
+                # Previously, vLLM was zeroing out K-projection gradients, preventing training
+                # PEFT trains all of Q, K, V - so we should too
+                # REMOVED:
+                # if isinstance(module, QKVParallelLinearWithLoRA):
+                #     ... _mask_k_grad_a hook that zeros K gradients ...
 
                 # Debug hook: log first few gradient arrivals on A
                 try:
@@ -283,16 +323,12 @@ class TrainingManager:
                 stacked_tensor = module.lora_b_stacked[idx]
                 stacked_tensor.requires_grad_(True)
 
-                # If this is a packed single-slice QKV, zero K-slice grads during backward
-                if isinstance(module, QKVParallelLinearWithLoRA):
-                    q_size = getattr(module, 'q_proj_shard_size', None)
-                    kv_size = getattr(module, 'kv_proj_shard_size', None)
-                    if isinstance(q_size, int) and isinstance(kv_size, int):
-                        def _mask_k_grad_b(grad, q_size=q_size, kv_size=kv_size):
-                            if grad is not None and grad.dim() >= 3:
-                                grad[:, :, q_size:q_size + kv_size, :].zero_()
-                            return grad
-                        stacked_tensor.register_hook(_mask_k_grad_b)
+                # ✅ FIX #4: Removed K-projection gradient masking hooks for lora_b
+                # Previously, vLLM was zeroing out K-projection gradients, preventing training
+                # PEFT trains all of Q, K, V - so we should too
+                # REMOVED:
+                # if isinstance(module, QKVParallelLinearWithLoRA):
+                #     ... _mask_k_grad_b hook that zeros K gradients ...
 
                 # Debug hook: log first few gradient arrivals on B
                 try:

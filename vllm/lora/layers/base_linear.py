@@ -265,7 +265,8 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
 
                         indices = list(range(len(self.lora_a_stacked)))
                         if is_merged_qkv and len(indices) >= 3:
-                            indices = [0, 2]  # Q and V
+                            # ✅ FIX: Train Q, K, V to match PEFT (was only Q and V)
+                            indices = [0, 1, 2]  # Q, K, and V
 
                         # LoRA scale matching PEFT: alpha / r
                         lora_scale = 1.0
@@ -317,10 +318,18 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                             except Exception:
                                 print("Error logging LoRA debug info")
 
-                            # Note: Scaling is applied when optimize() is called (lora.py).
-                            # We don't apply scaling again here to avoid double-scaling.
-                            lora_hidden = (x.to(torch.float32) @ lora_a.T.to(torch.float32)) # * float(lora_scale)
-                            lora_output = lora_hidden @ lora_b_used.T.to(torch.float32)
+                            # CRITICAL FIX: Apply LoRA scaling here!
+                            # When training, optimize() is skipped (models.py:443), so scaling is NOT
+                            # merged into lora_b. We MUST apply it during forward pass.
+                            # Standard PEFT formula: out = (x @ A^T) @ B^T * (alpha/rank)
+                            # The scaling factor is: alpha / rank (e.g., 16/8 = 2.0)
+
+                            # ✅ FIX #5: Use bfloat16 to match PEFT (was float32)
+                            # PEFT computes LoRA in bfloat16, vLLM was using float32
+                            # This dtype mismatch affects gradient precision
+                            target_dtype = output.dtype if output.dtype in [torch.bfloat16, torch.float16] else torch.bfloat16
+                            lora_hidden = (x.to(target_dtype) @ lora_a.T.to(target_dtype)) * float(lora_scale)
+                            lora_output = lora_hidden @ lora_b_used.T.to(target_dtype)
                             lora_output = lora_output.to(output.dtype)
                             # Debug: per-layer LoRA stats
                             try:
