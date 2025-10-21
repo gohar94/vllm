@@ -17,6 +17,7 @@ from vllm.multimodal.inputs import MultiModalPlaceholderDict
 from vllm.sampling_params import RequestOutputKind
 from vllm.sequence import (RequestMetrics, SequenceGroup, SequenceGroupBase,
                            SequenceStatus)
+from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
 
@@ -111,7 +112,7 @@ class RequestOutput:
         prompt_logprobs: Optional[PromptLogprobs],
         outputs: list[CompletionOutput],
         finished: bool,
-        metrics: Optional[RequestMetrics] = None,
+        metrics: Optional[Union[RequestMetrics, RequestStateStats]] = None,
         lora_request: Optional[LoRARequest] = None,
         encoder_prompt: Optional[str] = None,
         encoder_prompt_token_ids: Optional[list[int]] = None,
@@ -123,6 +124,11 @@ class RequestOutput:
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
     ) -> None:
+        # Extract training_loss and training_logits from kwargs if present
+        self.training_loss = kwargs.pop('training_loss', None)
+        self.training_logits = kwargs.pop('training_logits', None)
+        self.training_loss_weights = kwargs.pop('training_loss_weights', None)
+
         if kwargs:
             logger.warning_once("RequestOutput: Ignoring extra arguments: %s",
                                 str(kwargs))

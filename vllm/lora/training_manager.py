@@ -1,0 +1,766 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+TrainingManager for managing LoRA adapters during training.
+
+This module provides functionality to create and manage LoRA adapters
+specifically for training purposes, including:
+- Initializing trainable LoRA parameters
+- Freezing base model parameters
+- Managing gradient flow for LoRA training
+"""
+
+import json
+import os
+from typing import Dict, List, Optional
+
+import torch
+import torch.nn as nn
+from safetensors.torch import save_file
+
+from vllm.config.lora import LoRAConfig
+from vllm.logger import init_logger
+from vllm.lora.layers import BaseLayerWithLoRA
+from vllm.lora.layers.column_parallel_linear import (
+    QKVParallelLinearWithLoRA,
+    MergedQKVParallelLinearWithLoRA,
+)
+from vllm.lora.models import LoRAModel
+from vllm.lora.worker_manager import WorkerLoRAManager
+
+logger = init_logger(__name__)
+
+# Default LoRA configuration
+RANK = 8
+ALPHA = 16
+
+
+class TrainingManager:
+    """Manages LoRA adapter training with simplified, clean architecture."""
+
+    def __init__(
+        self,
+        model_runner,
+        lora_manager: WorkerLoRAManager,
+        lora_config: LoRAConfig,
+        device: torch.device,
+        dtype: torch.dtype,
+        sub_modules: Optional[list[str]] = None,
+        rank: int = RANK,
+        alpha: int = ALPHA,
+        target_modules: Optional[List[str]] = None,
+    ):
+        """Initialize the Training Manager.
+        
+        Args:
+            model_runner: The model runner (to access wrapped/unwrapped model)
+            lora_manager: Worker LoRA manager for handling LoRA operations
+            lora_config: LoRA configuration
+            device: Device to place LoRA weights on
+            dtype: Data type for LoRA weights
+            sub_modules: Specific submodules to apply LoRA to (if None, use target_modules)
+            rank: LoRA rank (dimension of low-rank matrices)
+            alpha: LoRA alpha (scaling factor)
+            target_modules: List of module name patterns to apply LoRA (e.g., ["q_proj", "v_proj"])
+        """
+        self.model_runner = model_runner
+        self.lora_manager = lora_manager
+        self.lora_config = lora_config
+        self.device = device
+        self.dtype = dtype
+        self.rank = rank
+        self.alpha = alpha
+
+        # Track trainable parameters and training state
+        self.trainable_lora_params: Dict[str, nn.Parameter] = {}
+        self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+        self.current_lora_id: Optional[int] = None
+        self.training_step: int = 0
+        self.gradient_accumulation_steps: int = 1
+        self.gradient_accumulation_counter: int = 0
+        self.trained_lora_ids: set = set()
+
+        # Determine target modules
+        if sub_modules:
+            self.sub_modules = sub_modules
+        elif target_modules:
+            self.sub_modules = self._find_target_modules(target_modules)
+        else:
+            # Default: apply to attention projection layers (matching PEFT default)
+            self.sub_modules = self._find_target_modules(
+                ["q_proj", "v_proj"])  # Match PEFT default target modules
+
+        logger.info(f"[TrainingManager] Initialized with {len(self.sub_modules)} target modules")
+        logger.info(f"[TrainingManager] LoRA rank={self.rank}, alpha={self.alpha}")
+        
+        # Register with LoRAModelManager
+        if hasattr(self.lora_manager, '_adapter_manager'):
+            self.lora_manager._adapter_manager._training_manager = self
+            logger.info("[TrainingManager] Registered with LoRAModelManager")
+
+    @property 
+    def target_modules(self) -> set[str]:
+        """Get the set of target module names that have trained parameters."""
+        return set(self.sub_modules.keys())
+
+    @property
+    def model(self):
+        """Get the actual model, unwrapping if needed."""
+        if hasattr(self.model_runner, 'model'):
+            model = self.model_runner.model
+            # Unwrap if it's a UBatchWrapper or similar
+            if hasattr(model, 'unwrap'):
+                return model.unwrap()
+            return model
+        return self.model_runner
+
+    def _find_target_modules(self, target_patterns: List[str]) -> List[str]:
+        """Find all module names that match the target patterns."""
+        # Store target patterns for later use in determining QKV indices
+        self.target_patterns = target_patterns
+
+        target_modules = []
+        for name, module in self.model.named_modules():
+            if any(pattern in name for pattern in target_patterns):
+                if isinstance(module, (nn.Linear, BaseLayerWithLoRA)):
+                    target_modules.append(name)
+
+        logger.info(f"[TrainingManager] Found {len(target_modules)} modules matching patterns {target_patterns}")
+        return target_modules
+
+    def _get_qkv_indices_for_training(self) -> tuple[list[int], list[int]]:
+        """
+        Determine which Q/K/V indices to train based on target_patterns.
+        Returns (a_indices, b_indices) where indices map to: 0=Q, 1=K, 2=V.
+
+        This makes training configurable - only specified projections are trained.
+        """
+        # Map projection names to indices
+        projection_map = {"q_proj": 0, "k_proj": 1, "v_proj": 2}
+
+        # Determine which indices to enable based on target_patterns
+        enabled_indices = []
+        for pattern in getattr(self, 'target_patterns', []):
+            for proj_name, idx in projection_map.items():
+                if proj_name in pattern:
+                    enabled_indices.append(idx)
+                    break
+
+        # Remove duplicates and sort
+        enabled_indices = sorted(list(set(enabled_indices)))
+
+        # If no specific projections found, default to all (backward compatibility)
+        if not enabled_indices:
+            enabled_indices = [0, 1, 2]
+
+        logger.info(f"[TrainingManager] QKV training indices: {enabled_indices} "
+                   f"(Q=0, K=1, V=2) based on target_patterns={getattr(self, 'target_patterns', [])}")
+
+        return enabled_indices, enabled_indices
+
+    def freeze_base_model(self, verbose: bool = True) -> Dict[str, int]:
+        """Freeze all base model parameters (non-LoRA)."""
+        frozen_count = 0
+        total_count = 0
+        trainable_count = 0
+
+        for name, param in self.model.named_parameters():
+            total_count += 1
+            # Check if this is a LoRA parameter (including stacked tensors)
+            is_lora_param = any([
+                'lora_a' in name.lower(), 'lora_b' in name.lower(),
+                'lora' in name.lower() and 'stacked' in name.lower(),
+                'lora' in name.lower() and ('weight' in name.lower() or 'bias' in name.lower())
+            ])
+
+            if not is_lora_param:
+                param.requires_grad = False
+                frozen_count += 1
+            else:
+                # Don't set requires_grad here - let make_lora_trainable handle it
+                trainable_count += 1
+
+        # Count trainable stacked tensors separately (they're managed by make_lora_trainable)
+        stacked_trainable_count = len(self.trainable_lora_params)
+
+        stats = {
+            'total': total_count,
+            'frozen': frozen_count,
+            'trainable': trainable_count,
+            'stacked_trainable': stacked_trainable_count,
+        }
+
+        # Base model frozen, LoRA tensors trainable
+        return stats
+
+    def make_lora_trainable(
+        self,
+        lora_id: int,
+        learning_rate: float = 1e-4,
+        num_training_steps: Optional[int] = None,
+        num_warmup_steps: int = 0,
+        gradient_accumulation_steps: int = 1,
+        weight_decay: float = 0.0,
+        scheduler_type: str = "cosine",
+    ) -> Dict[str, int]:
+        """Convert a loaded LoRA adapter to trainable Parameters and setup optimizer."""
+        # DEBUG: Log all parameters
+        logger.info(f"[LORA/SETUP] make_lora_trainable called with:")
+        logger.info(f"[LORA/SETUP]   lora_id={lora_id}")
+        logger.info(f"[LORA/SETUP]   learning_rate={learning_rate}")
+        logger.info(f"[LORA/SETUP]   num_training_steps={num_training_steps}")
+        logger.info(f"[LORA/SETUP]   num_warmup_steps={num_warmup_steps}")
+        logger.info(f"[LORA/SETUP]   gradient_accumulation_steps={gradient_accumulation_steps}")
+        logger.info(f"[LORA/SETUP]   weight_decay={weight_decay}")
+        logger.info(f"[LORA/SETUP]   scheduler_type={scheduler_type}")
+        
+        if not self.lora_manager:
+            raise ValueError("LoRA manager not available")
+
+        # Check if already set up
+        if self.current_lora_id == lora_id and self.optimizer is not None:
+            # Already set up, just update gradient accumulation if needed
+            if self.gradient_accumulation_steps != gradient_accumulation_steps:
+                self.gradient_accumulation_steps = gradient_accumulation_steps
+            
+            return {
+                'lora_id': lora_id,
+                'already_trainable': True,
+                'optimizer_setup': True,
+                'scheduler_setup': self.scheduler is not None,
+                'learning_rate': learning_rate,
+                'gradient_accumulation_steps': gradient_accumulation_steps,
+            }
+
+        # Get LoRA model and stacked tensor index
+        lora_adapters = self.lora_manager.list_adapters()
+        if lora_id not in lora_adapters:
+            raise ValueError(f"LoRA adapter {lora_id} not found in LoRA manager")
+
+        lora_model = self.lora_manager._adapter_manager.get_adapter(lora_id)
+        if lora_model is None:
+            raise ValueError(f"LoRA adapter {lora_id} could not be retrieved")
+
+        lora_index_to_id = self.lora_manager._adapter_manager.lora_index_to_id
+        try:
+            stacked_index = lora_index_to_id.index(lora_id)
+        except ValueError:
+            raise ValueError(f"LoRA {lora_id} not found in lora_index_to_id mapping")
+
+        # Making stacked tensors trainable
+
+        # Clear existing trainable parameters and make stacked tensors trainable
+        trainable_params = []
+        trainable_count = 0
+        self.trainable_lora_params.clear()
+
+        # Make stacked tensors directly trainable
+        for module_name, module in self.model.named_modules():
+            if not hasattr(module, 'lora_a_stacked') or not hasattr(module, 'lora_b_stacked'):
+                continue
+
+            # Check if this module has loaded LoRA weights
+            if module_name not in lora_model.loras:
+                continue  # Skip modules that don't have LoRA loaded
+
+            # Determine slice indices to train per module
+            if isinstance(module, MergedQKVParallelLinearWithLoRA):
+                # ✅ FIX: Make Q/K/V training configurable (not hardcoded)
+                # Use target_patterns to determine which projections to train
+                # This allows users to train any subset of Q, K, V via the training API
+                config_a_indices, config_b_indices = self._get_qkv_indices_for_training()
+
+                # Only use indices that exist in the stacked tensors
+                a_indices = [i for i in config_a_indices if i < len(module.lora_a_stacked)]
+                b_indices = [i for i in config_b_indices if i < len(module.lora_b_stacked)]
+
+                # Fallback if no valid indices
+                if not a_indices:
+                    a_indices = [0]
+                if not b_indices:
+                    b_indices = [0]
+            else:
+                # Single-slice (includes QKVParallelLinearWithLoRA which packs qkv into one slice)
+                a_indices = [0] if len(module.lora_a_stacked) > 0 else []
+                b_indices = [0] if len(module.lora_b_stacked) > 0 else []
+
+            # Process lora_a_stacked
+            for idx in a_indices:
+                stacked_tensor = module.lora_a_stacked[idx]
+                stacked_tensor.requires_grad_(True)
+
+                # ✅ FIX #4: Removed K-projection gradient masking hooks
+                # Previously, vLLM was zeroing out K-projection gradients, preventing training
+                # PEFT trains all of Q, K, V - so we should too
+                # REMOVED:
+                # if isinstance(module, QKVParallelLinearWithLoRA):
+                #     ... _mask_k_grad_a hook that zeros K gradients ...
+
+                # Debug hook: log first few gradient arrivals on A
+                try:
+                    if not hasattr(self, '_grad_hook_emitted_a'):
+                        self._grad_hook_emitted_a = 0
+                    def _log_grad_a(grad):
+                        try:
+                            if self._grad_hook_emitted_a < 5 and grad is not None:
+                                logger.info(f"[LORA/HOOK] A grad norm={float(grad.norm().detach().cpu()):.6e} shape={tuple(grad.shape)}")
+                                self._grad_hook_emitted_a += 1
+                        except Exception:
+                            print("Error logging grad hook for A")
+                        return grad
+                    stacked_tensor.register_hook(_log_grad_a)
+                except Exception:
+                    print("Error registering grad hook for A")
+
+                param_name = f"{module_name}.lora_a_stacked[{idx}]"
+                self.trainable_lora_params[param_name] = stacked_tensor
+                trainable_params.append(stacked_tensor)
+                trainable_count += 1
+
+            # Process lora_b_stacked
+            for idx in b_indices:
+                stacked_tensor = module.lora_b_stacked[idx]
+                stacked_tensor.requires_grad_(True)
+
+                # ✅ FIX #4: Removed K-projection gradient masking hooks for lora_b
+                # Previously, vLLM was zeroing out K-projection gradients, preventing training
+                # PEFT trains all of Q, K, V - so we should too
+                # REMOVED:
+                # if isinstance(module, QKVParallelLinearWithLoRA):
+                #     ... _mask_k_grad_b hook that zeros K gradients ...
+
+                # Debug hook: log first few gradient arrivals on B
+                try:
+                    if not hasattr(self, '_grad_hook_emitted_b'):
+                        self._grad_hook_emitted_b = 0
+                    def _log_grad_b(grad):
+                        try:
+                            if self._grad_hook_emitted_b < 5 and grad is not None:
+                                logger.info(f"[LORA/HOOK] B grad norm={float(grad.norm().detach().cpu()):.6e} shape={tuple(grad.shape)}")
+                                self._grad_hook_emitted_b += 1
+                        except Exception:
+                            print("Error registering grad hook for B")
+                        return grad
+                    stacked_tensor.register_hook(_log_grad_b)
+                except Exception:
+                    print("Error registering grad hook for B")
+
+                param_name = f"{module_name}.lora_b_stacked[{idx}]"
+                self.trainable_lora_params[param_name] = stacked_tensor
+                trainable_params.append(stacked_tensor)
+                trainable_count += 1
+
+        # Setup complete
+        
+        # [VLLM/LORA] Print trainable LoRA parameters details
+        print("\n" + "=" * 70)
+        print("[VLLM/LORA] Trainable LoRA Parameters (After make_lora_trainable)")
+        print("=" * 70)
+        print(f"[VLLM/LORA] Total trainable parameters: {trainable_count}")
+        for param_name, param_tensor in self.trainable_lora_params.items():
+            print(f"[VLLM/LORA]   {param_name}:")
+            print(f"[VLLM/LORA]     Shape: {param_tensor.shape}, dtype: {param_tensor.dtype}")
+            print(f"[VLLM/LORA]     Stats: mean={param_tensor.mean().item():.6f}, "
+                  f"std={param_tensor.std().item():.6f}, "
+                  f"min={param_tensor.min().item():.6f}, "
+                  f"max={param_tensor.max().item():.6f}")
+            checksum = param_tensor.sum().item()
+            print(f"[VLLM/LORA]     Checksum (sum): {checksum:.6f}")
+            
+            # If this is a packed qkv parameter, analyze its structure
+            if 'qkv_proj' in param_name:
+                print(f"[VLLM/LORA/QKV] Analyzing packed QKV structure for {param_name}")
+                # For lora_a, the output dim is stacked [rank, rank, rank]
+                # For lora_b, the input dim is stacked, output dim is [hidden, hidden, hidden]
+                if 'lora_a' in param_name:
+                    # lora_a shape is typically [hidden_size, 3*rank] for packed qkv
+                    if param_tensor.shape[1] % 3 == 0:
+                        slice_size = param_tensor.shape[1] // 3
+                        q_slice = param_tensor.data[:, :slice_size]
+                        k_slice = param_tensor.data[:, slice_size:2*slice_size]
+                        v_slice = param_tensor.data[:, 2*slice_size:]
+                        print(f"[VLLM/LORA/QKV]   Q slice: shape={q_slice.shape}, mean={q_slice.mean().item():.6f}, std={q_slice.std().item():.6f}, checksum={q_slice.sum().item():.6f}")
+                        print(f"[VLLM/LORA/QKV]   K slice: shape={k_slice.shape}, mean={k_slice.mean().item():.6f}, std={k_slice.std().item():.6f}, checksum={k_slice.sum().item():.6f}")
+                        print(f"[VLLM/LORA/QKV]   V slice: shape={v_slice.shape}, mean={v_slice.mean().item():.6f}, std={v_slice.std().item():.6f}, checksum={v_slice.sum().item():.6f}")
+                elif 'lora_b' in param_name:
+                    # lora_b shape is typically [3*rank, hidden_size] for packed qkv
+                    if param_tensor.shape[0] % 3 == 0:
+                        slice_size = param_tensor.shape[0] // 3
+                        q_slice = param_tensor.data[:slice_size, :]
+                        k_slice = param_tensor.data[slice_size:2*slice_size, :]
+                        v_slice = param_tensor.data[2*slice_size:, :]
+                        print(f"[VLLM/LORA/QKV]   Q slice: shape={q_slice.shape}, mean={q_slice.mean().item():.6f}, std={q_slice.std().item():.6f}, checksum={q_slice.sum().item():.6f}")
+                        print(f"[VLLM/LORA/QKV]   K slice: shape={k_slice.shape}, mean={k_slice.mean().item():.6f}, std={k_slice.std().item():.6f}, checksum={k_slice.sum().item():.6f}")
+                        print(f"[VLLM/LORA/QKV]   V slice: shape={v_slice.shape}, mean={v_slice.mean().item():.6f}, std={v_slice.std().item():.6f}, checksum={v_slice.sum().item():.6f}")
+        print("=" * 70)
+
+        # Setup optimizer and scheduler
+        self.current_lora_id = lora_id
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.gradient_accumulation_counter = 0
+        self.trained_lora_ids.add(lora_id)
+
+        self.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+        if num_training_steps is not None and num_training_steps > 0:
+            self.scheduler = self.setup_scheduler(
+                optimizer=self.optimizer,
+                num_training_steps=num_training_steps,
+                num_warmup_steps=num_warmup_steps,
+                scheduler_type=scheduler_type,
+            )
+        else:
+            self.scheduler = None
+
+        return {
+            'lora_id': lora_id,
+            'trainable_params': trainable_count,
+            'optimizer_setup': True,
+            'scheduler_setup': self.scheduler is not None,
+            'learning_rate': learning_rate,
+            'gradient_accumulation_steps': gradient_accumulation_steps,
+        }
+
+    def setup_scheduler(
+        self,
+        optimizer: torch.optim.Optimizer,
+        num_training_steps: int,
+        num_warmup_steps: int = 0,
+        scheduler_type: str = "cosine",
+    ):
+        """Setup learning rate scheduler."""
+        if scheduler_type == "cosine":
+            if num_warmup_steps > 0:
+                def lr_lambda(current_step: int):
+                    # ✅ FIX: Remove the +1 offset to match PEFT's scheduler exactly
+                    # PyTorch LambdaLR correctly starts from step 0
+                    if current_step < num_warmup_steps:
+                        lr_factor = float(current_step) / float(max(1, num_warmup_steps))
+                        return lr_factor
+                    progress = float(current_step - num_warmup_steps) / float(
+                        max(1, num_training_steps - num_warmup_steps))
+                    lr_factor = max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.141592653589793))))
+                    return lr_factor
+
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            else:
+                from torch.optim.lr_scheduler import CosineAnnealingLR
+                scheduler = CosineAnnealingLR(optimizer, T_max=num_training_steps)
+        elif scheduler_type == "linear":
+            from torch.optim.lr_scheduler import LinearLR
+            scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=num_training_steps)
+        else:
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+
+            # Scheduler created
+        return scheduler
+
+    def optimizer_step(
+        self,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+        max_grad_norm: Optional[float] = 1.0,  # ✅ CRITICAL FIX: Match PEFT default (was None)
+    ) -> Dict[str, float]:
+        """Perform optimizer step with optional gradient clipping."""
+        stats = {}
+
+        # ✅ PEFT MATCHING: Gradient clipping (matches PEFT's max_grad_norm=1.0)
+        # Applied after backward(), before optimizer.step()
+        # Uses torch.nn.utils.clip_grad_norm_() with L2 norm
+        if max_grad_norm is not None and max_grad_norm > 0:
+            # Clip gradients to prevent exploding gradients during training
+            # This matches PEFT's TrainingArguments(max_grad_norm=1.0) default
+            trainable_params = [p for p in optimizer.param_groups[0]['params'] if p.grad is not None]
+            total_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                trainable_params,
+                max_norm=max_grad_norm,
+                norm_type=2.0  # L2 norm (default)
+            )
+            stats['grad_norm'] = float(total_norm_before_clip)  # Store pre-clip norm for logging
+            stats['grad_norm_before_clip'] = float(total_norm_before_clip)
+            stats['grad_norm_after_clip'] = min(float(total_norm_before_clip), max_grad_norm)
+            
+            # Log clipping events (when norm exceeds max)
+            if total_norm_before_clip > max_grad_norm:
+                logger.info(f"[LORA/GRAD_CLIP] step={self.training_step} "
+                          f"norm_before={total_norm_before_clip:.4f} "
+                          f"norm_after={max_grad_norm:.4f} "
+                          f"clipped={((total_norm_before_clip - max_grad_norm) / total_norm_before_clip * 100):.1f}%")
+        else:
+            # Calculate gradient norm without clipping
+            total_norm = 0.0
+            for param in optimizer.param_groups[0]['params']:
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item()**2
+            total_norm = total_norm**0.5
+            stats['grad_norm'] = total_norm
+
+        # DEBUG: log gradient presence before step
+        try:
+            has_grad = sum(1 for p in optimizer.param_groups[0]['params'] if p.grad is not None)
+            logger.info(f"[LORA/GRAD] before step: grads={has_grad}/{len(optimizer.param_groups[0]['params'])}, total_norm={stats['grad_norm']:.4f}")
+        except Exception:
+            print("Error logging gradient presence before step")
+
+        # Optimizer step
+        optimizer.step()
+        stats['learning_rate'] = optimizer.param_groups[0]['lr']
+
+        # Scheduler step if provided
+        if scheduler is not None:
+            scheduler.step()
+            # Log LR after scheduler step for first 10 steps
+            if self.training_step <= 10:
+                new_lr = optimizer.param_groups[0]['lr']
+                logger.info(f"[LORA/LR] step={self.training_step} lr_before_sched={stats['learning_rate']:.6e} lr_after_sched={new_lr:.6e}")
+                stats['learning_rate'] = new_lr
+
+        return stats
+
+    def zero_grad(self, optimizer: torch.optim.Optimizer) -> None:
+        """Zero out all gradients."""
+        optimizer.zero_grad()
+
+    def step_with_accumulation(
+        self,
+        max_grad_norm: Optional[float] = None,
+    ) -> Optional[Dict[str, float]]:
+        """Handle gradient accumulation and optimizer step."""
+        if self.optimizer is None:
+            logger.warning("[TrainingManager] No optimizer configured, skipping step")
+            return None
+
+        # Check if gradients are computed and log norms (every step)
+        grad_count = 0
+        total_grad_l2 = 0.0
+        sample_b_grads: list[tuple[str, float]] = []
+        for name, param in self.trainable_lora_params.items():
+            if param.grad is not None:
+                grad_count += 1
+                try:
+                    gnorm = float(param.grad.data.norm().detach().cpu())
+                    total_grad_l2 += gnorm * gnorm
+                    if 'lora_b_stacked' in name and len(sample_b_grads) < 3:
+                        sample_b_grads.append((name, gnorm))
+                except Exception:
+                    print("Error calculating gradient norm")
+        if grad_count == 0:
+            logger.warning(f"[TrainingManager] No gradients found in {len(self.trainable_lora_params)} LoRA parameters")
+            return None
+        try:
+            msg = f"[LORA/GRAD] step={self.training_step} grads_present={grad_count}/{len(self.trainable_lora_params)} total_grad_norm={(total_grad_l2 ** 0.5):.6e}"
+            if sample_b_grads:
+                msg += " sample_B_grad_norms=" + ",".join(f"{n}:{g:.3e}" for n,g in sample_b_grads)
+            logger.info(msg)
+        except Exception:
+            print("Error logging gradient presence after step")
+
+        # [VLLM/GRAD] Print gradient information (first step only)
+        if self.training_step == 0:
+            print("\n" + "=" * 70)
+            print("[VLLM/GRAD] Gradients After Backward Pass (First Step)")
+            print("=" * 70)
+            print(f"[VLLM/GRAD] Gradient accumulation steps: {self.gradient_accumulation_steps}")
+            print(f"[VLLM/GRAD] Current accumulation counter: {self.gradient_accumulation_counter}")
+            total_grad_norm = 0.0
+            for param_name, param in self.trainable_lora_params.items():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    grad_mean = param.grad.mean().item()
+                    grad_std = param.grad.std().item()
+                    grad_min = param.grad.min().item()
+                    grad_max = param.grad.max().item()
+                    total_grad_norm += grad_norm ** 2
+                    print(f"[VLLM/GRAD] {param_name}:")
+                    print(f"[VLLM/GRAD]   Grad norm: {grad_norm:.6e}, mean: {grad_mean:.6e}, std: {grad_std:.6e}")
+                    print(f"[VLLM/GRAD]   Grad min: {grad_min:.6e}, max: {grad_max:.6e}")
+                    print(f"[VLLM/GRAD]   Param dtype: {param.dtype}, grad dtype: {param.grad.dtype}")
+                else:
+                    print(f"[VLLM/GRAD] {param_name}: NO GRADIENT")
+            print(f"[VLLM/GRAD] Total gradient norm (all params): {(total_grad_norm ** 0.5):.6e}")
+            print("=" * 70)
+
+        # ✅ FIX: Check if high-level training loop is controlling gradient accumulation
+        external_control = hasattr(self, '_should_step_optimizer')
+        
+        if external_control:
+            # External control from high-level loop - respect the flag
+            should_step = self._should_step_optimizer
+            
+            # DEBUG: Log external control
+            if self.training_step <= 10:
+                logger.info(f"[LORA/ACCUM_EXT] step={self.training_step} should_step={should_step} (external control)")
+            
+            if should_step:
+                self.training_step += 1
+        else:
+            # Internal accumulation control (original behavior)
+            self.gradient_accumulation_counter += 1
+            self.training_step += 1
+            should_step = self.gradient_accumulation_counter >= self.gradient_accumulation_steps
+            
+            # DEBUG: Log accumulation status
+            if self.training_step <= 10:
+                logger.info(f"[LORA/ACCUM] step={self.training_step} counter={self.gradient_accumulation_counter}/{self.gradient_accumulation_steps} should_step={should_step}")
+
+        # Check if we should perform an optimizer step
+        if should_step:
+            # Snapshot params before step for delta logging
+            params_before = {}
+            try:
+                for param_name, param in self.trainable_lora_params.items():
+                    params_before[param_name] = param.detach().clone()
+            except Exception:
+                params_before = {}
+            
+            # Perform optimizer step (directly updates the stacked tensor parameters)
+            stats = self.optimizer_step(
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                max_grad_norm=max_grad_norm,
+            )
+
+            # ✅ DISABLED: K-slice zeroing (now training Q, K, V all together for fair comparison)
+            # # Enforce Q/V-only training on packed QKV layers by zeroing K-slices after update
+            # try:
+            #     for module_name, module in self.model.named_modules():
+            #         if isinstance(module, QKVParallelLinearWithLoRA):
+            #             q_size = getattr(module, 'q_proj_shard_size', None)
+            #             kv_size = getattr(module, 'kv_proj_shard_size', None)
+            #             if isinstance(q_size, int) and isinstance(kv_size, int):
+            #                 # lora_b_stacked: (max_loras, 1, output, rank) – zero K slice in output dim
+            #                 if len(module.lora_b_stacked) > 0:
+            #                     tensor_b = module.lora_b_stacked[0]
+            #                     tensor_b.data[:, :, q_size:q_size + kv_size, :].zero_()
+            #                 # lora_a_stacked: (max_loras, 1, rank, input) – K slice maps on output side; keep consistent and zero corresponding buffer if any
+            #                 if len(module.lora_a_stacked) > 0:
+            #                     # No direct output partition on A; still zero a conservative region is risky. Skip A zeros for single-slice
+            #                     pass
+            #         elif isinstance(module, MergedQKVParallelLinearWithLoRA):
+            #             # Three slices [Q, K, V]; index 1 is K
+            #             if len(module.lora_b_stacked) >= 3 and module.lora_b_stacked[1] is not None:
+            #                 module.lora_b_stacked[1].data.zero_()
+            #             if len(module.lora_a_stacked) >= 3 and module.lora_a_stacked[1] is not None:
+            #                 module.lora_a_stacked[1].data.zero_()
+            #     # Optional: brief debug around known spike window
+            #     if 100 <= self.training_step <= 220:
+            #         print(f"[VLLM/DEBUG] Training Q+K+V at training_step={self.training_step}")
+            #         print(f"[VLLM/DEBUG] LR={stats.get('learning_rate', None)} grad_norm={stats.get('grad_norm', None)}")
+            # except Exception as e:
+            #     print(f"[VLLM/DEBUG] K-slice zeroing disabled: {e}")
+            
+            # [LORA/STEP] Log parameter deltas after optimizer step
+            try:
+                delta_sum = 0.0
+                sample_b_deltas: list[tuple[str, float]] = []
+                for param_name, param in self.trainable_lora_params.items():
+                    if param_name in params_before:
+                        d = (param.detach() - params_before[param_name]).norm().detach().cpu()
+                        dv = float(d)
+                        delta_sum += dv
+                        if 'lora_b_stacked' in param_name and len(sample_b_deltas) < 3:
+                            sample_b_deltas.append((param_name, dv))
+                msg = f"[LORA/STEP] step={self.training_step} delta_norm_sum={delta_sum:.6e}"
+                if sample_b_deltas:
+                    msg += " sample_B_delta_norms=" + ",".join(f"{n}:{v:.3e}" for n,v in sample_b_deltas)
+                logger.info(msg)
+            except Exception:
+                print("Error logging parameter deltas after optimizer step")
+            
+            # Zero gradients and reset accumulation counter
+            self.zero_grad(self.optimizer)
+            if not external_control:
+                # Only reset internal counter if not using external control
+                self.gradient_accumulation_counter = 0
+            stats['training_step'] = self.training_step
+            
+            # Clear external control flag if set
+            if external_control:
+                delattr(self, '_should_step_optimizer')
+            
+            return stats
+        else:
+            # Clear external control flag if set (even when not stepping)
+            if external_control:
+                delattr(self, '_should_step_optimizer')
+            return None
+
+    def verify_training_health(self, lora_id: int) -> bool:
+        """Verify gradients are flowing and parameters are updating."""
+        if self.optimizer is None:
+            logger.warning("[TrainingManager] No optimizer configured")
+            return False
+        
+        # Check if any parameters have gradients
+        has_gradients = any(p.grad is not None for p in self.optimizer.param_groups[0]['params'])
+        
+        # Check if parameters changed after step (simple checksum)
+        if hasattr(self, '_last_param_checksum'):
+            current_checksum = sum(p.sum().item() for p in self.optimizer.param_groups[0]['params'])
+            params_changed = abs(current_checksum - self._last_param_checksum) > 1e-10
+            self._last_param_checksum = current_checksum
+            return has_gradients and params_changed
+        else:
+            self._last_param_checksum = sum(p.sum().item() for p in self.optimizer.param_groups[0]['params'])
+            return has_gradients
+
+    def save_lora_checkpoint(
+        self,
+        lora_model: LoRAModel,
+        output_dir: str,
+        adapter_name: str = "adapter",
+    ) -> str:
+        """Save LoRA adapter weights to disk."""
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Prepare tensors for saving
+        tensors = {}
+        for module_name, lora_weights in lora_model.loras.items():
+            base_name = f"base_model.model.{module_name}"
+            
+            # Handle packed layers vs regular layers
+            if isinstance(lora_weights.lora_a, list):
+                # Packed layer - save each component separately
+                for i, (lora_a_tensor, lora_b_tensor) in enumerate(zip(lora_weights.lora_a, lora_weights.lora_b)):
+                    if lora_a_tensor is not None:
+                        tensor_cpu = lora_a_tensor.detach().cpu() if isinstance(lora_a_tensor, torch.nn.Parameter) else lora_a_tensor.cpu()
+                        tensors[f"{base_name}.lora_A.weight.{i}"] = tensor_cpu.contiguous()
+                    if lora_b_tensor is not None:
+                        tensor_cpu = lora_b_tensor.detach().cpu() if isinstance(lora_b_tensor, torch.nn.Parameter) else lora_b_tensor.cpu()
+                        tensors[f"{base_name}.lora_B.weight.{i}"] = tensor_cpu.contiguous()
+            else:
+                # Regular layer - save as single tensor
+                if lora_weights.lora_a is not None:
+                    tensor_cpu = lora_weights.lora_a.detach().cpu() if isinstance(lora_weights.lora_a, torch.nn.Parameter) else lora_weights.lora_a.cpu()
+                    tensors[f"{base_name}.lora_A.weight"] = tensor_cpu.contiguous()
+                if lora_weights.lora_b is not None:
+                    tensor_cpu = lora_weights.lora_b.detach().cpu() if isinstance(lora_weights.lora_b, torch.nn.Parameter) else lora_weights.lora_b.cpu()
+                    tensors[f"{base_name}.lora_B.weight"] = tensor_cpu.contiguous()
+
+        # Save adapter_config.json
+        config = {
+            "peft_type": "LORA",
+            "r": lora_model.rank,
+            "lora_alpha": self.alpha,
+            "lora_dropout": 0.0,
+            "target_modules": list(self.sub_modules),
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+        }
+
+        with open(os.path.join(output_dir, "adapter_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        # Save weights
+        save_file(tensors, os.path.join(output_dir, "adapter_model.safetensors"))
+
+        logger.info(f"[TrainingManager] Saved LoRA adapter to {output_dir}")
+        logger.info(f"[TrainingManager] Saved {len(tensors)} tensors")
+
+        return output_dir

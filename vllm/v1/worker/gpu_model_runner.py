@@ -257,6 +257,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
+        # Training manager for LoRA training (initialized after model load)
+        self.training_manager = None
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -581,6 +584,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                is_training=new_req_data.is_training,
+                training_config=new_req_data.training_config,
             )
             self.requests[req_id] = req_state
 
@@ -1002,15 +1007,33 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
+        # Check if this is a training batch (all requests are training)
+        is_training_batch = False
+        if self.input_batch.num_reqs > 0:
+            # Check if any request is a training request
+            training_count = sum(
+                1 for req_id in self.input_batch.req_ids
+                if req_id is not None and (req_state := self.requests.get(
+                    req_id)) is not None and req_state.is_training)
+            is_training_batch = (training_count == self.input_batch.num_reqs)
+
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
-            # NOTE(woosuk): Due to chunked prefills, the batch may contain
-            # partial requests. While we should not sample any token
-            # from these partial requests, we do so for simplicity.
-            # We will ignore the sampled tokens from the partial requests.
-            # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            if is_training_batch:
+                # For training, we need logits for ALL tokens, not just last ones
+                # Create indices for all tokens: [0, 1, 2, ..., total_num_scheduled_tokens-1]
+                logits_indices = torch.arange(total_num_scheduled_tokens,
+                                              dtype=torch.int32,
+                                              device="cpu")
+            else:
+                # For inference: select only the last token of each sequence for sampling
+                # NOTE(woosuk): Due to chunked prefills, the batch may contain
+                # partial requests. While we should not sample any token
+                # from these partial requests, we do so for simplicity.
+                # We will ignore the sampled tokens from the partial requests.
+                # TODO: Support prompt logprobs.
+                logits_indices = query_start_loc[1:] - 1
             num_draft_tokens = None
             spec_decode_metadata = None
         else:
@@ -1105,6 +1128,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 encoder_seq_lens=encoder_seq_lens,
             )
 
+            # Log attention metadata for first 10 batches during training
+            if is_training_batch:
+                if not hasattr(self, '_vllm_batch_counter'):
+                    self._vllm_batch_counter = 0
+
+                if self._vllm_batch_counter < 10:
+                    print(f"\n[VLLM/BATCH {self._vllm_batch_counter}] Attention Metadata:")
+                    print(f"  Num requests: {num_reqs}")
+                    print(f"  Total tokens: {total_num_scheduled_tokens}")
+                    print(f"  Max query length: {max_num_scheduled_tokens}")
+                    if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
+                        print(f"  Sequence lengths: {seq_lens_cpu[:min(4, len(seq_lens_cpu))].tolist()}")
+                    print(f"  Causal attention: {common_attn_metadata.causal}")
+
+                self._vllm_batch_counter += 1
+
             if self.speculative_config and \
                 spec_decode_common_attn_metadata is None:
                 spec_decode_common_attn_metadata = common_attn_metadata
@@ -1130,6 +1169,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         num_draft_tokens=self.num_draft_tokens.gpu[:num_reqs],
                     )
 
+                # Add is_training flag to metadata args for XFormers backend
+                if is_training_batch:
+                    extra_attn_metadata_args['is_training'] = True
+
                 if ubatch_slices is not None:
                     common_attn_metadata_list = split_attn_metadata(
                         ubatch_slices, common_attn_metadata)
@@ -1154,7 +1197,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Hot-Swap lora model
         if self.lora_config:
-            self.set_active_loras(self.input_batch, num_scheduled_tokens)
+            self.set_active_loras(self.input_batch, num_scheduled_tokens,
+                                  is_training_batch)
 
         return (attn_metadata, logits_indices, spec_decode_metadata,
                 num_scheduled_tokens, spec_decode_common_attn_metadata,
@@ -1837,6 +1881,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
             # then the embedding layer is not included in the CUDA graph.
+            # EXCEPTION: For training, we MUST use embeddings to enable gradients
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
@@ -2027,8 +2072,42 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             invalid_req_indices,
         )
 
-    @torch.inference_mode()
     def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        """Execute model - dispatches to training or inference based on request type.
+        
+        Args:
+            scheduler_output: Output from the scheduler
+            intermediate_tensors: Intermediate tensors from previous pipeline stage
+            
+        Returns:
+            ModelRunnerOutput (or async wrapper) or IntermediateTensors for PP
+        """
+        # Detect if this batch contains any training requests
+        has_training_requests = any(
+            req.is_training for req in scheduler_output.scheduled_new_reqs)
+
+        if has_training_requests:
+            # Check if any request is marked as evaluation
+            is_eval = any(
+                req.training_config and req.training_config.is_eval
+                for req in scheduler_output.scheduled_new_reqs
+                if req.is_training
+            )
+            # Dispatch to training execution (without @torch.inference_mode)
+            return self.execute_model_training(scheduler_output,
+                                               intermediate_tensors,
+                                               is_eval=is_eval)
+        else:
+            # Dispatch to inference execution (with @torch.inference_mode)
+            return self.execute_model_inference(scheduler_output,
+                                                intermediate_tensors)
+
+    @torch.inference_mode()
+    def execute_model_inference(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
@@ -2232,6 +2311,568 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampled_token_ids=sampler_output.sampled_token_ids,
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
+        )
+
+    def execute_model_training(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        is_eval: bool = False,
+    ) -> ModelRunnerOutput:
+        """Execute model for training requests.
+        
+        This is a specialized version of execute_model that:
+        1. Does NOT use torch.inference_mode() decorator
+        2. Skips KV cache allocation and management
+        3. Skips sampling and token generation
+        4. Computes and returns training loss
+        5. Enables gradient computation for backward pass
+        
+        Args:
+            scheduler_output: Output from the scheduler containing training requests
+            intermediate_tensors: Intermediate tensors from previous pipeline stage
+            is_eval: If True, skips backward pass (evaluation mode)
+            
+        Returns:
+            ModelRunnerOutput with training losses instead of sampled tokens
+        """
+        with record_function_or_nullcontext("Preprocess"):
+            self._update_states(scheduler_output)
+            if not scheduler_output.total_num_scheduled_tokens:
+                # Return empty output if there's no work to do.
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+            if self.prepare_inputs_event is not None:
+                # Ensure prior step has finished with reused CPU tensors.
+                self.prepare_inputs_event.synchronize()
+            try:
+                # Prepare the decoder inputs.
+                # Note: For training, we still need attention metadata for the forward pass
+                (attn_metadata, logits_indices, spec_decode_metadata,
+                 num_scheduled_tokens_np, spec_decode_common_attn_metadata,
+                 max_query_len, ubatch_slices, num_tokens_after_padding
+                 ) = self._prepare_inputs(scheduler_output)
+
+            finally:
+                if self.prepare_inputs_event is not None:
+                    self.prepare_inputs_event.record()
+
+            (
+                num_scheduled_tokens,
+                num_input_tokens,
+                num_tokens_across_dp,
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
+                model_kwargs,
+            ) = self._preprocess(scheduler_output, intermediate_tensors,
+                                 ubatch_slices, num_tokens_after_padding)
+
+            if ubatch_slices is not None:
+                num_input_tokens = num_input_tokens // 2
+
+            uniform_decode = False  # Training always uses non-uniform decode
+            batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
+                                               uniform_decode=uniform_decode)
+            cudagraph_runtime_mode, batch_descriptor = \
+                self.cudagraph_dispatcher.dispatch(batch_descriptor)
+
+        # Run the model WITHOUT torch.inference_mode() to enable gradients
+        with (set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+                ubatch_slices=ubatch_slices,
+        ), record_function_or_nullcontext("Forward")):
+            # Enable gradient computation for training
+            # IMPORTANT: Keep torch.enable_grad() active for ENTIRE forward + loss computation
+            with torch.enable_grad():
+                # Check if this is a LoRA training request
+                is_lora_training = any(
+                    req.lora_request is not None
+                    for req in scheduler_output.scheduled_new_reqs)
+
+                # Check if this is evaluation mode (from training_config)
+                # Note: is_eval parameter takes precedence, but we also check training_config
+                batch_is_eval = is_eval
+                if not batch_is_eval:
+                    # Check if any request has is_eval set in training_config
+                    for req in scheduler_output.scheduled_new_reqs:
+                        if req.training_config and req.training_config.is_eval:
+                            batch_is_eval = True
+                            break
+
+                if batch_is_eval:
+                    logger.debug("[Evaluation] Running in evaluation mode (no backward pass)")
+
+                # Set up parameter gradients for training
+                if is_lora_training and hasattr(self, 'training_manager'):
+                    # LoRA training: freeze base model, enable only LoRA parameters
+                    logger.debug("[Training] LoRA training mode - freezing base model parameters")
+
+                    # Get the LoRA ID from the request
+                    lora_id = None
+                    for req in scheduler_output.scheduled_new_reqs:
+                        if req.lora_request is not None:
+                            lora_id = req.lora_request.lora_int_id
+                            break
+
+                    # ✅ FIX: Only call make_lora_trainable if optimizer not already set up
+                    # The high-level training API sets up the optimizer/scheduler ONCE at the start
+                    # This per-batch call should only happen for low-level API usage
+                    if lora_id is not None and not is_eval:
+                        # Only setup if optimizer not already configured
+                        if (self.training_manager.optimizer is None or 
+                            self.training_manager.current_lora_id != lora_id):
+                            try:
+                                lora_stats = self.training_manager.make_lora_trainable(lora_id)
+                            except Exception as e:
+                                logger.warning(f"[Training] Failed to convert LoRA {lora_id}: {e}")
+
+                    # Freeze base model (only log once per LoRA setup)
+                    if not hasattr(self, '_base_model_frozen'):
+                        stats = self.training_manager.freeze_base_model(verbose=False)
+                        self._base_model_frozen = True
+                else:
+                    # Full fine-tuning: enable all parameters
+                    param_count = 0
+                    grad_enabled_count = 0
+                    for name, param in self.model.named_parameters():
+                        param_count += 1
+                        if param.requires_grad:
+                            grad_enabled_count += 1
+                        param.requires_grad_(True)  # Force enable, even if already True
+
+                # CRITICAL: For ALL training (LoRA or full), we need to use embeddings with gradient support
+                # The standard vLLM flow uses input_ids directly, which skips the embedding layer
+                # For gradient flow, we MUST compute embeddings explicitly so gradients can flow
+                if input_ids is not None:
+                    # DEBUG: Log input shape before processing
+                    if not hasattr(self, '_shape_logged'):
+                        self._shape_logged = 0
+                    if self._shape_logged < 5:
+                        print(f"[VLLM/TRAINING/INPUT] input_ids shape: {input_ids.shape}")
+                        print(f"[VLLM/TRAINING/INPUT] num_input_tokens: {num_input_tokens}")
+                        print(f"[VLLM/TRAINING/INPUT] num_scheduled_tokens: {num_scheduled_tokens}")
+                        print(f"[VLLM/TRAINING/INPUT] num_requests: {len(scheduler_output.scheduled_new_reqs)}")
+                        self._shape_logged += 1
+
+                    # Also ensure the model itself is in training mode
+                    self.model.train()
+
+                    # Get the embedding layer
+                    embed_layer = self.model.model.embed_tokens if hasattr(self.model, 'model') else self.model.embed_tokens
+
+                    # Use torch.nn.functional.embedding directly to compute embeddings
+                    # This is critical for gradient flow through embeddings
+                    embed_weight = embed_layer.weight
+                    if not embed_weight.requires_grad:
+                        # Temporarily enable gradients for the embedding lookup
+                        # This allows the gradient graph to be built through the embeddings
+                        embed_weight = embed_weight.detach().requires_grad_(True)
+
+                    inputs_embeds = torch.nn.functional.embedding(input_ids, embed_weight)
+                    input_ids = None  # Clear input_ids so the model uses inputs_embeds
+
+
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+
+                # For training, model_output should be hidden states
+                hidden_states = model_output
+
+                # Handle pipeline parallelism
+                if not get_pp_group().is_last_rank:
+                    # Return the intermediate tensors for next PP stage
+                    assert isinstance(hidden_states, IntermediateTensors)
+                    return hidden_states
+
+                # Select the hidden states for the tokens we want
+                # (logits_indices was prepared in _prepare_inputs - for training it includes ALL tokens)
+                hidden_states = hidden_states[logits_indices]
+
+                # Compute logits for loss calculation
+                # For training, we need logits for all tokens (achieved via logits_indices)
+                # MUST be inside torch.enable_grad() context!
+                logits = self.model.compute_logits(hidden_states, None)
+
+                # Collect losses and logits for each training request
+                # IMPORTANT: Loss computation must be inside torch.enable_grad() context!
+                losses = {}
+                logits_dict = {}
+                loss_tensors = []  # Keep loss tensors for backward pass
+                loss_weights = []  # Track valid token counts for weighted averaging
+                weighting_map = {req_id: cfg.valid_label_count for req_id, cfg in self.requests.items() if getattr(cfg.training_config, "valid_label_count", 0)} if hasattr(self, "requests") else {}
+                req_ids_output = []
+                req_id_to_index = {}
+
+                offset = 0
+                for i, req_id in enumerate(self.input_batch.req_ids):
+                    if req_id is None:
+                        continue
+
+                    req_state = self.requests.get(req_id)
+                    if req_state is None or not req_state.is_training:
+                        continue
+
+                    # Get the number of tokens for this request
+                    num_tokens = scheduler_output.num_scheduled_tokens.get(
+                        req_id, 0)
+                    if num_tokens == 0:
+                        continue
+
+                    # Extract logits and labels for this request
+                    request_logits = logits[offset:offset + num_tokens]
+                    
+                    # [VLLM/EVAL DEBUG] Check offset calculation for first few samples
+                    if batch_is_eval and hasattr(self, '_vllm_eval_sample_count') and self._vllm_eval_sample_count < 5:
+                        print(f"[VLLM/EVAL DEBUG] Sample {self._vllm_eval_sample_count} - Logits slicing:")
+                        print(f"[VLLM/EVAL DEBUG]   req_id={req_id}, offset={offset}, num_tokens={num_tokens}")
+                        print(f"[VLLM/EVAL DEBUG]   Extracting logits[{offset}:{offset+num_tokens}] from total shape {logits.shape}")
+
+                    # Store logits for this request (keep gradients for backward pass)
+                    logits_dict[req_id] = request_logits
+
+                    # Get labels from training config
+                    training_config = req_state.training_config
+                    if training_config is not None and training_config.labels is not None:
+                        labels = training_config.labels
+
+                        # Convert labels to tensor if needed and move to device
+                        if not isinstance(labels, torch.Tensor):
+                            labels = torch.tensor(labels,
+                                                  dtype=torch.long,
+                                                  device=self.device)
+                        else:
+                            labels = labels.to(self.device)
+
+                        # Handle variable length sequences like PEFT does
+                        if len(labels) != num_tokens:
+                            logger.debug(
+                                f"Adjusting labels for request {req_id}: "
+                                f"expected {num_tokens}, got {len(labels)}")
+                            
+                            # Pad or truncate labels to match sequence length
+                            if len(labels) < num_tokens:
+                                # Pad with -100 (ignored in loss computation)
+                                pad_length = num_tokens - len(labels)
+                                padding = torch.full((pad_length,), -100, 
+                                                   dtype=labels.dtype, device=labels.device)
+                                labels = torch.cat([labels, padding])
+                            else:
+                                # Truncate to fit
+                                labels = labels[:num_tokens]
+                            
+                            logger.debug(f"Adjusted labels length: {len(labels)}")
+
+                        shift_logits = request_logits[:-1, :].contiguous()
+                        shift_labels = labels[1:].contiguous()
+
+                        valid_labels = weighting_map.get(req_id, (shift_labels != -100).sum().item())
+                        
+                        # [VLLM/LOSS] Print loss computation details (first step only)
+                        if not hasattr(self, '_vllm_first_loss_printed'):
+                            self._vllm_first_loss_printed = False
+                        
+                        if not self._vllm_first_loss_printed:
+                            print("\n" + "=" * 70)
+                            print("[VLLM/LOSS] First Loss Computation Details")
+                            print("=" * 70)
+                            print(f"[VLLM/LOSS] Request ID: {req_id}")
+                            print(f"[VLLM/LOSS] Logits shape (before shift): {request_logits.shape}")
+                            print(f"[VLLM/LOSS] Logits dtype: {request_logits.dtype}")
+                            print(f"[VLLM/LOSS] Labels shape (before shift): {labels.shape}")
+                            print(f"[VLLM/LOSS] Labels dtype: {labels.dtype}")
+                            print(f"[VLLM/LOSS] Shift logits shape: {shift_logits.shape}")
+                            print(f"[VLLM/LOSS] Shift labels shape: {shift_labels.shape}")
+                            total_labels = shift_labels.numel()
+                            masked_labels = (shift_labels == -100).sum().item()
+                            print(f"[VLLM/LOSS] Number of valid labels: {valid_labels} out of {total_labels}")
+                            print(f"[VLLM/LOSS] Number of -100 labels: {masked_labels}")
+                            print(f"[VLLM/LOSS] Percentage masked: {100.0 * masked_labels / total_labels:.2f}%")
+                            print(f"[VLLM/LOSS] Labels (first 30): {labels[:30].tolist()}")
+                            print(f"[VLLM/LOSS] Label mask pattern (first 30, 0=valid, 1=masked): {(shift_labels[:30] == -100).int().tolist()}")
+                            print("=" * 70)
+                        
+                        # [VLLM/EVAL] Print additional details during evaluation
+                        if not hasattr(self, '_vllm_first_eval_loss_printed'):
+                            self._vllm_first_eval_loss_printed = False
+                        if not hasattr(self, '_vllm_eval_sample_count'):
+                            self._vllm_eval_sample_count = 0
+                        
+                        # Debug first 5 eval samples  
+                        if batch_is_eval and self._vllm_eval_sample_count < 5:
+                            print("\n" + "=" * 70)
+                            print(f"[VLLM/EVAL] Sample {self._vllm_eval_sample_count} - Loss Computation")
+                            print("=" * 70)
+                            print(f"[VLLM/EVAL] Request ID: {req_id}")
+                            print(f"[VLLM/EVAL] Total tokens: {num_tokens}")
+                            print(f"[VLLM/EVAL] Valid labels: {valid_labels}")
+                            print(f"[VLLM/EVAL] Masked labels: {(shift_labels == -100).sum().item()}")
+                            print(f"[VLLM/EVAL] Logits shape: {shift_logits.shape}")
+                            print(f"[VLLM/EVAL] Logits mean: {shift_logits.mean().item():.6f}")
+                            print(f"[VLLM/EVAL] Logits std: {shift_logits.std().item():.6f}")
+                            print(f"[VLLM/EVAL] Logits dtype: {shift_logits.dtype}")
+                            print(f"[VLLM/EVAL] Labels (non--100, first 20): {shift_labels[shift_labels != -100][:20].tolist()}")
+                            print(f"[VLLM/EVAL] Full logits mean (unshifted): {request_logits.mean().item():.6f}")
+                            print(f"[VLLM/EVAL] Full logits std (unshifted): {request_logits.std().item():.6f}")
+                            print("=" * 70)
+                        
+                        # CRITICAL FIX: Skip loss computation if no valid labels
+                        if valid_labels == 0:
+                            losses[req_id] = None
+                        else:
+                            # Ensure numerically stable loss by upcasting logits to float32
+                            loss_fct = torch.nn.CrossEntropyLoss()
+                            logits_fp32 = shift_logits.float()
+                            loss = loss_fct(
+                                logits_fp32.view(-1, logits_fp32.size(-1)),
+                                shift_labels.view(-1))
+
+                            loss_value = loss.item()
+
+                            # [VLLM/LOSS/DEBUG] Initialize step counter for per-request logging
+                            if not hasattr(self, '_vllm_loss_step_counter'):
+                                self._vllm_loss_step_counter = 0
+
+                            # [VLLM/LOSS/DEBUG] Log per-request loss details for step 0
+                            if self._vllm_loss_step_counter == 0:
+                                if not hasattr(self, '_vllm_loss_request_details'):
+                                    self._vllm_loss_request_details = []
+
+                                total_tokens = shift_labels.numel()
+                                self._vllm_loss_request_details.append({
+                                    'req_id': req_id,
+                                    'total_tokens': total_tokens,
+                                    'valid_labels': valid_labels,
+                                    'loss': loss_value
+                                })
+                                print(f"[VLLM/LOSS/DEBUG] Request {req_id}: total_tokens={total_tokens}, valid_labels={valid_labels}, loss={loss_value:.6f}")
+
+                            # [VLLM/LOSS] Print loss value (first step only)
+                            if not self._vllm_first_loss_printed:
+                                print(f"[VLLM/LOSS] Computed loss: {loss_value:.6f}")
+                                self._vllm_first_loss_printed = True
+                            
+                            # [VLLM/EVAL] Print eval loss details for first 5 samples
+                            if batch_is_eval and self._vllm_eval_sample_count < 5:
+                                # Compute per-token losses for analysis
+                                loss_fct_per_token = torch.nn.CrossEntropyLoss(reduction='none')
+                                per_token_losses = loss_fct_per_token(
+                                    shift_logits.view(-1, shift_logits.size(-1)),
+                                    shift_labels.view(-1)
+                                )
+                                valid_per_token = per_token_losses[shift_labels.view(-1) != -100]
+                                
+                                print(f"[VLLM/EVAL] Sample {self._vllm_eval_sample_count} - Computed loss: {loss_value:.6f}")
+                                print(f"[VLLM/EVAL] Loss reduction: 'mean' over {valid_labels} valid tokens")
+                                print(f"[VLLM/EVAL] Per-token loss stats:")
+                                print(f"[VLLM/EVAL]   Mean: {valid_per_token.mean().item():.6f}")
+                                print(f"[VLLM/EVAL]   Std: {valid_per_token.std().item():.6f}")
+                                print(f"[VLLM/EVAL]   Min: {valid_per_token.min().item():.6f}")
+                                print(f"[VLLM/EVAL]   Max: {valid_per_token.max().item():.6f}")
+                                print(f"[VLLM/EVAL]   First 10: {valid_per_token[:10].tolist()}")
+                                self._vllm_eval_sample_count += 1
+                            
+                            # CRITICAL FIX: Skip NaN/inf losses
+                            if torch.isnan(loss) or torch.isinf(loss):
+                                losses[req_id] = None
+                            else:
+                                # Store loss tensor for backward pass
+                                loss_tensors.append(loss)
+                                loss_weights.append(valid_labels)  # Store valid token count for weighting
+
+                                # [VLLM/LOSS/DEBUG] Log which losses are added to loss_tensors
+                                if hasattr(self, '_vllm_loss_step_counter') and self._vllm_loss_step_counter == 0:
+                                    print(f"[VLLM/LOSS/DEBUG] Adding to loss_tensors: req_id={req_id}, loss={loss_value:.6f}, weight={valid_labels}, loss_tensors count={len(loss_tensors)}")
+
+                                # Store scalar value for output
+                                losses[req_id] = loss_value
+                                
+                                # [VLLM/EVAL FIX] Store valid token count for weighted averaging
+                                if batch_is_eval:
+                                    if not hasattr(self, '_vllm_eval_valid_tokens'):
+                                        self._vllm_eval_valid_tokens = {}
+                                    self._vllm_eval_valid_tokens[req_id] = valid_labels
+                    else:
+                        # No labels provided, cannot compute loss
+                        if batch_is_eval and hasattr(self, '_vllm_eval_sample_count') and self._vllm_eval_sample_count < 10:
+                            print(f"[VLLM/EVAL DEBUG] ⚠️  Request {req_id}: labels=None, loss set to None")
+                        losses[req_id] = None
+
+                    # CRITICAL FIX: Always add req_id to mappings to prevent scheduler KeyError
+                    req_ids_output.append(req_id)
+                    req_id_to_index[req_id] = len(req_ids_output) - 1
+                    offset += num_tokens
+
+        # Backward pass for training (skip for evaluation)
+        # IMPORTANT: Backward must also be inside torch.enable_grad() context
+        if not batch_is_eval:
+            with record_function_or_nullcontext("Backward"):
+                if loss_tensors:
+                    with torch.enable_grad():
+                        # [VLLM/LOSS/DEBUG] Log individual loss values before stacking
+                        if not hasattr(self, '_vllm_step_counter') or (hasattr(self, '_vllm_step_counter') and self._vllm_step_counter == 0):
+                            print(f"\n[VLLM/LOSS/DEBUG] === Before Stacking ===")
+                            print(f"[VLLM/LOSS/DEBUG] Number of loss tensors to stack: {len(loss_tensors)}")
+                            for i, lt in enumerate(loss_tensors):
+                                print(f"[VLLM/LOSS/DEBUG]   loss_tensors[{i}] = {lt.item():.6f}, weight={loss_weights[i]}")
+
+                        # ✅ FIX: Use token-weighted averaging instead of simple mean
+                        # This matches PEFT/Transformers behavior where tokens get equal weight, not requests
+                        if loss_weights and sum(loss_weights) > 0:
+                            # Convert weights to tensor
+                            weights_tensor = torch.tensor(loss_weights, dtype=torch.float32, device=loss_tensors[0].device)
+                            # Normalize weights to sum to 1
+                            weights_normalized = weights_tensor / weights_tensor.sum()
+                            # Compute weighted average
+                            total_loss = sum(loss * weight for loss, weight in zip(loss_tensors, weights_normalized))
+
+                            if not hasattr(self, '_vllm_step_counter') or self._vllm_step_counter == 0:
+                                simple_mean = torch.stack(loss_tensors).mean().item()
+                                weighted_mean = total_loss.item()
+                                print(f"[VLLM/LOSS/DEBUG] Simple mean (old): {simple_mean:.6f}")
+                                print(f"[VLLM/LOSS/DEBUG] Token-weighted mean (new): {weighted_mean:.6f}")
+                                print(f"[VLLM/LOSS/DEBUG] Difference: {abs(simple_mean - weighted_mean):.6f}")
+                        else:
+                            # Fallback to simple mean if no weights
+                            total_loss = torch.stack(loss_tensors).mean()
+
+                        # Initialize step counter for detailed logging
+                        if not hasattr(self, '_vllm_step_counter'):
+                            self._vllm_step_counter = 0
+
+                        # [VLLM/LOSS/DEBUG] Analyze loss averaging for step 0
+                        if self._vllm_step_counter == 0 and hasattr(self, '_vllm_loss_request_details'):
+                            print(f"\n[VLLM/LOSS/DEBUG] === Loss Averaging Analysis (Step 0) ===")
+                            total_valid_labels = sum(d['valid_labels'] for d in self._vllm_loss_request_details)
+                            total_tokens = sum(d['total_tokens'] for d in self._vllm_loss_request_details)
+
+                            print(f"[VLLM/LOSS/DEBUG] Number of requests: {len(self._vllm_loss_request_details)}")
+                            print(f"[VLLM/LOSS/DEBUG] Total valid labels across all requests: {total_valid_labels}")
+                            print(f"[VLLM/LOSS/DEBUG] Total tokens across all requests: {total_tokens}")
+
+                            # Show per-request losses
+                            for i, detail in enumerate(self._vllm_loss_request_details):
+                                print(f"[VLLM/LOSS/DEBUG]   Request {i}: {detail['valid_labels']} valid labels, loss={detail['loss']:.6f}")
+
+                            # Show what simple averaging does
+                            simple_avg = sum(d['loss'] for d in self._vllm_loss_request_details) / len(self._vllm_loss_request_details)
+                            print(f"[VLLM/LOSS/DEBUG] Simple average of per-request losses: {simple_avg:.6f}")
+
+                            # Show what weighted averaging would give
+                            weighted_sum = sum(d['loss'] * d['valid_labels'] for d in self._vllm_loss_request_details)
+                            weighted_avg = weighted_sum / total_valid_labels if total_valid_labels > 0 else 0
+                            print(f"[VLLM/LOSS/DEBUG] Weighted average (by valid labels): {weighted_avg:.6f}")
+
+                            print(f"[VLLM/LOSS/DEBUG] Actual combined loss (from stack+mean): {total_loss.item():.6f}")
+                            print(f"[VLLM/LOSS/DEBUG] ===")
+
+                        # [VLLM/STEP] Detailed logging for first 3 steps (matching PEFT)
+                        if self._vllm_step_counter < 3:
+                            current_step = self._vllm_step_counter
+                            print(f"\n[VLLM/STEP {current_step}] === Backward Pass Details ===")
+                            print(f"[VLLM/STEP {current_step}] Loss (before GA division): {total_loss.item():.6f}")
+                            print(f"[VLLM/STEP {current_step}] Number of loss tensors: {len(loss_tensors)}")
+
+                        # ✅ FIX: Divide loss by gradient accumulation steps to match PEFT/Transformers
+                        # Evidence: transformers/trainer.py line 4099:
+                        #   loss = loss / self.current_gradient_accumulation_steps
+                        #   self.accelerator.backward(loss, **kwargs)
+                        # This ensures that when gradients accumulate over multiple backward() calls,
+                        # the final accumulated gradient has the correct magnitude (averaged over accumulation steps).
+                        if is_lora_training and hasattr(self, 'training_manager'):
+                            gradient_accumulation_steps = getattr(
+                                self.training_manager, 'gradient_accumulation_steps', 1
+                            )
+
+                            # Log gradient accumulation details for first 10 batches (5 optimizer steps)
+                            if self._vllm_step_counter < 10:
+                                print(f"\n[VLLM/BATCH {self._vllm_step_counter}] Loss before division: {total_loss.item():.6f}")
+                                if self._vllm_step_counter == 0:
+                                    print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
+
+                            # Apply PEFT-matching loss scaling
+                            if gradient_accumulation_steps > 1:
+                                total_loss = total_loss / gradient_accumulation_steps
+
+                                if self._vllm_step_counter < 10:
+                                    print(f"[VLLM/LOSS] Loss after division by {gradient_accumulation_steps}: {total_loss.item():.6f}")
+
+                        # Compute gradients via backward pass
+                        total_loss.backward()
+
+                        # Log gradient information after backward (first 10 batches)
+                        if self._vllm_step_counter < 10 and is_lora_training and hasattr(self, 'training_manager'):
+                            lora_params_with_grad = 0
+                            total_grad_norm = 0.0
+                            layer_0_grads = {}
+
+                            for name, param in self.training_manager.trainable_lora_params.items():
+                                if 'lora' in name.lower() and param.grad is not None:
+                                    grad_norm = param.grad.norm().item()
+                                    total_grad_norm += grad_norm ** 2
+                                    lora_params_with_grad += 1
+
+                                    # Collect layer 0 gradients for comparison
+                                    if 'layers.0' in name and 'lora' in name.lower():
+                                        layer_0_grads[name] = grad_norm
+
+                            total_grad_norm = total_grad_norm ** 0.5
+                            print(f"[VLLM/GRAD] After backward:")
+                            print(f"  Total gradient norm: {total_grad_norm:.6f}")
+
+                            # Print first 3 layer 0 gradients for comparison with PEFT
+                            for i, (name, norm) in enumerate(list(layer_0_grads.items())[:3]):
+                                print(f"    {name}: {norm:.6e}")
+
+                        # Increment step counter
+                        self._vllm_step_counter += 1
+
+                        # Increment loss step counter for next iteration
+                        if hasattr(self, '_vllm_loss_step_counter'):
+                            self._vllm_loss_step_counter += 1
+
+                    # Automatically perform optimizer step with gradient accumulation
+                    if is_lora_training and hasattr(self, 'training_manager'):
+                        if self.training_manager.optimizer is not None:
+                            # DEBUG: Log when we call step_with_accumulation
+                            if self.training_manager.training_step <= 3:
+                                logger.info(f"[RUNNER/STEP] Calling step_with_accumulation, num_loss_tensors={len(loss_tensors)}")
+                            # ✅ PEFT MATCHING: Use max_grad_norm=1.0 to match PEFT's default
+                            opt_stats = self.training_manager.step_with_accumulation(max_grad_norm=1.0)
+        else:
+            logger.debug("[Evaluation] Skipping backward pass (eval mode)")
+
+        # Now detach logits for return (after backward pass)
+        logits_dict_detached = {
+            req_id: logits.detach().cpu()
+            for req_id, logits in logits_dict.items()
+        }
+
+        # Return training output
+        # Note: For training, we don't have sampled_token_ids or logprobs
+        return ModelRunnerOutput(
+            req_ids=req_ids_output,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=None,  # No sampling for training
+            logprobs=None,  # No logprobs for training
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=None,
+            num_nans_in_logits={},
+            training_losses=losses,  # Add training losses to output
+            training_logits=
+            logits_dict_detached,  # Add training logits to output
         )
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
@@ -2459,6 +3100,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                   self.scheduler_config,
                                                   self.lora_config,
                                                   self.device)
+                # Note: TrainingManager initialization moved to after model wrapping
             if hasattr(self, "drafter"):
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
@@ -2517,6 +3159,47 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.NONE, self.device)
+        
+        # Initialize TrainingManager AFTER model wrapping (if LoRA is enabled)
+        # This ensures TrainingManager gets the wrapped model and can unwrap it correctly
+        if self.lora_config:
+            logger.info("[FIX] Initializing TrainingManager after model wrapping")
+            self._init_training_manager()
+
+    def _init_training_manager(self) -> None:
+        """Initialize the TrainingManager for LoRA training.
+        
+        This is called after the model is loaded with LoRA support.
+        The TrainingManager will extract layer dimensions from the model
+        and provide functionality to create random LoRA adapters for training.
+        """
+        from vllm.lora.training_manager import TrainingManager
+
+        # Determine rank and alpha from config or use defaults
+        rank = getattr(self.lora_config, 'max_lora_rank',
+                       8) if self.lora_config else 8
+        alpha = getattr(self.lora_config, 'lora_alpha',
+                        16) if self.lora_config else 16
+
+        # Default target modules for LoRA training (attention projections)
+        # IMPORTANT: Must match PEFT adapter config (q_proj, k_proj, v_proj only - NO o_proj)
+        target_modules = ["q_proj", "k_proj", "v_proj"]
+
+        self.training_manager = TrainingManager(
+            model_runner=self,
+            lora_manager=self.lora_manager,
+            lora_config=self.lora_config,
+            device=self.device,
+            dtype=self.dtype,
+            sub_modules=None,
+            rank=rank,
+            alpha=alpha,
+            target_modules=target_modules,
+        )
+        logger.info(
+            f"TrainingManager initialized for LoRA training (rank={rank}, alpha={alpha})"
+        )
+        logger.info(f"Target modules for LoRA: {target_modules}")
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, \

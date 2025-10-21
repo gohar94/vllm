@@ -166,7 +166,9 @@ class KVCacheManager:
         """
         # Prefix caching is disabled or
         # When the request requires prompt logprobs, we skip prefix caching.
+        # Also skip prefix caching for training requests (no block_hashes).
         if (not self.enable_caching
+                or request.is_training
                 or (request.sampling_params is not None
                     and request.sampling_params.prompt_logprobs is not None)):
             return self.create_empty_block_list(), 0
@@ -290,7 +292,9 @@ class KVCacheManager:
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
-        if not self.enable_caching or delay_cache_blocks:
+        # Also skip caching for training requests since they don't need
+        # prefix caching (cache is zeroed after each training step)
+        if not self.enable_caching or delay_cache_blocks or request.is_training:
             return KVCacheBlocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_computed_tokens +

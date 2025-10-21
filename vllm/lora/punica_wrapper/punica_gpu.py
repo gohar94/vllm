@@ -45,7 +45,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         # here), V0 captures the graph as if max_num_seqs is set to
         # the capture size.
         # V1 doesn't have this problem and always respects max_num_seqs.
-        max_num_prompts = (max_batches
+        # FIX: Use max of both values for V1 to support batches with many tokens
+        max_num_prompts = (max(max_batches, max_num_batched_tokens)
                            if envs.VLLM_USE_V1 else max_num_batched_tokens)
         self.prompt_mapping_meta = LoRAKernelMeta.make(self.max_loras,
                                                        max_num_prompts,
@@ -80,7 +81,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             scale (float): Scaling factor for the operation
         """
 
-        x = x.view(-1, x.shape[-1])
+        # Ensure contiguity for Triton kernel
+        x = x.contiguous().view(-1, x.shape[-1])
         lora_shrink(
             x,
             lora_a_stacked,

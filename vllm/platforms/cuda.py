@@ -333,6 +333,9 @@ class CudaPlatformBase(Platform):
             elif selected_backend == _Backend.XFORMERS_VLLM_V1:
                 logger.info_once("Using XFormers backend on V1 engine.")
                 return XFORMERS_V1
+            elif selected_backend == _Backend.TORCH_SDPA_VLLM_V1:
+                logger.info_once("Using PyTorch SDPA backend on V1 engine.")
+                return "vllm.v1.attention.backends.torch_sdpa.TorchSDPAAttentionBackend"
 
             from vllm.attention.selector import is_attn_backend_supported
 

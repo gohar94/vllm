@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
 
 import cloudpickle
+import torch
 import torch.nn as nn
 from pydantic import ValidationError
 from tqdm.auto import tqdm
@@ -408,6 +409,780 @@ class LLM:
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
         return self.engine_class.validate_outputs(outputs, RequestOutput)
+
+    def train(
+        self,
+        training_data: Union[dict[str, Any], Sequence[dict[str, Any]]],
+        *,
+        use_tqdm: Union[bool, Callable[..., tqdm]] = True,
+        lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+        # Optional: Individual LoRA configuration parameters
+        # If provided, these will be used to create a LoRARequest
+        lora_path: Optional[str] = None,
+        lora_name: Optional[str] = None,
+        lora_int_id: Optional[int] = None,
+        # Training configuration (for high-level API)
+        num_epochs: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        learning_rate: float = 1e-4,
+        gradient_accumulation_steps: int = 1,
+        warmup_steps: int = 0,
+        scheduler_type: str = "cosine",
+        weight_decay: float = 0.0,
+        # Evaluation configuration
+        eval_data: Optional[Sequence[dict[str, Any]]] = None,
+        eval_steps: Optional[int] = None,
+    ) -> Union[list[dict[str, Any]], dict[str, Any]]:
+        """Train the model on the given training data.
+
+        This method supports two modes:
+        
+        1. **High-level API** (num_epochs + batch_size provided):
+           Handles full training loop, optimizer setup, and optional evaluation.
+           
+        2. **Low-level API** (num_epochs + batch_size NOT provided):
+           Processes a single batch for fine-grained control.
+
+        Args:
+            training_data: Training examples. Each example should be a dictionary.
+                Supported formats (in order of preference):
+
+                1. SFTTrainer format (RECOMMENDED):
+                   {'text': str}  # Full conversation/document text
+
+                2. Chat format (will apply chat template):
+                   {'messages': [{'role': 'user', 'content': '...'},
+                                 {'role': 'assistant', 'content': '...'}]}
+
+                3. Legacy format (for backward compatibility):
+                   {'prompt': str, 'labels': list[int]}
+                   # If labels not provided, uses prompt tokens as labels
+
+                Note: For causal LM training, labels should be the same as 
+                input tokens (next-token prediction). The model shifts internally.
+
+            use_tqdm: If `True`, shows a tqdm progress bar.
+
+            lora_request: LoRA request(s) to use for training.
+
+            lora_path: Path to LoRA adapter weights.
+            lora_name: Name for the LoRA adapter.
+            lora_int_id: Integer ID for the LoRA adapter (must be > 0).
+
+            # High-level API parameters (optional):
+            num_epochs: Number of training epochs. If provided with batch_size,
+                enables high-level training loop.
+            batch_size: Batch size for training. If provided with num_epochs,
+                enables high-level training loop.
+            learning_rate: Learning rate for optimizer (default: 1e-4).
+            gradient_accumulation_steps: Steps to accumulate gradients (default: 1).
+            warmup_steps: Number of warmup steps (default: 0).
+            scheduler_type: "cosine" or "linear" (default: "cosine").
+            weight_decay: Weight decay for optimizer (default: 0.0).
+            eval_data: Optional evaluation data for periodic validation.
+            eval_steps: Run evaluation every N steps (requires eval_data).
+
+        Returns:
+            Low-level API: List of training results per batch.
+            High-level API: Dictionary with training history:
+            {
+                'train_losses': List of training losses per step,
+                'eval_losses': List of evaluation losses,
+                'metrics': Final training metrics
+            }
+
+        Examples:
+            # High-level API (recommended):
+            >>> results = llm.train(
+            ...     training_data,
+            ...     lora_request=lora_request,
+            ...     num_epochs=3,
+            ...     batch_size=4,
+            ...     learning_rate=1e-4,
+            ...     eval_data=eval_data,
+            ...     eval_steps=100,
+            ... )
+            
+            # Low-level API (advanced):
+            >>> for batch in my_batches:
+            ...     results = llm.train(batch, lora_request=lora_request)
+        """
+        if not envs.VLLM_USE_V1:
+            raise NotImplementedError(
+                "Training API is only supported in V1 engine. "
+                "Set VLLM_USE_V1=1 to enable it.")
+
+        # Handle LoRA configuration
+        # User can provide either lora_request OR (lora_path + lora_name + lora_int_id)
+        if lora_request is not None and any(
+            [lora_path, lora_name, lora_int_id]):
+            raise ValueError(
+                "Cannot provide both 'lora_request' and individual LoRA parameters "
+                "(lora_path, lora_name, lora_int_id). Use one or the other.")
+
+        # Create LoRARequest from individual parameters if provided
+        if lora_path is not None:
+            if lora_name is None or lora_int_id is None:
+                raise ValueError(
+                    "If 'lora_path' is provided, must also provide "
+                    "'lora_name' and 'lora_int_id'.")
+            lora_request = LoRARequest(
+                lora_name=lora_name,
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+
+        # Convert single example to list
+        if isinstance(training_data, dict):
+            training_data = [training_data]
+
+        # Validate training data
+        for i, example in enumerate(training_data):
+            has_text = 'text' in example
+            has_messages = 'messages' in example
+            has_prompt = 'prompt' in example or 'prompt_token_ids' in example
+
+            if not (has_text or has_messages or has_prompt):
+                raise ValueError(
+                    f"Training example {i} must have one of: "
+                    "'text' (SFTTrainer format), 'messages' (chat format), "
+                    "or 'prompt'/'prompt_token_ids' (legacy format)")
+
+        # Determine which API mode to use
+        high_level_mode = num_epochs is not None and batch_size is not None
+        
+        if high_level_mode:
+            # High-level API: Handle full training loop
+            return self._train_high_level(
+                training_data=training_data,
+                lora_request=lora_request,
+                num_epochs=num_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=warmup_steps,
+                scheduler_type=scheduler_type,
+                weight_decay=weight_decay,
+                eval_data=eval_data,
+                eval_steps=eval_steps,
+                use_tqdm=use_tqdm,
+            )
+        
+        # Low-level API: Process single batch
+        # Add training requests to the engine and collect their IDs
+        request_ids = self._add_training_requests(
+            training_data=training_data,
+            use_tqdm=use_tqdm,
+            lora_request=lora_request,
+        )
+
+        # Run the engine to process training requests
+        outputs = self._run_engine(use_tqdm=use_tqdm)
+
+        # Collect training losses from outputs
+        # Create a mapping from request_id to output
+        output_map = {output.request_id: output for output in outputs}
+
+        tokenizer = self.get_tokenizer()
+        results = []
+        for req_id, example in zip(request_ids, training_data):
+            # Get the output for this request
+            output = output_map.get(req_id)
+            training_loss = output.training_loss if output and hasattr(
+                output, 'training_loss') else None
+            training_logits = output.training_logits if output and hasattr(
+                output, 'training_logits') else None
+
+            # Calculate num_tokens based on the format
+            if 'text' in example:
+                num_tokens = len(tokenizer.encode(example['text']))
+            elif 'messages' in example:
+                text = tokenizer.apply_chat_template(
+                    example['messages'],
+                    add_generation_prompt=False,
+                    tokenize=False,
+                )
+                num_tokens = len(tokenizer.encode(text))
+            elif 'labels' in example:
+                num_tokens = len(example['labels']) if isinstance(
+                    example['labels'], list) else len(example['labels'])
+            elif 'prompt_token_ids' in example:
+                num_tokens = len(example['prompt_token_ids'])
+            elif 'prompt' in example:
+                num_tokens = len(tokenizer.encode(example['prompt']))
+            else:
+                num_tokens = 0
+
+            results.append({
+                'request_id': req_id,
+                'loss': training_loss,
+                'logits': training_logits,
+                'num_tokens': num_tokens,
+            })
+
+        return results
+
+    def _train_high_level(
+        self,
+        training_data: Sequence[dict[str, Any]],
+        lora_request: Optional[LoRARequest],
+        num_epochs: int,
+        batch_size: int,
+        learning_rate: float,
+        gradient_accumulation_steps: int,
+        warmup_steps: int,
+        scheduler_type: str,
+        weight_decay: float,
+        eval_data: Optional[Sequence[dict[str, Any]]],
+        eval_steps: Optional[int],
+        use_tqdm: bool,
+    ) -> dict[str, Any]:
+        """High-level training API that handles the full training loop.
+        
+        This method:
+        1. Automatically sets up optimizer and scheduler
+        2. Handles epoch loop and batching
+        3. Performs periodic evaluation
+        4. Returns comprehensive training history
+        """
+        import numpy as np
+        
+        # Setup training manager
+        worker = self.llm_engine.model_executor.driver_worker
+        model_runner = worker.model_runner
+        
+        if not hasattr(model_runner, "training_manager"):
+            model_runner._init_training_manager()
+        
+        training_manager = model_runner.training_manager
+        
+        # Calculate training steps
+        import math
+
+        num_steps_per_epoch = math.ceil(len(training_data) / batch_size)
+        total_steps = num_steps_per_epoch * num_epochs
+
+        # ✅ FIX: Account for gradient accumulation when calculating optimizer steps
+        # The scheduler needs to know the actual number of optimizer.step() calls,
+        # not the number of forward/backward passes.
+        # With gradient_accumulation_steps > 1, we do fewer optimizer steps.
+        total_optimizer_steps = math.ceil(total_steps / gradient_accumulation_steps)
+
+        # Setup optimizer and scheduler via make_lora_trainable
+        if lora_request:
+            lora_id = lora_request.lora_int_id
+
+            # Load LoRA into manager if not already loaded
+            # Use add_adapter to load without processing data
+            if lora_id not in training_manager.lora_manager.list_adapters():
+                training_manager.lora_manager.add_adapter(lora_request)
+
+            # Now setup optimizer and scheduler
+            training_manager.make_lora_trainable(
+                lora_id=lora_id,
+                learning_rate=learning_rate,
+                num_training_steps=total_optimizer_steps,  # ✅ FIX: Use optimizer steps, not batch steps
+                num_warmup_steps=warmup_steps,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                weight_decay=weight_decay,
+                scheduler_type=scheduler_type,
+            )
+            
+            # Freeze base model
+            training_manager.freeze_base_model(verbose=False)
+        
+        # Training history
+        train_losses = []
+        eval_losses = []
+        global_step = 0
+
+        # Helper to count valid label tokens for weighting (matches masking logic)
+        tokenizer = self.get_tokenizer()
+        def _count_valid_labels(example: dict[str, Any]) -> int:
+            # Estimate number of valid labels consistent with PEFT masking
+            if 'text' in example:
+                text = example['text']
+                full_len = len(tokenizer.encode(text, add_special_tokens=True))
+                instr_len = 0
+                if "### Response:" in text:
+                    prefix = text[: text.find("### Response:") + len("### Response:")]
+                    instr_len = len(tokenizer.encode(prefix, add_special_tokens=False))
+                # Valid labels exclude instruction tokens and account for shift by one
+                return max(0, full_len - instr_len - 1)
+            # Chat format
+            if 'messages' in example:
+                text = tokenizer.apply_chat_template(
+                    example['messages'], add_generation_prompt=False, tokenize=False)
+                # For chat, assume specials already applied by template; no instruction masking
+                full_len = len(tokenizer.encode(text, add_special_tokens=False))
+                return max(0, full_len - 1)
+            # Legacy prompt/labels
+            if 'labels' in example:
+                labels = example['labels']
+                if isinstance(labels, list):
+                    # Count non -100 labels, then account for shift
+                    valid = sum(1 for v in labels if v != -100)
+                    return max(0, valid - 1)
+                return 0
+            if 'prompt_token_ids' in example:
+                return max(0, len(example['prompt_token_ids']) - 1)
+            if 'prompt' in example:
+                full_len = len(tokenizer.encode(example['prompt'], add_special_tokens=True))
+                return max(0, full_len - 1)
+            return 0
+        
+        # ✅ PEFT MATCHING: Evaluate BEFORE training starts (initial baseline)
+        if eval_data:
+            print("\n" + "="*70)
+            print("[VLLM/INIT] Initial Evaluation (before training)")
+            print("="*70)
+            model_runner.model.eval()
+            with torch.no_grad():
+                eval_batch = eval_data
+                initial_eval_results = self.eval(
+                    eval_batch,
+                    lora_request=lora_request,
+                    use_tqdm=False,
+                )
+            model_runner.model.train()
+            
+            # Weighted by valid labels
+            initial_eval_losses_and_weights = [
+                (r['loss'], _count_valid_labels(ex))
+                for r, ex in zip(initial_eval_results, eval_batch)
+                if r['loss'] is not None
+            ]
+            if initial_eval_losses_and_weights:
+                total_w = sum(w for _, w in initial_eval_losses_and_weights) or 1
+                initial_eval_loss = sum(l * w for l, w in initial_eval_losses_and_weights) / total_w
+            else:
+                initial_eval_loss = 0.0
+            
+            print(f"[VLLM/INIT] Initial eval loss (untrained): {initial_eval_loss:.4f}")
+            print("="*70 + "\n")
+
+            # ✅ FIX: Reset batch counter after initial eval so training batches start at 0
+            worker = self.llm_engine.model_executor.driver_worker
+            model_runner = worker.model_runner
+            if hasattr(model_runner, '_vllm_batch_counter'):
+                print(f"[VLLM/INIT] Resetting batch counter (was {model_runner._vllm_batch_counter}) for training")
+                model_runner._vllm_batch_counter = 0
+
+        # Progress bar setup
+        if use_tqdm:
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            pbar = tqdm_func(total=total_steps, desc="Training")
+        
+        # Epoch loop
+        # ✅ FIX: Implement proper gradient accumulation (tracked locally)
+        accumulation_counter = 0
+        accumulated_losses = []
+        
+        # ✅ PEFT MATCHING: Add loss smoothing window (matching PEFT logging_steps=25)
+        LOGGING_STEPS = 25
+        loss_smoothing_window = []
+
+        # ============================================================================
+        print("\n" + "="*80)
+        print("🚀 VLLM TRAINING STARTING NOW - ALL LOGS AFTER THIS ARE ACTUAL TRAINING")
+        print("="*80)
+        print(f"Configuration:")
+        print(f"  - Training samples: {len(training_data)}")
+        print(f"  - Batch size: {batch_size}")
+        print(f"  - Gradient accumulation: {gradient_accumulation_steps}")
+        print(f"  - Num epochs: {num_epochs}")
+        print(f"  - Expected batches per epoch: {num_steps_per_epoch}")
+        print(f"  - Expected optimizer steps per epoch: {num_steps_per_epoch // gradient_accumulation_steps}")
+        print(f"  - Total optimizer steps: {total_optimizer_steps}")
+        print("="*80 + "\n")
+        # ============================================================================
+
+        for epoch in range(num_epochs):
+            epoch_losses = []
+            
+            # ✅ PEFT MATCHING: Shuffle training data using PyTorch's generator
+            # CRITICAL: Use torch.randperm instead of random.shuffle to match PEFT's RandomSampler
+            # PEFT's RandomSampler uses torch.Generator which has a different PRNG than Python's random
+
+            # Create indices and shuffle them using torch (matching RandomSampler behavior)
+            # RandomSampler uses: torch.randperm(n, generator=self.generator).tolist()
+            generator = torch.Generator().manual_seed(42 + epoch)  # Different seed per epoch
+            indices = torch.randperm(len(training_data), generator=generator).tolist()
+            epoch_training_data = [training_data[i] for i in indices]
+
+            print(f"\n[VLLM/SHUFFLE] Epoch {epoch}: Using {len(epoch_training_data)} training samples")
+            print(f"[VLLM/SHUFFLE] Shuffled with torch.randperm (seed={42 + epoch}) to match PEFT RandomSampler")
+            
+            # Batch the data
+            for i in range(0, len(epoch_training_data), batch_size):
+                batch = epoch_training_data[i:i + batch_size]
+                
+                # Determine if this is the last batch of accumulation
+                is_last_accumulation_step = (accumulation_counter + 1) >= gradient_accumulation_steps
+                is_last_batch_of_epoch = (i + batch_size) >= len(epoch_training_data)
+                should_step = is_last_accumulation_step or is_last_batch_of_epoch
+
+                if global_step <= 3:
+                    print(f"[HIGH_LEVEL] Batch {i//batch_size}, accum_counter={accumulation_counter}, should_step={should_step}")
+                
+                # ✅ FIX: Directly call low-level request processing
+                # DO NOT recursively call self.train() as it triggers make_lora_trainable() on every batch!
+                request_ids = self._add_training_requests(
+                    training_data=batch,
+                    use_tqdm=False,
+                    lora_request=lora_request,
+                )
+                
+                # Run the engine to process training requests
+                if global_step <= 3:
+                    print(f"[HIGH_LEVEL] Before _run_engine, num_requests={len(request_ids)}")
+                outputs = self._run_engine(use_tqdm=False)
+                if global_step <= 3:
+                    print(f"[HIGH_LEVEL] After _run_engine, num_outputs={len(outputs)}")
+                
+                # Process outputs (same as low-level train() method)
+                output_map = {output.request_id: output for output in outputs}
+                batch_results = []
+                for req_id, example in zip(request_ids, batch):
+                    output = output_map.get(req_id)
+                    training_loss = output.training_loss if output and hasattr(
+                        output, 'training_loss') else None
+                    batch_results.append({
+                        'request_id': req_id,
+                        'loss': training_loss,
+                    })
+                
+                # Extract loss
+                # Weighted by valid label tokens per sample
+                losses_and_weights = [
+                    (r['loss'], _count_valid_labels(ex))
+                    for r, ex in zip(batch_results, batch)
+                    if r['loss'] is not None
+                ]
+                if losses_and_weights:
+                    total_w = sum(w for _, w in losses_and_weights) or 1
+                    batch_loss = sum(l * w for l, w in losses_and_weights) / total_w
+                else:
+                    batch_loss = 0.0
+                epoch_losses.append(batch_loss)
+                accumulated_losses.append(batch_loss)
+                accumulation_counter += 1
+                
+                # ✅ FIX: Only log and increment global_step when optimizer steps
+                if should_step:
+                    # Average loss over accumulated batches
+                    avg_accumulated_loss = np.mean(accumulated_losses) if accumulated_losses else batch_loss
+                    
+                    # ✅ PEFT MATCHING: Add to smoothing window (matching PEFT logging_steps)
+                    loss_smoothing_window.append(avg_accumulated_loss)
+                    
+                    # Only log when we have accumulated LOGGING_STEPS worth of losses
+                    # This matches PEFT's logging_steps=25 behavior
+                    if len(loss_smoothing_window) >= LOGGING_STEPS or is_last_batch_of_epoch:
+                        smoothed_loss = np.mean(loss_smoothing_window)
+                        
+                        # ✅ FIX: Only append to train_losses when we actually log (every 25 steps)
+                        # This matches PEFT which only reports loss every logging_steps=25
+                        train_losses.append({
+                            "step": global_step,
+                            "epoch": epoch,
+                            "loss": smoothed_loss,
+                        })
+                        
+                        # [VLLM/LOSS] Print smoothed loss (matching PEFT's logging behavior)
+                        print(f"[VLLM/LOSS] Step {global_step}, Epoch {epoch}, Loss: {smoothed_loss:.6f} (smoothed over {len(loss_smoothing_window)} steps)")
+                        
+                        # Clear smoothing window
+                        loss_smoothing_window = []
+                    # ✅ FIX: Do NOT append to train_losses when still accumulating
+                    # Previously this was recording every step, making plots messy
+
+                    # [VLLM/DEBUG] Log LR and simple integrity checks around problematic window
+                    try:
+                        if 120 <= global_step <= 200:
+                            lr = None
+                            if hasattr(training_manager, 'optimizer') and training_manager.optimizer is not None:
+                                lr = training_manager.optimizer.param_groups[0]['lr']
+                            print(f"[VLLM/DEBUG] Global step={global_step} lr={lr}")
+                    except Exception as _:
+                        pass
+                    
+                    # Periodic evaluation
+                    if eval_data and eval_steps and global_step > 0 and global_step % eval_steps == 0:
+                        # Evaluate entire eval set in eval mode without grad
+                        model_runner.model.eval()
+                        with torch.no_grad():
+                            eval_batch = eval_data
+                            eval_results = self.eval(
+                                eval_batch,
+                                lora_request=lora_request,
+                                use_tqdm=False,
+                            )
+                        model_runner.model.train()
+
+                        # Weighted by valid labels
+                        eval_losses_and_weights = [
+                            (r['loss'], _count_valid_labels(ex))
+                            for r, ex in zip(eval_results, eval_batch)
+                            if r['loss'] is not None
+                        ]
+                        if eval_losses_and_weights:
+                            total_w = sum(w for _, w in eval_losses_and_weights) or 1
+                            eval_loss = sum(l * w for l, w in eval_losses_and_weights) / total_w
+                        else:
+                            eval_loss = 0.0
+                        eval_losses.append({
+                            "step": global_step,
+                            "epoch": epoch,
+                            "eval_loss": eval_loss,
+                        })
+                        print(f"[VLLM/LOSS] Step {global_step}, Eval Loss: {eval_loss:.6f}")
+                    
+                    # Reset accumulation
+                    global_step += 1
+                    accumulation_counter = 0
+                    accumulated_losses = []
+                    
+                    if use_tqdm:
+                        pbar.update(1)
+                        # Show smoothed loss in progress bar if available, else avg loss
+                        display_loss = smoothed_loss if len(loss_smoothing_window) == 0 else avg_accumulated_loss
+                        pbar.set_postfix({"loss": f"{display_loss:.4f}"})
+            
+            # End of epoch evaluation
+            if eval_data:
+                # Evaluate entire eval set in eval mode without grad
+                model_runner.model.eval()
+                with torch.no_grad():
+                    eval_batch = eval_data
+                    eval_results = self.eval(
+                        eval_batch,
+                        lora_request=lora_request,
+                        use_tqdm=False,
+                    )
+                model_runner.model.train()
+
+                # Weighted by valid labels (like PEFT)
+                eval_losses_and_weights = [
+                    (r['loss'], _count_valid_labels(ex))
+                    for r, ex in zip(eval_results, eval_batch)
+                    if r['loss'] is not None
+                ]
+                if eval_losses_and_weights:
+                    total_w = sum(w for _, w in eval_losses_and_weights) or 1
+                    eval_loss = sum(l * w for l, w in eval_losses_and_weights) / total_w
+                else:
+                    eval_loss = 0.0
+
+                if epoch == 0:  # Print only for first epoch
+                    unweighted = [r['loss'] for r in eval_results if r['loss'] is not None]
+                    unweighted_mean = np.mean(unweighted) if unweighted else 0
+                    print(f"\n[VLLM/EVAL DEBUG] End of Epoch {epoch}")
+                    print(f"[VLLM/EVAL DEBUG] Num eval samples: {len(eval_batch)}")
+                    print(f"[VLLM/EVAL DEBUG] Num eval results: {len(eval_results)}")
+                    print(f"[VLLM/EVAL DEBUG] Unweighted mean loss: {unweighted_mean:.6f}")
+                    print(f"[VLLM/EVAL DEBUG] ✅ WEIGHTED mean loss (valid labels): {eval_loss:.6f}\n")
+                eval_losses.append({
+                    "step": global_step,
+                    "epoch": epoch,
+                    "eval_loss": eval_loss,
+                })
+                print(f"[VLLM/LOSS] End of Epoch {epoch}, Eval Loss: {eval_loss:.6f}")
+        
+        if use_tqdm:
+            pbar.close()
+        
+        # Return comprehensive results
+        return {
+            'train_losses': train_losses,
+            'eval_losses': eval_losses,
+            'metrics': {
+                'total_steps': global_step,
+                'num_epochs': num_epochs,
+                'final_train_loss': train_losses[-1]['loss'] if train_losses else None,
+                'final_eval_loss': eval_losses[-1]['eval_loss'] if eval_losses else None,
+            }
+        }
+
+    def eval(
+        self,
+        eval_data: Union[dict[str, Any], Sequence[dict[str, Any]]],
+        *,
+        use_tqdm: Union[bool, Callable[..., tqdm]] = True,
+        lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+        # Optional: Individual LoRA configuration parameters
+        lora_path: Optional[str] = None,
+        lora_name: Optional[str] = None,
+        lora_int_id: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Evaluate the model on the given data (without gradient computation).
+
+        This method is similar to train() but skips the backward pass,
+        making it suitable for validation/evaluation during training.
+
+        Args:
+            eval_data: Evaluation examples in the same format as train().
+                Each example should be a dictionary with one of:
+                - {'text': str}  # SFTTrainer format
+                - {'messages': list}  # Chat format
+                - {'prompt': str, 'labels': list[int]}  # Legacy format
+
+            use_tqdm: If `True`, shows a tqdm progress bar.
+
+            lora_request: LoRA request(s) to use for evaluation.
+
+            lora_path: Path to LoRA adapter weights.
+            lora_name: Name for the LoRA adapter.
+            lora_int_id: Integer ID for the LoRA adapter (must be > 0).
+
+        Returns:
+            A list of evaluation results, each containing:
+            {
+                'request_id': str,
+                'loss': float,  # Evaluation loss value
+                'logits': torch.Tensor,  # Model logits
+                'num_tokens': int,
+            }
+
+        Example:
+            >>> llm = LLM(model="meta-llama/Llama-3.2-1B-Instruct")
+            >>> eval_data = [{'text': "User: Hello\\nAssistant: Hi!"}]
+            >>> results = llm.eval(
+            ...     eval_data,
+            ...     lora_path="/path/to/lora/adapter",
+            ...     lora_name="my_adapter",
+            ...     lora_int_id=1
+            ... )
+        """
+        if not envs.VLLM_USE_V1:
+            raise NotImplementedError(
+                "Evaluation API is only supported in V1 engine. "
+                "Set VLLM_USE_V1=1 to enable it.")
+
+        # Handle LoRA configuration (same as train())
+        if lora_request is not None and any(
+            [lora_path, lora_name, lora_int_id]):
+            raise ValueError(
+                "Cannot provide both 'lora_request' and individual LoRA parameters "
+                "(lora_path, lora_name, lora_int_id). Use one or the other.")
+
+        # Create LoRARequest from individual parameters if provided
+        if lora_path is not None:
+            if lora_name is None or lora_int_id is None:
+                raise ValueError(
+                    "If 'lora_path' is provided, must also provide "
+                    "'lora_name' and 'lora_int_id'.")
+            lora_request = LoRARequest(
+                lora_name=lora_name,
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+
+        # Convert single example to list
+        if isinstance(eval_data, dict):
+            eval_data = [eval_data]
+
+        # Validate eval data (same format as training data)
+        for i, example in enumerate(eval_data):
+            has_text = 'text' in example
+            has_messages = 'messages' in example
+            has_prompt = 'prompt' in example or 'prompt_token_ids' in example
+
+            if not (has_text or has_messages or has_prompt):
+                raise ValueError(
+                    f"Evaluation example {i} must have one of: "
+                    "'text' (SFTTrainer format), 'messages' (chat format), "
+                    "or 'prompt'/'prompt_token_ids' (legacy format)")
+
+        # CRITICAL FIX: Ensure LoRA weights are synced to stacked tensors for evaluation
+        # After training updates Parameters, we need to copy them to stacked tensors
+        # so that evaluation (which uses inference path) sees the updated weights
+        if lora_request:
+            worker = self.llm_engine.model_executor.driver_worker
+            model_runner = worker.model_runner
+
+            if hasattr(model_runner, "training_manager"):
+                training_manager = model_runner.training_manager
+                lora_id = lora_request.lora_int_id
+
+                # ✅ FIX: Do NOT reload LoRA from disk during eval - it overwrites trained weights!
+                # The LoRA is already in memory from training and stacked tensors are updated
+                # Only add adapter if it truly doesn't exist (first eval before any training)
+                if lora_id not in training_manager.lora_manager.list_adapters():
+                    # Check if this is actually the first eval - if training has happened, skip reload
+                    if hasattr(training_manager, 'training_step') and training_manager.training_step > 0:
+                        # LoRA has been trained - stacked tensors are already up to date
+                        # Do NOT reload from disk as it would overwrite trained weights
+                        pass
+                    else:
+                        # First evaluation before training - safe to load from disk
+                        training_manager.lora_manager.add_adapter(lora_request)
+
+        # Add evaluation requests to the engine (same as training but with is_eval=True)
+        request_ids = self._add_training_requests(
+            training_data=eval_data,
+            use_tqdm=use_tqdm,
+            lora_request=lora_request,
+            is_eval=True,  # Mark as evaluation
+        )
+
+            # LoRA is ready for evaluation (stacked tensors are trained directly)
+
+        # Run the engine to process evaluation requests
+        outputs = self._run_engine(use_tqdm=use_tqdm)
+
+        # Collect evaluation resul
+        output_map = {output.request_id: output for output in outputs}
+
+        # [VLLM/EVAL FIX] Get valid token counts from model runner
+        worker = self.llm_engine.model_executor.driver_worker
+        model_runner = worker.model_runner
+        valid_tokens_map = {}
+        if hasattr(model_runner, '_vllm_eval_valid_tokens'):
+            valid_tokens_map = model_runner._vllm_eval_valid_tokens.copy()
+            # Clear for next eval
+            model_runner._vllm_eval_valid_tokens = {}
+
+        tokenizer = self.get_tokenizer()
+        results = []
+        for req_id, example in zip(request_ids, eval_data):
+            # Get the output for this request
+            output = output_map.get(req_id)
+            eval_loss = output.training_loss if output and hasattr(
+                output, 'training_loss') else None
+            eval_logits = output.training_logits if output and hasattr(
+                output, 'training_logits') else None
+
+            # [VLLM/EVAL FIX] Use valid token count if available, otherwise calculate total
+            if req_id in valid_tokens_map:
+                num_tokens = valid_tokens_map[req_id]
+            elif 'text' in example:
+                num_tokens = len(tokenizer.encode(example['text']))
+            elif 'messages' in example:
+                text = tokenizer.apply_chat_template(
+                    example['messages'],
+                    add_generation_prompt=False,
+                    tokenize=False,
+                )
+                num_tokens = len(tokenizer.encode(text))
+            elif 'labels' in example:
+                num_tokens = len(example['labels']) if isinstance(
+                    example['labels'], list) else len(example['labels'])
+            elif 'prompt_token_ids' in example:
+                num_tokens = len(example['prompt_token_ids'])
+            elif 'prompt' in example:
+                num_tokens = len(tokenizer.encode(example['prompt']))
+            else:
+                num_tokens = 0
+
+            results.append({
+                'request_id': req_id,
+                'loss': eval_loss,
+                'logits': eval_logits,
+                'num_tokens': num_tokens,  # Now contains VALID token count
+            })
+
+        return results
 
     def _get_modality_specific_lora_reqs(
             self, prompts: Union[PromptType, Sequence[PromptType]],
@@ -1579,6 +2354,317 @@ class LLM:
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
         )
+
+    def _add_training_requests(
+        self,
+        training_data: Sequence[dict[str, Any]],
+        *,
+        use_tqdm: Union[bool, Callable[..., tqdm]] = True,
+        lora_request: LoRARequest = None,
+        is_eval: bool = False,
+    ) -> list[str]:
+        """Validate and add training requests to the engine.
+
+        Processes training data in SFTTrainer-compatible format.
+
+        Args:
+            training_data: Sequence of training/evaluation examples
+            use_tqdm: Whether to show progress bar
+            lora_request: Optional LoRA request
+            is_eval: If True, marks as evaluation (no backward pass)
+
+        Returns:
+            List of request IDs for the added training requests.
+        """
+        from vllm.v1.request import TrainingConfig
+
+        # Add requests to the engine
+        it = training_data
+        if use_tqdm:
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            it = tqdm_func(it, desc="Adding training requests")
+
+        tokenizer = self.get_tokenizer()
+
+        # ✅ PEFT MATCHING: Set pad token if not already set (required for padding)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # ✅ DYNAMIC PADDING: First pass to find max length in this batch
+        # This matches PEFT's behavior where padding is based on actual batch max, not fixed max_model_len
+        training_data_list = list(training_data)  # Ensure it's a list for multiple passes
+        batch_max_length = 0
+
+        for example in training_data_list:
+            # Get text from different formats
+            if 'text' in example:
+                text = example['text']
+                # Tokenize without padding OR truncation to get ACTUAL length
+                # Use add_special_tokens=True to match PEFT full-text tokenization
+                # Remove truncation in first pass! We're finding the max, not limiting it
+                temp_tokens = tokenizer.encode(text, add_special_tokens=True)
+                batch_max_length = max(batch_max_length, len(temp_tokens))
+            elif 'messages' in example:
+                text = tokenizer.apply_chat_template(
+                    example['messages'],
+                    add_generation_prompt=False,
+                    tokenize=False,
+                )
+                temp_tokens = tokenizer.encode(text, add_special_tokens=False)
+                batch_max_length = max(batch_max_length, len(temp_tokens))
+            elif 'prompt_token_ids' in example:
+                batch_max_length = max(batch_max_length, len(example['prompt_token_ids']))
+            elif 'prompt' in example:
+                prompt = example['prompt']
+                if isinstance(prompt, str):
+                    temp_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+                    batch_max_length = max(batch_max_length, len(temp_tokens))
+
+        # Clamp to PEFT's MAX_LENGTH (512) for identical truncation behavior
+        batch_max_length = min(batch_max_length, 512) if batch_max_length > 0 else 512
+
+        # Log the dynamic padding decision
+        if not hasattr(self, '_dynamic_padding_logged'):
+            self._dynamic_padding_logged = 0
+        if self._dynamic_padding_logged < 3:
+            print(f"[VLLM/DYNAMIC_PADDING] Batch size: {len(training_data_list)}, max_length in batch: {batch_max_length}")
+            print(f"[VLLM/DYNAMIC_PADDING] Using batch max instead of fixed max_model_len=512 (PEFT matching)")
+            self._dynamic_padding_logged += 1
+
+        request_ids = []
+
+        for i, example in enumerate(training_data_list):
+            # Process example based on format
+            # Format 1: 'text' field (SFTTrainer standard)
+            if 'text' in example:
+                text = example['text']
+                # ✅ DYNAMIC PADDING: Use batch max length (clamped) to match PEFT
+                # Encode full text with add_special_tokens=True (PEFT behavior)
+                prompt_token_ids = tokenizer.encode(
+                    text,
+                    padding='max_length',
+                    max_length=batch_max_length,
+                    truncation=True,
+                    add_special_tokens=True
+                )
+                # Old (fixed padding): max_length=512
+                
+                # FIXED: Implement proper instruction masking like PEFT
+                labels = torch.tensor(prompt_token_ids, dtype=torch.long, device='cpu')
+                
+                # ✅ PEFT MATCHING: Mask padding tokens with -100 (ignored in loss)
+                # Find the padding token ID and mask all padding tokens in labels
+                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                labels[labels == pad_token_id] = -100
+                
+                # Create prompt dict early (needed for skipped samples)
+                prompt = {'prompt_token_ids': prompt_token_ids}
+                
+                # Parse Alpaca format to identify instruction vs response
+                instruction_tokens_count = 0
+                response_tokens_count = len(prompt_token_ids)
+                
+                if "### Response:" in text:
+                    # Find where the response starts
+                    response_start_text = "### Response:"
+                    response_start_pos = text.find(response_start_text)
+                    
+                    if response_start_pos != -1:
+                        # Tokenize text up to response start
+                        # Use add_special_tokens=False to match PEFT's boundary computation
+                        instruction_text = text[:response_start_pos + len(response_start_text)]
+                        instruction_tokens = tokenizer.encode(instruction_text, add_special_tokens=False)
+                        instruction_tokens_count = len(instruction_tokens)
+                        response_tokens_count = len(prompt_token_ids) - instruction_tokens_count
+                        
+                        # [VLLM/EVAL DEBUG] Check response boundary for first few samples
+                        if is_eval and len(request_ids) < 5:
+                            print(f"[VLLM/EVAL DEBUG] Sample {len(request_ids)} - Response boundary:")
+                            print(f"[VLLM/EVAL DEBUG]   Found '### Response:' at position {response_start_pos}")
+                            print(f"[VLLM/EVAL DEBUG]   Text around marker: ...{text[max(0,response_start_pos-15):response_start_pos+35]}...")
+                            print(f"[VLLM/EVAL DEBUG]   instruction_tokens: {instruction_tokens_count}, response_tokens: {response_tokens_count}")
+                        
+                        # CRITICAL FIX: Skip samples with insufficient response tokens
+                        if response_tokens_count < 2:  # Need at least 2 tokens for loss computation (due to shifting)
+                            if is_eval and len(request_ids) < 10:
+                                print(f"[VLLM/EVAL DEBUG] ⚠️  Sample {len(request_ids)} SKIPPED: response_tokens={response_tokens_count} < 2")
+                                print(f"[VLLM/EVAL DEBUG]     Total tokens={len(prompt_token_ids)}, instruction_tokens={instruction_tokens_count}")
+                            # Still need to add a request to avoid scheduler issues
+                            training_config = TrainingConfig(labels=None)
+                            request_id = self._add_training_request(
+                                prompt=prompt,
+                                training_config=training_config,
+                                lora_request=lora_request
+                            )
+                            request_ids.append(request_id)
+                            continue
+                        
+                        # Mask instruction tokens with -100 (like PEFT does)
+                        labels[:len(instruction_tokens)] = -100
+                        
+                        # [VLLM/EVAL DEBUG] Log label masking for first few eval samples
+                        if is_eval and len(request_ids) < 5:
+                            num_valid = (labels != -100).sum().item()
+                            num_masked = (labels == -100).sum().item()
+                            # Find where masking ends (first non--100 token)
+                            mask_end_idx = 0
+                            for i, label in enumerate(labels):
+                                if label != -100:
+                                    mask_end_idx = i
+                                    break
+                            print(f"[VLLM/EVAL DEBUG] Sample {len(request_ids)}: total_tokens={len(labels)}, valid={num_valid}, masked={num_masked}, mask_pct={100*num_masked/len(labels):.1f}%")
+                            print(f"[VLLM/EVAL DEBUG]   Masking ends at index {mask_end_idx}, instruction_tokens={len(instruction_tokens)}")
+                            print(f"[VLLM/EVAL DEBUG]   First 10 labels: {labels[:10].tolist()}")
+                            print(f"[VLLM/EVAL DEBUG]   Labels around mask boundary [{mask_end_idx-2}:{mask_end_idx+5}]: {labels[max(0,mask_end_idx-2):mask_end_idx+5].tolist()}")
+
+            # Format 2: 'messages' field (chat format)
+            elif 'messages' in example:
+                # Apply chat template to convert to text
+                text = tokenizer.apply_chat_template(
+                    example['messages'],
+                    add_generation_prompt=False,
+                    tokenize=False,
+                )
+                # ✅ DYNAMIC PADDING: Use batch max length
+                # Chat template may include specials; keep add_special_tokens=False for safety
+                prompt_token_ids = tokenizer.encode(
+                    text,
+                    padding='max_length',
+                    max_length=batch_max_length,
+                    truncation=True,
+                    add_special_tokens=False
+                )
+                labels = torch.tensor(prompt_token_ids,
+                                      dtype=torch.long,
+                                      device='cpu')
+                # Mask padding tokens
+                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                labels[labels == pad_token_id] = -100
+                prompt = {'prompt_token_ids': prompt_token_ids}
+
+            # Format 3: Legacy 'prompt' + 'labels' format
+            elif 'prompt' in example or 'prompt_token_ids' in example:
+                if 'prompt' in example:
+                    prompt = example['prompt']
+                    prompt_token_ids = tokenizer.encode(prompt) if isinstance(
+                        prompt, str) else None
+                else:
+                    prompt = {'prompt_token_ids': example['prompt_token_ids']}
+                    prompt_token_ids = example['prompt_token_ids']
+
+                # If labels provided, use them; otherwise use prompt tokens
+                if 'labels' in example:
+                    labels = example['labels']
+                    if isinstance(labels, list):
+                        labels = torch.tensor(labels,
+                                              dtype=torch.long,
+                                              device='cpu')
+                else:
+                    # Default: labels = input tokens (causal LM standard)
+                    if prompt_token_ids is None:
+                        prompt_token_ids = example['prompt_token_ids']
+                    labels = torch.tensor(prompt_token_ids,
+                                          dtype=torch.long,
+                                          device='cpu')
+            else:
+                raise ValueError(f"Training example {i} has invalid format")
+
+            # Create training config with LoRA request
+            training_config = TrainingConfig(
+                labels=labels,
+                compute_loss=True,
+                loss_fn="cross_entropy",
+                lora_request=lora_request,
+                is_eval=is_eval,
+            )
+
+            # Add training request and collect its ID
+            req_id = self._add_training_request(
+                prompt=prompt,
+                training_config=training_config,
+                lora_request=lora_request,
+            )
+            request_ids.append(req_id)
+
+        return request_ids
+
+    def _add_training_request(
+        self,
+        prompt: PromptType,
+        training_config,  # TrainingConfig - imported inside function
+        lora_request: Optional[LoRARequest] = None,
+    ) -> str:
+        """Add a single training request to the engine.
+
+        Returns:
+            The request ID of the added training request.
+        """
+        from vllm.v1.request import Request
+
+        request_id = str(next(self.request_counter))
+
+        # For V1 engine, we need to create a Request object directly
+        # and add it to the scheduler
+        if not envs.VLLM_USE_V1:
+            raise NotImplementedError("Training only supported in V1 engine")
+
+        # Tokenize the prompt if needed
+        if isinstance(prompt, str):
+            tokenizer = self.get_tokenizer()
+            prompt_token_ids = tokenizer.encode(prompt)
+        elif isinstance(prompt, dict):
+            if 'prompt_token_ids' in prompt:
+                prompt_token_ids = prompt['prompt_token_ids']
+            elif 'prompt' in prompt:
+                tokenizer = self.get_tokenizer()
+                prompt_token_ids = tokenizer.encode(prompt['prompt'])
+            else:
+                raise ValueError(
+                    "Prompt dict must have 'prompt' or 'prompt_token_ids'")
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
+
+        # Get EOS token ID
+        tokenizer = self.get_tokenizer()
+        eos_token_id = tokenizer.eos_token_id
+
+        # Create the training request
+        training_request = Request(
+            request_id=request_id,
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=None,
+            pooling_params=None,
+            eos_token_id=eos_token_id,
+            is_training=True,
+            training_config=training_config,
+            lora_request=lora_request,
+        )
+
+        # Add to output processor first (needed for get_num_unfinished_requests)
+        prompt_str = prompt if isinstance(prompt,
+                                          str) else str(prompt_token_ids)
+        self.llm_engine.output_processor.add_request(training_request,
+                                                     prompt_str, None, 0)
+
+        # Then add to scheduler for execution
+        # For V1, the engine has engine_core which contains the actual EngineCore
+        engine_core_client = self.llm_engine.engine_core
+
+        # Access the actual EngineCore (unwrap from InprocClient)
+        if hasattr(engine_core_client, 'engine_core'):
+            # InprocClient case
+            actual_engine_core = engine_core_client.engine_core
+            actual_engine_core.scheduler.add_request(training_request)
+        elif hasattr(engine_core_client, 'scheduler'):
+            # Direct EngineCore access
+            engine_core_client.scheduler.add_request(training_request)
+        else:
+            # For async/multiprocess case
+            raise NotImplementedError(
+                "Training with async/multiprocess engine not yet supported. "
+                "Please use the synchronous LLM class with V1 engine.")
+
+        return request_id
 
     def _run_engine(
         self,

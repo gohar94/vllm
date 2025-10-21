@@ -177,10 +177,28 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """PyTorch-native implementation equivalent to forward()."""
         orig_dtype = x.dtype
+
+        # CRITICAL FIX: Create a grad_fn by adding a zero tensor (identity operation that creates computation graph)
+        # This is needed because operations on leaf tensors don't track gradients
+        if x.requires_grad and x.grad_fn is None:
+            x = x + torch.zeros_like(x, requires_grad=False)  # This creates a grad_fn while being numerically identical
+
+        # CRITICAL: Preserve requires_grad through dtype conversion
+        # .to() doesn't preserve requires_grad for leaf tensors, so we need to explicitly handle it
+        requires_grad = x.requires_grad
         x = x.to(torch.float32)
+        if requires_grad and not x.requires_grad:
+            x.requires_grad_(True)
+
         if residual is not None:
-            x = x + residual.to(torch.float32)
+            residual_requires_grad = residual.requires_grad
+            residual_float = residual.to(torch.float32)
+            if residual_requires_grad and not residual_float.requires_grad:
+                residual_float.requires_grad_(True)
+            x = x + residual_float
             residual = x.to(orig_dtype)
+            if residual.requires_grad and not residual.requires_grad:
+                residual.requires_grad_(True)
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
@@ -197,12 +215,34 @@ class RMSNorm(CustomOp):
 
             x_var = x[:, :, :self.variance_size_override]
 
+        # CRITICAL: Operations on leaf tensors (no grad_fn) don't automatically track gradients
+        # We need to ensure variance computation preserves requires_grad
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+        if x.requires_grad and not variance.requires_grad:
+            variance.requires_grad_(True)
 
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        scale = torch.rsqrt(variance + self.variance_epsilon)
+        if variance.requires_grad and not scale.requires_grad:
+            scale.requires_grad_(True)
+
+        x_prev_requires_grad = x.requires_grad
+        x = x * scale
+        if (x_prev_requires_grad or scale.requires_grad) and not x.requires_grad:
+            x.requires_grad_(True)
+
+        # Preserve requires_grad through dtype conversion back to original
+        x_requires_grad = x.requires_grad
         x = x.to(orig_dtype)
+        if x_requires_grad and not x.requires_grad:
+            x.requires_grad_(True)
+
         if self.has_weight:
+            x_prev_requires_grad = x.requires_grad
             x = x * self.weight
+            # CRITICAL: Multiplication of two leaf tensors doesn't track gradients automatically
+            if (x_prev_requires_grad or self.weight.requires_grad) and not x.requires_grad:
+                x.requires_grad_(True)
+
         if residual is None:
             return x
         else:
@@ -214,6 +254,15 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+
+        # TRAINING SUPPORT: Use native implementation when gradients are enabled
+        # The custom CUDA ops don't preserve gradient chains
+        grad_enabled = torch.is_grad_enabled()
+        x_requires_grad = x.requires_grad
+        residual_requires_grad = residual is not None and residual.requires_grad
+
+        if grad_enabled and (x_requires_grad or residual_requires_grad):
             return self.forward_native(x, residual)
 
         add_residual = residual is not None

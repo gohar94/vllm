@@ -118,6 +118,7 @@ class LlamaAttention(nn.Module):
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx  # ✅ Store for logging
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -210,11 +211,45 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # ✅ FORWARD PASS TRACING: Log input (layer 0 only, first 5 calls)
+        if self.layer_idx == 0 and not hasattr(self, '_trace_count'):
+            self._trace_count = 0
+        if self.layer_idx == 0 and self._trace_count < 5:
+            print(f"[vLLM/FWD/L{self.layer_idx}] Input hidden_states: shape={hidden_states.shape}, "
+                  f"mean={hidden_states.mean().item():.6f}, std={hidden_states.std().item():.6f}, "
+                  f"norm={hidden_states.norm().item():.6f}")
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # ✅ FORWARD PASS TRACING: Log Q/K/V outputs (layer 0 only, first 5 calls)
+        if self.layer_idx == 0 and self._trace_count < 5:
+            print(f"[vLLM/FWD/L{self.layer_idx}] QKV packed output: shape={qkv.shape}, "
+                  f"mean={qkv.mean().item():.6f}, norm={qkv.norm().item():.6f}")
+            print(f"[vLLM/FWD/L{self.layer_idx}] Q output: shape={q.shape}, "
+                  f"mean={q.mean().item():.6f}, norm={q.norm().item():.6f}")
+            print(f"[vLLM/FWD/L{self.layer_idx}] K output: shape={k.shape}, "
+                  f"mean={k.mean().item():.6f}, norm={k.norm().item():.6f}")
+            print(f"[vLLM/FWD/L{self.layer_idx}] V output: shape={v.shape}, "
+                  f"mean={v.mean().item():.6f}, norm={v.norm().item():.6f}")
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+
+        # ✅ FORWARD PASS TRACING: Log attention output (layer 0 only, first 5 calls)
+        if self.layer_idx == 0 and self._trace_count < 5:
+            print(f"[vLLM/FWD/L{self.layer_idx}] Attn output: shape={attn_output.shape}, "
+                  f"mean={attn_output.mean().item():.6f}, norm={attn_output.norm().item():.6f}")
+
         output, _ = self.o_proj(attn_output)
+
+        # ✅ FORWARD PASS TRACING: Log final output (layer 0 only, first 5 calls)
+        if self.layer_idx == 0 and self._trace_count < 5:
+            print(f"[vLLM/FWD/L{self.layer_idx}] Final output (after o_proj): shape={output.shape}, "
+                  f"mean={output.mean().item():.6f}, norm={output.norm().item():.6f}")
+            self._trace_count += 1
+            print(f"[vLLM/FWD/L{self.layer_idx}] ========== End forward pass {self._trace_count} ==========\n")
+
         return output
 
     def _init_rotary_emb(self, config: LlamaConfig,
