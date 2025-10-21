@@ -1128,6 +1128,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 encoder_seq_lens=encoder_seq_lens,
             )
 
+            # Log attention metadata for first 10 batches during training
+            if is_training_batch:
+                if not hasattr(self, '_vllm_batch_counter'):
+                    self._vllm_batch_counter = 0
+
+                if self._vllm_batch_counter < 10:
+                    print(f"\n[VLLM/BATCH {self._vllm_batch_counter}] Attention Metadata:")
+                    print(f"  Num requests: {num_reqs}")
+                    print(f"  Total tokens: {total_num_scheduled_tokens}")
+                    print(f"  Max query length: {max_num_scheduled_tokens}")
+                    if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
+                        print(f"  Sequence lengths: {seq_lens_cpu[:min(4, len(seq_lens_cpu))].tolist()}")
+                    print(f"  Causal attention: {common_attn_metadata.causal}")
+
+                self._vllm_batch_counter += 1
+
             if self.speculative_config and \
                 spec_decode_common_attn_metadata is None:
                 spec_decode_common_attn_metadata = common_attn_metadata
@@ -2495,6 +2511,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits_dict = {}
                 loss_tensors = []  # Keep loss tensors for backward pass
                 loss_weights = []  # Track valid token counts for weighted averaging
+                weighting_map = {req_id: cfg.valid_label_count for req_id, cfg in self.requests.items() if getattr(cfg.training_config, "valid_label_count", 0)} if hasattr(self, "requests") else {}
                 req_ids_output = []
                 req_id_to_index = {}
 
@@ -2560,8 +2577,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         shift_logits = request_logits[:-1, :].contiguous()
                         shift_labels = labels[1:].contiguous()
 
-                        # Check for potential NaN causes
-                        valid_labels = (shift_labels != -100).sum().item()
+                        valid_labels = weighting_map.get(req_id, (shift_labels != -100).sum().item())
                         
                         # [VLLM/LOSS] Print loss computation details (first step only)
                         if not hasattr(self, '_vllm_first_loss_printed'):
@@ -2779,29 +2795,27 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 self.training_manager, 'gradient_accumulation_steps', 1
                             )
 
-                            # Log gradient accumulation details for first 3 steps
-                            if self._vllm_step_counter < 3:
-                                print(f"[VLLM/STEP {self._vllm_step_counter}] Gradient accumulation steps: {gradient_accumulation_steps}")
-                                print(f"[VLLM/STEP {self._vllm_step_counter}] Loss before division: {total_loss.item():.6f}")
+                            # Log gradient accumulation details for first 10 batches (5 optimizer steps)
+                            if self._vllm_step_counter < 10:
+                                print(f"\n[VLLM/BATCH {self._vllm_step_counter}] Loss before division: {total_loss.item():.6f}")
+                                if self._vllm_step_counter == 0:
+                                    print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
 
                             # Apply PEFT-matching loss scaling
                             if gradient_accumulation_steps > 1:
                                 total_loss = total_loss / gradient_accumulation_steps
 
-                                if self._vllm_step_counter < 3:
-                                    print(f"[VLLM/STEP {self._vllm_step_counter}] Loss after division by {gradient_accumulation_steps}: {total_loss.item():.6f} (matches PEFT)")
+                                if self._vllm_step_counter < 10:
+                                    print(f"[VLLM/LOSS] Loss after division by {gradient_accumulation_steps}: {total_loss.item():.6f}")
 
                         # Compute gradients via backward pass
-                        if self._vllm_step_counter < 3:
-                            print(f"[VLLM/STEP {self._vllm_step_counter}] Calling backward()...")
-
                         total_loss.backward()
 
-                        # Log gradient information after backward (first 3 steps)
-                        if self._vllm_step_counter < 3 and is_lora_training and hasattr(self, 'training_manager'):
+                        # Log gradient information after backward (first 10 batches)
+                        if self._vllm_step_counter < 10 and is_lora_training and hasattr(self, 'training_manager'):
                             lora_params_with_grad = 0
                             total_grad_norm = 0.0
-                            print(f"[VLLM/STEP {self._vllm_step_counter}] Gradients after backward():")
+                            layer_0_grads = {}
 
                             for name, param in self.training_manager.trainable_lora_params.items():
                                 if 'lora' in name.lower() and param.grad is not None:
@@ -2809,12 +2823,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                     total_grad_norm += grad_norm ** 2
                                     lora_params_with_grad += 1
 
-                                    # Print first 3 parameters with gradients
-                                    if lora_params_with_grad <= 3:
-                                        print(f"[VLLM/STEP {self._vllm_step_counter}] Gradient for {name}: norm={grad_norm:.6f}, mean={param.grad.mean().item():.6f}")
+                                    # Collect layer 0 gradients for comparison
+                                    if 'layers.0' in name and 'lora' in name.lower():
+                                        layer_0_grads[name] = grad_norm
 
                             total_grad_norm = total_grad_norm ** 0.5
-                            print(f"[VLLM/STEP {self._vllm_step_counter}] Total LoRA params with gradients: {lora_params_with_grad}, Total grad norm: {total_grad_norm:.6f}")
+                            print(f"[VLLM/GRAD] After backward:")
+                            print(f"  Total gradient norm: {total_grad_norm:.6f}")
+
+                            # Print first 3 layer 0 gradients for comparison with PEFT
+                            for i, (name, norm) in enumerate(list(layer_0_grads.items())[:3]):
+                                print(f"    {name}: {norm:.6e}")
 
                         # Increment step counter
                         self._vllm_step_counter += 1
@@ -2829,9 +2848,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             # DEBUG: Log when we call step_with_accumulation
                             if self.training_manager.training_step <= 3:
                                 logger.info(f"[RUNNER/STEP] Calling step_with_accumulation, num_loss_tensors={len(loss_tensors)}")
-                            # ✅ TEST: Increase gradient clipping threshold
-                            # Hypothesis: grad_norm=1.0 is too aggressive (clipping 40-80% of steps)
-                            opt_stats = self.training_manager.step_with_accumulation(max_grad_norm=10.0)
+                            # ✅ PEFT MATCHING: Use max_grad_norm=1.0 to match PEFT's default
+                            opt_stats = self.training_manager.step_with_accumulation(max_grad_norm=1.0)
         else:
             logger.debug("[Evaluation] Skipping backward pass (eval mode)")
 

@@ -464,7 +464,7 @@ class TrainingManager:
         self,
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
-        max_grad_norm: Optional[float] = None,
+        max_grad_norm: Optional[float] = 1.0,  # ✅ CRITICAL FIX: Match PEFT default (was None)
     ) -> Dict[str, float]:
         """Perform optimizer step with optional gradient clipping."""
         stats = {}

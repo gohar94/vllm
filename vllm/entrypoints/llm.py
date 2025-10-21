@@ -657,14 +657,16 @@ class LLM:
         training_manager = model_runner.training_manager
         
         # Calculate training steps
-        num_steps_per_epoch = len(training_data) // batch_size
+        import math
+
+        num_steps_per_epoch = math.ceil(len(training_data) / batch_size)
         total_steps = num_steps_per_epoch * num_epochs
 
         # ✅ FIX: Account for gradient accumulation when calculating optimizer steps
         # The scheduler needs to know the actual number of optimizer.step() calls,
         # not the number of forward/backward passes.
         # With gradient_accumulation_steps > 1, we do fewer optimizer steps.
-        total_optimizer_steps = total_steps // gradient_accumulation_steps
+        total_optimizer_steps = math.ceil(total_steps / gradient_accumulation_steps)
 
         # Setup optimizer and scheduler via make_lora_trainable
         if lora_request:
@@ -697,23 +699,23 @@ class LLM:
         # Helper to count valid label tokens for weighting (matches masking logic)
         tokenizer = self.get_tokenizer()
         def _count_valid_labels(example: dict[str, Any]) -> int:
-            # SFT text format with instruction masking
+            # Estimate number of valid labels consistent with PEFT masking
             if 'text' in example:
                 text = example['text']
-                prompt_token_ids = tokenizer.encode(text)
-                instr_count = 0
+                full_len = len(tokenizer.encode(text, add_special_tokens=True))
+                instr_len = 0
                 if "### Response:" in text:
                     prefix = text[: text.find("### Response:") + len("### Response:")]
-                    # Match masking logic: add_special_tokens=False
-                    instr_count = len(tokenizer.encode(prefix, add_special_tokens=False))
-                # Shift by one for next-token prediction
-                return max(0, len(prompt_token_ids) - instr_count - 1)
-            # Chat format (no masking implemented here)
+                    instr_len = len(tokenizer.encode(prefix, add_special_tokens=False))
+                # Valid labels exclude instruction tokens and account for shift by one
+                return max(0, full_len - instr_len - 1)
+            # Chat format
             if 'messages' in example:
                 text = tokenizer.apply_chat_template(
                     example['messages'], add_generation_prompt=False, tokenize=False)
-                prompt_token_ids = tokenizer.encode(text)
-                return max(0, len(prompt_token_ids) - 1)
+                # For chat, assume specials already applied by template; no instruction masking
+                full_len = len(tokenizer.encode(text, add_special_tokens=False))
+                return max(0, full_len - 1)
             # Legacy prompt/labels
             if 'labels' in example:
                 labels = example['labels']
@@ -725,8 +727,8 @@ class LLM:
             if 'prompt_token_ids' in example:
                 return max(0, len(example['prompt_token_ids']) - 1)
             if 'prompt' in example:
-                prompt_token_ids = tokenizer.encode(example['prompt'])
-                return max(0, len(prompt_token_ids) - 1)
+                full_len = len(tokenizer.encode(example['prompt'], add_special_tokens=True))
+                return max(0, full_len - 1)
             return 0
         
         # ✅ PEFT MATCHING: Evaluate BEFORE training starts (initial baseline)
@@ -758,14 +760,21 @@ class LLM:
             
             print(f"[VLLM/INIT] Initial eval loss (untrained): {initial_eval_loss:.4f}")
             print("="*70 + "\n")
-        
+
+            # ✅ FIX: Reset batch counter after initial eval so training batches start at 0
+            worker = self.llm_engine.model_executor.driver_worker
+            model_runner = worker.model_runner
+            if hasattr(model_runner, '_vllm_batch_counter'):
+                print(f"[VLLM/INIT] Resetting batch counter (was {model_runner._vllm_batch_counter}) for training")
+                model_runner._vllm_batch_counter = 0
+
         # Progress bar setup
         if use_tqdm:
             tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
             pbar = tqdm_func(total=total_steps, desc="Training")
         
         # Epoch loop
-        # ✅ FIX: Implement proper gradient accumulation
+        # ✅ FIX: Implement proper gradient accumulation (tracked locally)
         accumulation_counter = 0
         accumulated_losses = []
         
@@ -791,14 +800,18 @@ class LLM:
         for epoch in range(num_epochs):
             epoch_losses = []
             
-            # ✅ PEFT MATCHING: Shuffle training data at the start of each epoch
-            # This matches PEFT/Transformers' RandomSampler behavior
-            import random
-            epoch_training_data = training_data.copy()
-            # ✅ ENABLE SHUFFLING: Matches PEFT/Transformers behavior
-            # Shuffling prevents memorization of data order and reduces cyclic loss patterns
-            random.shuffle(epoch_training_data)
-            print(f"\n[VLLM/SHUFFLE] Epoch {epoch}: Using {len(epoch_training_data)} training samples (shuffled)")
+            # ✅ PEFT MATCHING: Shuffle training data using PyTorch's generator
+            # CRITICAL: Use torch.randperm instead of random.shuffle to match PEFT's RandomSampler
+            # PEFT's RandomSampler uses torch.Generator which has a different PRNG than Python's random
+
+            # Create indices and shuffle them using torch (matching RandomSampler behavior)
+            # RandomSampler uses: torch.randperm(n, generator=self.generator).tolist()
+            generator = torch.Generator().manual_seed(42 + epoch)  # Different seed per epoch
+            indices = torch.randperm(len(training_data), generator=generator).tolist()
+            epoch_training_data = [training_data[i] for i in indices]
+
+            print(f"\n[VLLM/SHUFFLE] Epoch {epoch}: Using {len(epoch_training_data)} training samples")
+            print(f"[VLLM/SHUFFLE] Shuffled with torch.randperm (seed={42 + epoch}) to match PEFT RandomSampler")
             
             # Batch the data
             for i in range(0, len(epoch_training_data), batch_size):
@@ -808,11 +821,7 @@ class LLM:
                 is_last_accumulation_step = (accumulation_counter + 1) >= gradient_accumulation_steps
                 is_last_batch_of_epoch = (i + batch_size) >= len(epoch_training_data)
                 should_step = is_last_accumulation_step or is_last_batch_of_epoch
-                
-                # ✅ FIX: Set flag on training manager for gradient accumulation
-                training_manager._should_step_optimizer = should_step
-                
-                # DEBUG: Log flag setting
+
                 if global_step <= 3:
                     print(f"[HIGH_LEVEL] Batch {i//batch_size}, accum_counter={accumulation_counter}, should_step={should_step}")
                 
@@ -2391,9 +2400,9 @@ class LLM:
             if 'text' in example:
                 text = example['text']
                 # Tokenize without padding OR truncation to get ACTUAL length
-                # ✅ FIX: Use add_special_tokens=False since data already has special tokens
-                # ✅ CRITICAL FIX: Remove truncation in first pass! We're finding the max, not limiting it
-                temp_tokens = tokenizer.encode(text, add_special_tokens=False)
+                # Use add_special_tokens=True to match PEFT full-text tokenization
+                # Remove truncation in first pass! We're finding the max, not limiting it
+                temp_tokens = tokenizer.encode(text, add_special_tokens=True)
                 batch_max_length = max(batch_max_length, len(temp_tokens))
             elif 'messages' in example:
                 text = tokenizer.apply_chat_template(
@@ -2411,6 +2420,9 @@ class LLM:
                     temp_tokens = tokenizer.encode(prompt, add_special_tokens=False)
                     batch_max_length = max(batch_max_length, len(temp_tokens))
 
+        # Clamp to PEFT's MAX_LENGTH (512) for identical truncation behavior
+        batch_max_length = min(batch_max_length, 512) if batch_max_length > 0 else 512
+
         # Log the dynamic padding decision
         if not hasattr(self, '_dynamic_padding_logged'):
             self._dynamic_padding_logged = 0
@@ -2426,15 +2438,14 @@ class LLM:
             # Format 1: 'text' field (SFTTrainer standard)
             if 'text' in example:
                 text = example['text']
-                # ✅ DYNAMIC PADDING: Use batch max length instead of fixed 512 (matches PEFT)
-                # This ensures all sequences in the batch have the same length, but minimizes padding tokens
-                # ✅ FIX: Use add_special_tokens=False since data already has special tokens
+                # ✅ DYNAMIC PADDING: Use batch max length (clamped) to match PEFT
+                # Encode full text with add_special_tokens=True (PEFT behavior)
                 prompt_token_ids = tokenizer.encode(
                     text,
                     padding='max_length',
                     max_length=batch_max_length,
                     truncation=True,
-                    add_special_tokens=False
+                    add_special_tokens=True
                 )
                 # Old (fixed padding): max_length=512
                 
@@ -2460,7 +2471,7 @@ class LLM:
                     
                     if response_start_pos != -1:
                         # Tokenize text up to response start
-                        # FIX: Use add_special_tokens=False to match PEFT's behavior
+                        # Use add_special_tokens=False to match PEFT's boundary computation
                         instruction_text = text[:response_start_pos + len(response_start_text)]
                         instruction_tokens = tokenizer.encode(instruction_text, add_special_tokens=False)
                         instruction_tokens_count = len(instruction_tokens)
@@ -2515,7 +2526,7 @@ class LLM:
                     tokenize=False,
                 )
                 # ✅ DYNAMIC PADDING: Use batch max length
-                # ✅ FIX: Use add_special_tokens=False since chat template already adds them
+                # Chat template may include specials; keep add_special_tokens=False for safety
                 prompt_token_ids = tokenizer.encode(
                     text,
                     padding='max_length',

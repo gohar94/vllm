@@ -127,6 +127,7 @@ class RequestOutput:
         # Extract training_loss and training_logits from kwargs if present
         self.training_loss = kwargs.pop('training_loss', None)
         self.training_logits = kwargs.pop('training_logits', None)
+        self.training_loss_weights = kwargs.pop('training_loss_weights', None)
 
         if kwargs:
             logger.warning_once("RequestOutput: Ignoring extra arguments: %s",

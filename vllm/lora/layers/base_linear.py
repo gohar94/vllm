@@ -265,8 +265,9 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
 
                         indices = list(range(len(self.lora_a_stacked)))
                         if is_merged_qkv and len(indices) >= 3:
-                            # ✅ FIX: Train Q, K, V to match PEFT (was only Q and V)
-                            indices = [0, 1, 2]  # Q, K, and V
+                            # Train Q and V only (standard practice for attention LoRA)
+                            # K projection typically doesn't need LoRA adaptation
+                            indices = [0, 2]  # Q and V only (K is at index 1, not trained)
 
                         # LoRA scale matching PEFT: alpha / r
                         lora_scale = 1.0
@@ -328,8 +329,14 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                             # PEFT computes LoRA in bfloat16, vLLM was using float32
                             # This dtype mismatch affects gradient precision
                             target_dtype = output.dtype if output.dtype in [torch.bfloat16, torch.float16] else torch.bfloat16
-                            lora_hidden = (x.to(target_dtype) @ lora_a.T.to(target_dtype)) * float(lora_scale)
-                            lora_output = lora_hidden @ lora_b_used.T.to(target_dtype)
+
+                            # ✅ FIX #6: Match PEFT's exact LoRA scaling sequence
+                            # PEFT: (x @ A^T @ B^T) * scaling (scaling AFTER both matmuls)
+                            # vLLM was: (x @ A^T * scaling) @ B^T (scaling BETWEEN matmuls)
+                            # While mathematically equivalent, matching the exact sequence eliminates
+                            # any potential numerical/autograd differences for cleaner comparison
+                            lora_hidden = x.to(target_dtype) @ lora_a.T.to(target_dtype)
+                            lora_output = (lora_hidden @ lora_b_used.T.to(target_dtype)) * float(lora_scale)
                             lora_output = lora_output.to(output.dtype)
                             # Debug: per-layer LoRA stats
                             try:
