@@ -250,7 +250,11 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Training requests don't need KV cache - they process full sequence at once
-            if request.is_training:
+            # or when skip_kv_cache is True
+            if request.is_training or (
+                request.sampling_params is not None
+                and request.sampling_params.extra_args is not None
+                and request.sampling_params.extra_args.get("skip_kv_cache", False)):
                 new_blocks = None  # No KV cache needed
                 can_schedule = True
             else:
@@ -298,6 +302,9 @@ class Scheduler(SchedulerInterface):
             # Store blocks for inference requests only
             if new_blocks is not None:
                 assert not request.is_training, "Training requests should not have new blocks allocated."
+                assert not (request.sampling_params is not None
+                            and request.sampling_params.extra_args is not None
+                            and request.sampling_params.extra_args.get("skip_kv_cache", False)), "Skip KV cache requests should not have new blocks allocated."
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
@@ -384,7 +391,11 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
 
                 # Get already-cached tokens (skip for training requests).
-                if request.num_computed_tokens == 0 and not request.is_training:
+                # and skip for requests with skip_kv_cache=True
+                if request.num_computed_tokens == 0 and not request.is_training and not (
+                    request.sampling_params is not None
+                    and request.sampling_params.extra_args is not None
+                    and request.sampling_params.extra_args.get("skip_kv_cache", False)):
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = \
                         self.kv_cache_manager.get_computed_blocks(
@@ -479,30 +490,38 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
+                if request.is_training or (
+                    request.sampling_params is not None
+                    and request.sampling_params.extra_args is not None
+                    and request.sampling_params.extra_args.get("skip_kv_cache", False)):
+                    new_blocks = None  # No KV cache needed
+                    can_schedule = True
+                else:
 
-                if new_blocks is None:
-                    # The request cannot be scheduled.
-                    break
-
-                # KVTransfer: the connector uses this info to determine
-                # if a load is needed. Note that
-                # This information is used to determine if a load is
-                # needed for this request.
-                if self.connector is not None:
-                    self.connector.update_state_after_alloc(
+                    new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
-                        new_computed_blocks + new_blocks,
-                        num_external_computed_tokens,
+                        num_new_tokens + num_external_computed_tokens,
+                        num_new_local_computed_tokens,
+                        new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
                     )
+
+                    if new_blocks is None:
+                        # The request cannot be scheduled.
+                        break
+
+                    # KVTransfer: the connector uses this info to determine
+                    # if a load is needed. Note that
+                    # This information is used to determine if a load is
+                    # needed for this request.
+                    if self.connector is not None:
+                        self.connector.update_state_after_alloc(
+                            request,
+                            new_computed_blocks + new_blocks,
+                            num_external_computed_tokens,
+                        )
 
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
