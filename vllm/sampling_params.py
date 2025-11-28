@@ -435,6 +435,9 @@ class SamplingParams(
         if self.best_of != self._real_n and self.output_kind == (
                 RequestOutputKind.DELTA):
             raise ValueError("best_of must equal n to use output_kind=DELTA")
+        if self.extra_args is not None and "skip_kv_cache" in self.extra_args and self.extra_args["skip_kv_cache"]:
+            if self.min_tokens != 1 and self.max_tokens != 1:
+                raise ValueError("skip_kv_cache is only supported when min_tokens and max_tokens are both 1")
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
