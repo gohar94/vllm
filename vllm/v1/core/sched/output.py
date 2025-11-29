@@ -163,3 +163,11 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # Skip KV cache requests (prefill-only requests with skip_kv_cache=True)
+    # These are scheduled separately and can be executed in a separate CUDA stream.
+    scheduled_skip_kv_new_reqs: list[NewRequestData] = None
+    scheduled_skip_kv_cached_reqs: CachedRequestData = None
+    # Number of tokens scheduled for skip_kv_cache requests
+    num_scheduled_skip_kv_tokens: dict[str, int] = None
+    total_num_scheduled_skip_kv_tokens: int = 0

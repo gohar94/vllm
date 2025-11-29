@@ -99,9 +99,11 @@ class Executor(ExecutorBase):
         self,
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
+        use_skip_kv_cache_stream: bool = False,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
         output = self.collective_rpc("execute_model",
                                      args=(scheduler_output, ),
+                                     kwargs={"use_skip_kv_cache_stream": use_skip_kv_cache_stream},
                                      non_block=non_block)
         return output[0]
 

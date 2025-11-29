@@ -323,6 +323,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.async_output_copy_stream = torch.cuda.Stream() if \
             self.use_async_scheduling else None
 
+        # Separate CUDA stream for skip_kv_cache requests
+        # These requests don't use KV cache and can be executed with different
+        # priority or overlapped with regular requests based on scheduling policy.
+        self.skip_kv_cache_stream = torch.cuda.Stream()
+
         # TODO(woosuk): Provide an option to tune the max cudagraph batch size.
         # The convention is different.
         # self.cudagraph_batch_sizes sorts in ascending order.
@@ -2185,12 +2190,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        use_skip_kv_cache_stream: bool = False,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
         """Execute model - dispatches to training or inference based on request type.
         
         Args:
             scheduler_output: Output from the scheduler
             intermediate_tensors: Intermediate tensors from previous pipeline stage
+            use_skip_kv_cache_stream: If True, execute in the skip_kv_cache CUDA stream
             
         Returns:
             ModelRunnerOutput (or async wrapper) or IntermediateTensors for PP
@@ -2202,14 +2209,32 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                intermediate_tensors)
         else:
             return self.execute_model_inference(scheduler_output,
-                                                intermediate_tensors)
+                                                intermediate_tensors,
+                                                use_skip_kv_cache_stream)
 
     @torch.inference_mode()
     def execute_model_inference(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        use_skip_kv_cache_stream: bool = False,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        # Use the skip_kv_cache stream if requested
+        # We wrap the entire execution in the stream context for simplicity
+        if use_skip_kv_cache_stream:
+            # Execute in the separate skip_kv_cache stream
+            with torch.cuda.stream(self.skip_kv_cache_stream):
+                return self._execute_model_inference_impl(scheduler_output, intermediate_tensors)
+        else:
+            # Regular execution in default stream
+            return self._execute_model_inference_impl(scheduler_output, intermediate_tensors)
+    
+    def _execute_model_inference_impl(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        """Internal implementation of execute_model_inference."""
         with record_function_or_nullcontext("Preprocess"):
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:

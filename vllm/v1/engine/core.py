@@ -76,6 +76,19 @@ class EngineCore:
                     VLLM_VERSION, vllm_config)
 
         self.log_stats = log_stats
+        
+        # Skip KV cache separate stream execution
+        self.skip_kv_cache_separate_stream = (
+            vllm_config.scheduler_config.skip_kv_cache_separate_stream)
+        self.skip_kv_cache_queue: Optional[queue.Queue] = None
+        self.skip_kv_cache_thread: Optional[threading.Thread] = None
+        self.skip_kv_cache_thread_stop = threading.Event()
+        # Track pending skip_kv_cache executions: (scheduler_output, future)
+        self.pending_skip_kv_futures: deque[tuple[SchedulerOutput, Future]] = deque()
+        if self.skip_kv_cache_separate_stream:
+            self.skip_kv_cache_queue = queue.Queue()
+            logger.info("Skip KV cache requests will be executed in a separate "
+                       "CUDA stream with a dedicated execution thread.")
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -163,6 +176,47 @@ class EngineCore:
 
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
+        
+        # Start the skip_kv_cache execution thread if enabled
+        if self.skip_kv_cache_separate_stream:
+            self.skip_kv_cache_thread = threading.Thread(
+                target=self._skip_kv_cache_execution_loop,
+                daemon=True,
+                name="SkipKVCacheExecutor")
+            self.skip_kv_cache_thread.start()
+            logger.info("Started skip_kv_cache execution thread")
+
+    def _skip_kv_cache_execution_loop(self):
+        """Background thread that executes skip_kv_cache requests in a separate stream."""
+        logger.info("Skip KV cache execution thread started")
+        
+        while not self.skip_kv_cache_thread_stop.is_set():
+            try:
+                # Wait for a skip_kv_cache request with timeout
+                # Timeout allows checking the stop event periodically
+                item = self.skip_kv_cache_queue.get(timeout=0.1)
+                if item is None:  # Poison pill for shutdown
+                    break
+                
+                scheduler_output, future = item
+                
+                try:
+                    # Execute the model in the skip_kv_cache stream
+                    # The model runner will use the separate CUDA stream
+                    model_output = self.model_executor.execute_model(
+                        scheduler_output, 
+                        use_skip_kv_cache_stream=True)
+                    future.set_result(model_output)
+                except Exception as e:
+                    logger.error("Error executing skip_kv_cache request: %s", e)
+                    future.set_exception(e)
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error("Unexpected error in skip_kv_cache execution loop: %s", e)
+                
+        logger.info("Skip KV cache execution thread stopped")
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -273,6 +327,103 @@ class EngineCore:
                                   self.scheduler.make_stats())
             raise err
 
+    def _create_skip_kv_cache_scheduler_output(
+        self, 
+        full_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        """Create a scheduler output containing only skip_kv_cache requests.
+        
+        This creates a SchedulerOutput with only the skip_kv_cache requests moved into
+        the main fields (scheduled_new_reqs, num_scheduled_tokens, etc.) so the model
+        runner can process them as a normal batch.
+        """
+        from vllm.v1.core.sched.output import (CachedRequestData,
+                                                 SchedulerOutput)
+        
+        return SchedulerOutput(
+            scheduled_new_reqs=full_output.scheduled_skip_kv_new_reqs or [],
+            scheduled_cached_reqs=full_output.scheduled_skip_kv_cached_reqs or CachedRequestData.make_empty(),
+            # Move skip_kv token counts to main num_scheduled_tokens for model runner
+            num_scheduled_tokens=full_output.num_scheduled_skip_kv_tokens or {},
+            total_num_scheduled_tokens=full_output.total_num_scheduled_skip_kv_tokens,
+            scheduled_spec_decode_tokens={},  # No spec decode for skip_kv_cache
+            scheduled_encoder_inputs={},  # Typically no encoder for skip_kv_cache
+            num_common_prefix_blocks=[0] if not full_output.num_common_prefix_blocks else [0] * len(full_output.num_common_prefix_blocks),
+            finished_req_ids=set(),  # Will be updated separately
+            free_encoder_mm_hashes=[],
+            structured_output_request_ids={},
+            grammar_bitmask=None,
+            kv_connector_metadata=None,
+            # Keep these empty since we've moved them to the main fields
+            scheduled_skip_kv_new_reqs=[],
+            scheduled_skip_kv_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_skip_kv_tokens={},
+            total_num_scheduled_skip_kv_tokens=0,
+        )
+    
+    def _create_regular_scheduler_output(
+        self, 
+        full_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        """Create a scheduler output containing only regular requests (no skip_kv_cache).
+        
+        This creates a SchedulerOutput with skip_kv_cache fields cleared out so the model
+        runner only processes regular requests.
+        """
+        from vllm.v1.core.sched.output import (CachedRequestData,
+                                                 SchedulerOutput)
+        
+        return SchedulerOutput(
+            scheduled_new_reqs=full_output.scheduled_new_reqs,
+            scheduled_cached_reqs=full_output.scheduled_cached_reqs,
+            num_scheduled_tokens=full_output.num_scheduled_tokens,
+            total_num_scheduled_tokens=full_output.total_num_scheduled_tokens,
+            scheduled_spec_decode_tokens=full_output.scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs=full_output.scheduled_encoder_inputs,
+            num_common_prefix_blocks=full_output.num_common_prefix_blocks,
+            finished_req_ids=full_output.finished_req_ids,
+            free_encoder_mm_hashes=full_output.free_encoder_mm_hashes,
+            structured_output_request_ids=full_output.structured_output_request_ids,
+            grammar_bitmask=full_output.grammar_bitmask,
+            kv_connector_metadata=full_output.kv_connector_metadata,
+            # Clear skip_kv_cache fields so model runner doesn't try to process them
+            scheduled_skip_kv_new_reqs=[],
+            scheduled_skip_kv_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_skip_kv_tokens={},
+            total_num_scheduled_skip_kv_tokens=0,
+        )
+
+    def _process_completed_skip_kv_futures(self) -> dict[int, EngineCoreOutputs]:
+        """Check and process any completed skip_kv_cache futures."""
+        outputs: dict[int, EngineCoreOutputs] = {}
+        
+        # Check completed futures (non-blocking)
+        completed_indices = []
+        for i, (scheduler_output, future) in enumerate(self.pending_skip_kv_futures):
+            if future.done():
+                try:
+                    model_output = future.result()
+                    # Update scheduler with the output
+                    engine_outputs = self.scheduler.update_from_output(
+                        scheduler_output, model_output)
+                    # Merge outputs
+                    for client_idx, client_outputs in engine_outputs.items():
+                        if client_idx in outputs:
+                            outputs[client_idx].outputs.extend(client_outputs.outputs)
+                        else:
+                            outputs[client_idx] = client_outputs
+                    completed_indices.append(i)
+                except Exception as e:
+                    logger.error("Error processing skip_kv_cache result: %s", e)
+                    completed_indices.append(i)
+        
+        # Remove completed futures (reverse order to preserve indices)
+        for i in reversed(completed_indices):
+            self.pending_skip_kv_futures[i] = self.pending_skip_kv_futures[-1]
+            self.pending_skip_kv_futures.pop()
+        
+        return outputs
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -282,16 +433,78 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            return {}, False
+            # Check for completed skip_kv_cache futures even if no new requests
+            skip_kv_outputs = self._process_completed_skip_kv_futures()
+            return skip_kv_outputs, False
+        
         scheduler_output = self.scheduler.schedule()
-        model_output = self.execute_model_with_error_logging(
-            self.model_executor.execute_model,  # type: ignore
-            scheduler_output)
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output)  # type: ignore
+        
+        # Handle skip_kv_cache requests separately if enabled
+        regular_model_executed = False
+        if (self.skip_kv_cache_separate_stream and 
+            scheduler_output.total_num_scheduled_skip_kv_tokens > 0):
+            # Create separate scheduler output for skip_kv_cache requests
+            skip_kv_output = self._create_skip_kv_cache_scheduler_output(scheduler_output)
+            
+            # Queue skip_kv_cache requests for async execution (non-blocking)
+            skip_kv_future = Future()
+            self.skip_kv_cache_queue.put((skip_kv_output, skip_kv_future))
+            self.pending_skip_kv_futures.append((skip_kv_output, skip_kv_future))
+            
+            # Execute regular requests in main thread (if any)
+            # Note: When skip_kv_cache_separate_stream=True, total_num_scheduled_tokens
+            # only contains regular tokens (skip_kv tokens are not merged)
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                # Create a scheduler output with only regular requests
+                regular_output = self._create_regular_scheduler_output(scheduler_output)
+                model_output = self.execute_model_with_error_logging(
+                    self.model_executor.execute_model,
+                    regular_output)
+                # Use regular_output for update_from_output to match what was executed
+                engine_core_outputs = self.scheduler.update_from_output(
+                    regular_output, model_output)
+                regular_model_executed = True
+                # Check for any completed skip_kv_cache futures from previous iterations (non-blocking)
+                skip_kv_outputs = self._process_completed_skip_kv_futures()
+            else:
+                # Only skip_kv_cache requests, no regular requests to execute now
+                # We must wait for at least the current skip_kv_cache request to complete
+                # before returning, otherwise the request won't make progress
+                try:
+                    model_output = skip_kv_future.result(timeout=60.0)
+                    engine_core_outputs = self.scheduler.update_from_output(
+                        skip_kv_output, model_output)
+                    # Remove from pending since we already processed it
+                    self.pending_skip_kv_futures.pop()
+                except Exception as e:
+                    logger.error("Error waiting for skip_kv_cache execution: %s", e)
+                    self.pending_skip_kv_futures.pop()
+                    raise
+                
+                # Check for other completed skip_kv_cache futures from previous iterations
+                skip_kv_outputs = self._process_completed_skip_kv_futures()
+            
+            # Merge outputs from completed skip_kv_cache executions (if any)
+            if skip_kv_outputs:
+                for client_idx, client_outputs in skip_kv_outputs.items():
+                    if client_idx in engine_core_outputs:
+                        engine_core_outputs[client_idx].outputs.extend(client_outputs.outputs)
+                    else:
+                        engine_core_outputs[client_idx] = client_outputs
+        else:
+            # Same stream execution (regular path)
+            model_output = self.execute_model_with_error_logging(
+                self.model_executor.execute_model,
+                scheduler_output)
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output)
+            regular_model_executed = True
 
-        return (engine_core_outputs,
-                scheduler_output.total_num_scheduled_tokens > 0)
+        # Model was executed if either regular requests were executed or skip_kv_cache requests were executed
+        model_executed = (regular_model_executed or 
+                         scheduler_output.total_num_scheduled_tokens > 0 or 
+                         scheduler_output.total_num_scheduled_skip_kv_tokens > 0)
+        return (engine_core_outputs, model_executed)
 
     def post_step(self, model_executed: bool) -> None:
         if self.use_spec_decode and model_executed:
@@ -355,6 +568,17 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def shutdown(self):
+        # Stop the skip_kv_cache execution thread if it's running
+        if self.skip_kv_cache_thread is not None:
+            logger.info("Stopping skip_kv_cache execution thread")
+            self.skip_kv_cache_thread_stop.set()
+            # Send poison pill to wake up the thread
+            if self.skip_kv_cache_queue is not None:
+                self.skip_kv_cache_queue.put(None)
+            self.skip_kv_cache_thread.join(timeout=5.0)
+            if self.skip_kv_cache_thread.is_alive():
+                logger.warning("Skip_kv_cache thread did not stop gracefully")
+        
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
