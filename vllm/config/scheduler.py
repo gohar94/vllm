@@ -128,6 +128,12 @@ class SchedulerConfig:
     - "priority" means requests are handled based on given priority (lower
     value means earlier handling) and time of arrival deciding any ties)."""
 
+    training_token_budget_ratio: float = 0.0
+    """The ratio of max_num_batched_tokens to allocate for training requests.
+    The remaining ratio (1 - training_token_budget_ratio) is allocated for
+    inference requests. This allows concurrent scheduling of training and
+    inference with separate token budgets. Default is 0.0 (no training budget)."""
+
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""
 

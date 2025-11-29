@@ -16,10 +16,11 @@ class AsyncScheduler(Scheduler):
     def _update_after_schedule(
         self,
         scheduler_output: SchedulerOutput,
+        is_primary: bool = True,
     ) -> None:
-        super()._update_after_schedule(scheduler_output)
+        super()._update_after_schedule(scheduler_output, is_primary)
         for req_id in scheduler_output.num_scheduled_tokens:
-            request = self.requests[req_id]
+            request = self.requests_primary[req_id] if is_primary else self.requests_secondary[req_id]
             if (request.num_computed_tokens == request.num_tokens +
                     request.num_output_placeholders):
                 # The request will generate a new token in this scheduling step.
@@ -39,8 +40,8 @@ class AsyncScheduler(Scheduler):
         request.num_output_placeholders -= len(new_token_ids)
         assert request.num_output_placeholders >= 0
 
-        # Cache the new tokens. Preempted requests should be skipped.
-        if status_before_update == RequestStatus.RUNNING:
+        # Cache the new tokens. Preempted requests and skip_kv_cache requests should be skipped.
+        if status_before_update == RequestStatus.RUNNING and not self._should_skip_kv_cache(request) and not self._is_training_request(request):
             self.kv_cache_manager.cache_blocks(
                 request,
                 request.num_computed_tokens - request.num_output_placeholders)

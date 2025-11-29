@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -244,6 +245,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+
+        # CUDA streams for concurrent primary and secondary execution
+        # Primary: regular inference, Secondary: training/skip_kv_cache
+        if scheduler_config.async_scheduling:
+            self.primary_stream = torch.cuda.Stream(device=device)
+            self.secondary_stream = torch.cuda.Stream(device=device)
+            logger.info(f"Created CUDA streams for concurrent execution: "
+                       f"primary_stream={self.primary_stream}, "
+                       f"secondary_stream={self.secondary_stream}")
+        else:
+            self.primary_stream = None
+            self.secondary_stream = None
 
         self.eplb_state: Optional[EplbState] = None
         """
@@ -2187,22 +2200,66 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
         """Execute model - dispatches to training or inference based on request type.
-        
+
         Args:
             scheduler_output: Output from the scheduler
             intermediate_tensors: Intermediate tensors from previous pipeline stage
-            
+
         Returns:
             ModelRunnerOutput (or async wrapper) or IntermediateTensors for PP
         """
-        # Detect if this batch contains any training requests
-        has_training_requests = any(req.is_training for req in scheduler_output.scheduled_new_reqs)
-        if has_training_requests:
-            return self.execute_model_training(scheduler_output,
-                                               intermediate_tensors)
-        else:
-            return self.execute_model_inference(scheduler_output,
-                                                intermediate_tensors)
+        return self.execute_model_inference(scheduler_output,
+                                            intermediate_tensors)
+        # # Detect if this batch contains any training requests
+        # has_training_requests = any(req.is_training for req in scheduler_output.scheduled_new_reqs)
+        
+        # # Detect if this batch contains any skip_kv_cache requests
+        # has_skip_kv_cache = any(
+        #     req.sampling_params and 
+        #     req.sampling_params.extra_args and 
+        #     req.sampling_params.extra_args.get("skip_kv_cache", False)
+        #     for req in scheduler_output.scheduled_new_reqs
+        # )
+        
+        # logger.info(f"has_training_requests={has_training_requests}, has_skip_kv_cache={has_skip_kv_cache}")
+        
+        # # Select appropriate CUDA stream if async_scheduling is enabled
+        # if self.primary_stream is not None:
+        #     # Use secondary_stream for both training and skip_kv_cache requests
+        #     if has_training_requests:
+        #         stream = self.secondary_stream
+        #     elif has_skip_kv_cache:
+        #         stream = self.secondary_stream  # Use secondary stream for skip_kv_cache
+        #     else:
+        #         stream = self.primary_stream
+
+        #     # Execute on the selected stream
+        #     with torch.cuda.stream(stream):
+        #         if has_training_requests:
+        #             output = self.execute_model_training(scheduler_output,
+        #                                                 intermediate_tensors)
+        #         else:
+        #             output = self.execute_model_inference(scheduler_output,
+        #                                                  intermediate_tensors)
+
+        #     # Synchronize the stream to ensure output tensors are valid
+        #     # This is critical for returning correct results to EngineCore
+        #     stream.synchronize()
+
+        #     logger.info(f"Executed on stream={stream}, "
+        #                f"is_training={has_training_requests}, "
+        #                f"skip_kv_cache={has_skip_kv_cache}, "
+        #                f"thread={threading.current_thread().name}")
+
+        #     return output
+        # else:
+        #     # No CUDA streams (async_scheduling=False), use default execution
+        #     if has_training_requests:
+        #         return self.execute_model_training(scheduler_output,
+        #                                            intermediate_tensors)
+        #     else:
+        #         return self.execute_model_inference(scheduler_output,
+        #                                             intermediate_tensors)
 
     @torch.inference_mode()
     def execute_model_inference(

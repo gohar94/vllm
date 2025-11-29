@@ -32,6 +32,8 @@ class SchedulerStats:
 
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    num_secondary_running_reqs: int = 0  # Secondary queue (training/skip_kv_cache)
+    num_secondary_waiting_reqs: int = 0  # Secondary queue (training/skip_kv_cache)
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
