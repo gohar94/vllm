@@ -65,17 +65,22 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         self,
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
+        use_skip_kv_cache_stream: bool = False,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
         """Execute the model on the Ray workers.
 
         Args:
             scheduler_output: The scheduler output to execute.
             non_block: If True, the method will return a Future.
+            use_skip_kv_cache_stream: If True, execute in separate CUDA stream.
 
         Returns:
             The model runner output.
         """
         # Build the compiled DAG for the first time.
+        # Note: Ray DAG doesn't easily support kwargs, so we ignore use_skip_kv_cache_stream
+        # for Ray executor for now. This feature is primarily for multiproc/uniproc executors.
+        # TODO(girfan): Support use_skip_kv_cache_stream for Ray executor.
         if self.forward_dag is None:  # type: ignore
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import hashlib
+import os
 from dataclasses import field
 from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
@@ -159,6 +160,14 @@ class SchedulerConfig:
     structured outputs, speculative decoding, and pipeline parallelism.
     """
 
+    skip_kv_cache_separate_stream: bool = True
+    """If set to True, requests with skip_kv_cache=True will be executed in a
+    separate CUDA stream using a separate execution thread. This allows for
+    concurrent execution and priority control of skip_kv_cache requests
+    (typically prefill-only requests) alongside regular requests. If set to False,
+    skip_kv_cache requests are executed in the same stream as regular requests.
+    Default is True for better resource utilization and latency."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -179,6 +188,11 @@ class SchedulerConfig:
         return hash_str
 
     def __post_init__(self) -> None:
+        # Check environment variable for skip_kv_cache_separate_stream
+        skip_kv_env = os.environ.get("VLLM_SKIP_KV_CACHE_SEPARATE_STREAM")
+        if skip_kv_env is not None:
+            self.skip_kv_cache_separate_stream = skip_kv_env.lower() in ("1", "true", "yes")
+        
         if self.max_model_len is None:
             self.max_model_len = 8192
 

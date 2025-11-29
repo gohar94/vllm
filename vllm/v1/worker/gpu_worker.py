@@ -425,6 +425,7 @@ class Worker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
+        use_skip_kv_cache_stream: bool = False,
     ) -> Optional[Union[ModelRunnerOutput, AsyncModelRunnerOutput]]:
         # Check if this batch contains any training requests
         has_training_requests = any(req.is_training for req in scheduler_output.scheduled_new_reqs)
@@ -453,7 +454,8 @@ class Worker(WorkerBase):
                     all_gather_tensors=all_gather_tensors))
 
         output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
+                                                 intermediate_tensors,
+                                                 use_skip_kv_cache_stream)
 
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
             return output

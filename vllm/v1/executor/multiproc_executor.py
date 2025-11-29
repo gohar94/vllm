@@ -174,6 +174,7 @@ class MultiprocExecutor(Executor):
         self,
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
+        use_skip_kv_cache_stream: bool = False,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
 
         if not self.has_connector:
@@ -181,6 +182,7 @@ class MultiprocExecutor(Executor):
             (output, ) = self.collective_rpc(
                 "execute_model",
                 args=(scheduler_output, ),
+                kwargs={"use_skip_kv_cache_stream": use_skip_kv_cache_stream},
                 unique_reply_rank=self.output_rank,
                 non_block=non_block,
                 timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
@@ -190,6 +192,7 @@ class MultiprocExecutor(Executor):
         outputs = self.collective_rpc(
             "execute_model",
             args=(scheduler_output, ),
+            kwargs={"use_skip_kv_cache_stream": use_skip_kv_cache_stream},
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
 
