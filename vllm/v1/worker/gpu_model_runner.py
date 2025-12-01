@@ -460,6 +460,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._share_runtime_state(runner)
         return runner
 
+    # TODO(girfan): This is a hack to share the runtime state between the primary and secondary runners.
+    # We should find a better way to do this.
     def _share_runtime_state(self, target: "GPUModelRunner") -> None:
         target.model = getattr(self, "model", None)
         target.model_memory_usage = getattr(self, "model_memory_usage", None)
@@ -475,6 +477,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         target.uniform_decode_query_len = self.uniform_decode_query_len
         target.cudagraph_dispatcher = self.cudagraph_dispatcher
         target.mm_budget = self.mm_budget
+        target.vllm_config = self.vllm_config
+        target.model_config = self.vllm_config.model_config
+        target.cache_config = self.vllm_config.cache_config
+        target.compilation_config = self.vllm_config.compilation_config
+        target.lora_config = self.vllm_config.lora_config
+        target.load_config = self.vllm_config.load_config
+        target.parallel_config = self.vllm_config.parallel_config
+        target.scheduler_config = self.vllm_config.scheduler_config
+        target.speculative_config = self.vllm_config.speculative_config
+        target.observability_config = self.vllm_config.observability_config
+        target.lora_manager = getattr(self, "lora_manager", None)
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
