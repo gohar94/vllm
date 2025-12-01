@@ -844,8 +844,6 @@ class WorkerProc:
 
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(rpc_id, output)
-            logger.info("Worker rank %s finished rpc_id=%s on %s stream",
-                        self.rank, rpc_id, role)
 
     def _resolve_method(self, method: Union[str, bytes]) -> Callable:
         if isinstance(method, str):
@@ -865,6 +863,9 @@ class WorkerProc:
         if method != "execute_model" or not args:
             return self.primary_task_queue
         scheduler_output = args[0]
+        queue_label = getattr(scheduler_output, "queue", None)
+        if queue_label == "secondary":
+            return self.secondary_task_queue
         try:
             if self._requires_secondary_stream(scheduler_output):
                 return self.secondary_task_queue
