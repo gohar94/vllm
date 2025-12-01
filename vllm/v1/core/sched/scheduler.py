@@ -1770,8 +1770,8 @@ class Scheduler(SchedulerInterface):
             request_ids = set(request_ids)
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
-        training_running_requests_to_remove = set()
-        training_waiting_requests_to_remove = []
+        secondary_running_requests_to_remove = set()
+        secondary_waiting_requests_to_remove = []
         valid_requests = []
 
         # First pass: collect requests to remove from queues
@@ -1782,16 +1782,16 @@ class Scheduler(SchedulerInterface):
                 continue
 
             valid_requests.append(request)
-            is_training = self._is_training_request(request)
+            is_secondary = self._is_secondary_request(request)
 
             if request.status == RequestStatus.RUNNING:
-                if is_training:
-                    training_running_requests_to_remove.add(request)
+                if is_secondary:
+                    secondary_running_requests_to_remove.add(request)
                 else:
                     running_requests_to_remove.add(request)
             else:
-                if is_training:
-                    training_waiting_requests_to_remove.append(request)
+                if is_secondary:
+                    secondary_waiting_requests_to_remove.append(request)
                 else:
                     waiting_requests_to_remove.append(request)
 
@@ -1800,12 +1800,12 @@ class Scheduler(SchedulerInterface):
             self.running = remove_all(self.running, running_requests_to_remove)
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
-        if training_running_requests_to_remove:
+        if secondary_running_requests_to_remove:
             self.secondary_running = remove_all(
-                self.secondary_running, training_running_requests_to_remove)
-        if training_waiting_requests_to_remove:
+                self.secondary_running, secondary_running_requests_to_remove)
+        if secondary_waiting_requests_to_remove:
             self.secondary_waiting.remove_requests(
-                training_waiting_requests_to_remove)
+                secondary_waiting_requests_to_remove)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -1820,8 +1820,8 @@ class Scheduler(SchedulerInterface):
         request_id = request.request_id
 
         # Add to appropriate finished sets based on request type
-        is_training = self._is_training_request(request)
-        if is_training:
+        is_secondary = self._is_secondary_request(request)
+        if is_secondary:
             self.finished_req_ids_secondary.add(request_id)
             if self.finished_req_ids_dict_secondary is not None:
                 self.finished_req_ids_dict_secondary[request.client_index].add(request_id)
@@ -1842,15 +1842,15 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
-        is_training = self._is_training_request(request)
+        is_secondary = self._is_secondary_request(request)
 
         # Only free KV cache for inference requests (training doesn't use KV cache)
-        if not is_training:
+        if not is_secondary:
             self.kv_cache_manager.free(request)
 
         # Remove from appropriate state dict
         request_id = request.request_id
-        if is_training:
+        if is_secondary:
             if request_id in self.requests_secondary:
                 del self.requests_secondary[request_id]
         else:

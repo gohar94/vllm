@@ -908,7 +908,6 @@ class EngineCoreProc(EngineCore):
 
     def _process_primary_step(self) -> bool:
         """Process one primary step for threaded mode."""
-        logger.info("Processing primary step")
         # Step the primary engine
         outputs, model_executed = self.step_primary()
         # Put EngineCoreOutputs into the output queue
@@ -920,7 +919,6 @@ class EngineCoreProc(EngineCore):
 
     def _process_secondary_step(self) -> bool:
         """Process one secondary step for threaded mode."""
-        logger.info("Processing secondary step")
         # Step the secondary engine
         outputs, model_executed = self.step_secondary()
         # Put EngineCoreOutputs into the output queue
