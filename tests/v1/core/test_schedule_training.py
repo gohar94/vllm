@@ -12,7 +12,8 @@ from .utils import create_scheduler, EOS_TOKEN_ID
 
 def test_schedule_training_basic():
     """Test basic training request scheduling."""
-    scheduler = create_scheduler(training_token_budget_ratio=0.5)
+    scheduler = create_scheduler(training_token_budget_ratio=0.5,
+                                 async_scheduling=True)
     
     # Add training requests
     training_requests = []
@@ -31,18 +32,18 @@ def test_schedule_training_basic():
         training_requests.append(request)
         scheduler.add_request(request)
     
-    # Verify they're in training_waiting queue
-    assert len(scheduler.training_waiting) == 3
+    # Verify they're in secondary queue
+    assert len(scheduler.secondary_waiting) == 3
     assert len(scheduler.waiting) == 0
     
     # Schedule training requests
-    output = scheduler.schedule_training()
+    output = scheduler.schedule_secondary()
     
     # Verify scheduling worked
     assert len(output.scheduled_new_reqs) == 3
     assert output.total_num_scheduled_tokens == 30  # 3 requests * 10 tokens each
-    assert len(scheduler.training_running) == 3
-    assert len(scheduler.training_waiting) == 0
+    assert len(scheduler.secondary_running) == 3
+    assert len(scheduler.secondary_waiting) == 0
     
     # Verify no KV cache blocks allocated
     for req_data in output.scheduled_new_reqs:
@@ -53,7 +54,8 @@ def test_schedule_training_basic():
 
 def test_schedule_training_with_is_training_flag():
     """Test scheduling with is_training=True flag."""
-    scheduler = create_scheduler(training_token_budget_ratio=0.5)
+    scheduler = create_scheduler(training_token_budget_ratio=0.5,
+                                 async_scheduling=True)
     
     # Add training request with is_training=True
     request = Request(
@@ -66,20 +68,21 @@ def test_schedule_training_with_is_training_flag():
     )
     scheduler.add_request(request)
     
-    assert len(scheduler.training_waiting) == 1
+    assert len(scheduler.secondary_waiting) == 1
     
     # Schedule
-    output = scheduler.schedule_training()
+    output = scheduler.schedule_secondary()
     
     assert len(output.scheduled_new_reqs) == 1
     assert output.total_num_scheduled_tokens == 20
-    assert len(scheduler.training_running) == 1
+    assert len(scheduler.secondary_running) == 1
 
 
 def test_schedule_training_token_budget():
     """Test that training scheduling respects token budget."""
-    scheduler = create_scheduler(max_num_batched_tokens=100, 
-                                 training_token_budget_ratio=0.5)
+    scheduler = create_scheduler(max_num_batched_tokens=100,
+                                 training_token_budget_ratio=0.5,
+                                 async_scheduling=True)
     
     # Add training requests that exceed token budget
     for i in range(5):
@@ -96,22 +99,23 @@ def test_schedule_training_token_budget():
         scheduler.add_request(request)
     
     # Schedule - should respect 50% budget (50 tokens for training)
-    output = scheduler.schedule_training()
+    output = scheduler.schedule_secondary()
     
     # Should only schedule requests that fit in the budget (50 tokens)
     # 1 request = 30 tokens, 2 requests = 50 tokens (30 + 20 due to budget limit)
     # Scheduler is greedy and will fit as many as possible
     assert output.total_num_scheduled_tokens <= 50
     # Can schedule 2 requests: first gets 30 tokens, second gets 20 tokens (limited by budget)
-    assert len(output.scheduled_new_reqs) == 2  
-    assert len(scheduler.training_running) == 2
-    assert len(scheduler.training_waiting) == 3  # 3 still waiting
+    assert len(output.scheduled_new_reqs) == 2
+    assert len(scheduler.secondary_running) == 2
+    assert len(scheduler.secondary_waiting) == 3  # 3 still waiting
 
 
 def test_schedule_training_and_inference_separate():
     """Test that training and inference scheduling are independent."""
     scheduler = create_scheduler(max_num_batched_tokens=100,
-                                 training_token_budget_ratio=0.5)
+                                 training_token_budget_ratio=0.5,
+                                 async_scheduling=True)
     
     # Add inference requests
     for i in range(2):
@@ -140,25 +144,26 @@ def test_schedule_training_and_inference_separate():
     
     # Verify separate queues
     assert len(scheduler.waiting) == 2
-    assert len(scheduler.training_waiting) == 2
+    assert len(scheduler.secondary_waiting) == 2
     
     # Schedule inference
-    inference_output = scheduler.schedule_inference()
+    inference_output = scheduler.schedule_primary()
     assert len(inference_output.scheduled_new_reqs) == 2
     assert len(scheduler.running) == 2
-    assert len(scheduler.training_waiting) == 2  # Training unaffected
+    assert len(scheduler.secondary_waiting) == 2  # Training unaffected
     
     # Schedule training
-    training_output = scheduler.schedule_training()
+    training_output = scheduler.schedule_secondary()
     assert len(training_output.scheduled_new_reqs) == 2
-    assert len(scheduler.training_running) == 2
+    assert len(scheduler.secondary_running) == 2
     assert len(scheduler.running) == 2  # Inference unaffected
 
 
 def test_schedule_training_chunked_prefill():
     """Test training scheduling with chunked prefill."""
     scheduler = create_scheduler(max_num_batched_tokens=100,
-                                 training_token_budget_ratio=0.5)
+                                 training_token_budget_ratio=0.5,
+                                 async_scheduling=True)
     
     # Add large training request
     request = Request(
@@ -174,18 +179,18 @@ def test_schedule_training_chunked_prefill():
     scheduler.add_request(request)
     
     # First schedule - should schedule partial tokens (50 from training budget)
-    output1 = scheduler.schedule_training()
+    output1 = scheduler.schedule_secondary()
     assert output1.total_num_scheduled_tokens == 50  # Training budget
-    assert len(scheduler.training_running) == 1
+    assert len(scheduler.secondary_running) == 1
     
     # Request should still be running (not finished)
-    request_state = scheduler.requests_training["training_large"]
+    request_state = scheduler.requests_secondary["training_large"]
     assert request_state.num_computed_tokens == 50
     
     # Second schedule - should schedule more tokens
     # Note: Due to max_model_len constraint, the last token position is reserved
     # so we get 49 tokens instead of 50
-    output2 = scheduler.schedule_training()
+    output2 = scheduler.schedule_secondary()
     assert output2.total_num_scheduled_tokens <= 50
     assert output2.total_num_scheduled_tokens >= 49  # Could be 49 or 50
     assert request_state.num_computed_tokens >= 99  # Should be close to 100

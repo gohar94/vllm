@@ -44,6 +44,7 @@ def test_scheduler_with_async_scheduling():
         max_num_seqs=10,
         max_num_batched_tokens=100,
         training_token_budget_ratio=0.5,  # 50/50 split
+        async_scheduling=True,
     )
 
     # Note: async_scheduling is a SchedulerConfig parameter, 
@@ -65,17 +66,17 @@ def test_scheduler_with_async_scheduling():
     scheduler.add_request(train_req2)
 
     # Verify queue separation
-    assert scheduler.has_inference_requests()
-    assert scheduler.has_training_requests()
+    assert scheduler.has_primary_requests()
+    assert scheduler.has_secondary_requests()
     assert len(scheduler.waiting) == 2  # 2 inference requests
-    assert len(scheduler.training_waiting) == 2  # 2 training requests
+    assert len(scheduler.secondary_waiting) == 2  # 2 training requests
 
     # Schedule inference requests
-    inf_output = scheduler.schedule_inference()
+    inf_output = scheduler.schedule_primary()
     assert len(inf_output.scheduled_new_reqs) > 0
 
     # Schedule training requests
-    train_output = scheduler.schedule_training()
+    train_output = scheduler.schedule_secondary()
     assert len(train_output.scheduled_new_reqs) > 0
 
     # Verify requests were scheduled from correct queues
@@ -98,14 +99,15 @@ def test_token_budget_allocation():
         max_num_seqs=10,
         max_num_batched_tokens=max_tokens,
         training_token_budget_ratio=training_ratio,
+        async_scheduling=True,
     )
 
     # Check token budget allocation
     expected_training_tokens = int(max_tokens * training_ratio)
     expected_inference_tokens = max_tokens - expected_training_tokens
 
-    assert scheduler.max_num_scheduled_tokens_training == expected_training_tokens
-    assert scheduler.max_num_scheduled_tokens_inference == expected_inference_tokens
+    assert scheduler.max_num_scheduled_tokens_secondary == expected_training_tokens
+    assert scheduler.max_num_scheduled_tokens_primary == expected_inference_tokens
 
 
 def test_concurrent_request_routing():
@@ -114,6 +116,7 @@ def test_concurrent_request_routing():
         max_num_seqs=10,
         max_num_batched_tokens=100,
         training_token_budget_ratio=0.5,
+        async_scheduling=True,
     )
 
     # Create mixed requests
@@ -130,11 +133,11 @@ def test_concurrent_request_routing():
 
     # Verify routing
     assert len(scheduler.waiting) == 2
-    assert len(scheduler.training_waiting) == 2
+    assert len(scheduler.secondary_waiting) == 2
 
     # Verify request IDs in correct queues
     inf_ids = {req.request_id for req in scheduler.waiting}
-    train_ids = {req.request_id for req in scheduler.training_waiting}
+    train_ids = {req.request_id for req in scheduler.secondary_waiting}
 
     assert inf_ids == {"inf_1", "inf_2"}
     assert train_ids == {"train_1", "train_2"}
@@ -146,6 +149,7 @@ def test_is_training_flag_normalization():
         max_num_seqs=10,
         max_num_batched_tokens=100,
         training_token_budget_ratio=0.5,
+        async_scheduling=True,
     )
 
     # Create request with skip_kv_cache=True
@@ -157,11 +161,9 @@ def test_is_training_flag_normalization():
     # After adding to scheduler, is_training should be normalized
     scheduler.add_request(req)
 
-    # The request should now have is_training=True
-    assert req.is_training is True
-
-    # And should be in training queue
-    assert len(scheduler.training_waiting) == 1
+    # The request should remain inference but routed to secondary queue
+    assert req.is_training is False
+    assert len(scheduler.secondary_waiting) == 1
     assert len(scheduler.waiting) == 0
 
 

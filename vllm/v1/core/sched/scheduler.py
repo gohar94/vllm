@@ -7,6 +7,8 @@ import itertools
 import time
 from collections import defaultdict
 from collections.abc import Iterable
+import threading
+from functools import wraps
 from typing import Any, Optional, Union
 
 from vllm.config import VllmConfig
@@ -38,6 +40,16 @@ from vllm.v1.structured_output import StructuredOutputManager
 logger = init_logger(__name__)
 
 
+def synchronized(method):
+    """Decorator to ensure scheduler methods hold the internal lock."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class Scheduler(SchedulerInterface):
 
     def __init__(
@@ -59,6 +71,9 @@ class Scheduler(SchedulerInterface):
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+
+        # Protect all scheduler state mutations accessed from multiple threads.
+        self._lock = threading.RLock()
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -199,6 +214,7 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+    @synchronized
     def schedule_primary(self) -> SchedulerOutput:
         """Schedule primary (regular inference) requests from waiting and running queues.
 
@@ -636,6 +652,8 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
         )
+        # Annotate the originating queue so update_from_output can dispatch.
+        scheduler_output.queue = "primary"
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -665,6 +683,7 @@ class Scheduler(SchedulerInterface):
         self._update_after_schedule(scheduler_output, is_primary=True)
         return scheduler_output
 
+    @synchronized
     def schedule_secondary(self) -> SchedulerOutput:
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -1089,6 +1108,7 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
         )
+        scheduler_output.queue = "secondary"
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1118,6 +1138,7 @@ class Scheduler(SchedulerInterface):
         self._update_after_schedule(scheduler_output, is_primary=False)
         return scheduler_output
 
+    @synchronized
     def schedule(self) -> SchedulerOutput:
         """Backward compatibility wrapper for single-threaded execution.
         
@@ -1126,10 +1147,17 @@ class Scheduler(SchedulerInterface):
         calls schedule_primary/schedule_secondary directly.
         """
         logger.info(f"Scheduling requests: {self.use_separate_queues}")
-        if self.use_separate_queues:
-            raise ValueError("use_separate_queues should be False in single-threaded mode")
+        if not self.use_separate_queues:
+            return self.schedule_primary()
 
-        return self.schedule_primary()
+        # Try scheduling primary work first to preserve legacy behavior.
+        primary_output = self.schedule_primary()
+        if (primary_output.total_num_scheduled_tokens
+                or primary_output.finished_req_ids):
+            return primary_output
+
+        # Fallback to scheduling secondary work if no primary progress made.
+        return self.schedule_secondary()
 
     def _update_after_schedule(
         self,
@@ -1373,6 +1401,7 @@ class Scheduler(SchedulerInterface):
             )
         return structured_output_request_ids, bitmask
 
+    @synchronized
     def update_from_output_primary(
         self,
         scheduler_output: SchedulerOutput,
@@ -1389,6 +1418,7 @@ class Scheduler(SchedulerInterface):
             is_primary=True,
         )
 
+    @synchronized
     def update_from_output_secondary(
         self,
         scheduler_output: SchedulerOutput,
@@ -1405,6 +1435,7 @@ class Scheduler(SchedulerInterface):
             is_primary=False,
         )
 
+    @synchronized
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1416,6 +1447,10 @@ class Scheduler(SchedulerInterface):
         Uses unified state for tests/code that bypasses add_request() and directly
         manipulates scheduler.requests and scheduler.running.
         """
+        # Auto-detect queue when caller uses the legacy API without specifying.
+        if is_primary and getattr(scheduler_output, "queue", None) == "secondary":
+            is_primary = False
+
         return self._update_from_output_impl(
             scheduler_output=scheduler_output,
             model_runner_output=model_runner_output,
@@ -1699,6 +1734,7 @@ class Scheduler(SchedulerInterface):
         """Check if a request should be routed to the secondary queue."""
         return self._is_training_request(request) or self._should_skip_kv_cache(request)
 
+    @synchronized
     def add_request(self, request: Request) -> None:
         """Add request to appropriate queue based on request type."""
         if self.use_separate_queues and self._is_secondary_request(request):
@@ -1716,6 +1752,7 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
+    @synchronized
     def finish_requests(
         self,
         request_ids: Union[str, Iterable[str]],
@@ -1731,7 +1768,6 @@ class Scheduler(SchedulerInterface):
             request_ids = (request_ids, )
         else:
             request_ids = set(request_ids)
-
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
         training_running_requests_to_remove = set()
@@ -1765,9 +1801,11 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
         if training_running_requests_to_remove:
-            self.secondary_running = remove_all(self.secondary_running, training_running_requests_to_remove)
+            self.secondary_running = remove_all(
+                self.secondary_running, training_running_requests_to_remove)
         if training_waiting_requests_to_remove:
-            self.secondary_waiting.remove_requests(training_waiting_requests_to_remove)
+            self.secondary_waiting.remove_requests(
+                training_waiting_requests_to_remove)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -1823,28 +1861,35 @@ class Scheduler(SchedulerInterface):
         if request_id in self.requests:
             del self.requests[request_id]
 
+    @synchronized
     def get_num_unfinished_requests(self) -> int:
         """Returns total number of unfinished requests (inference + training)."""
-        return (len(self.waiting) + len(self.running) + 
+        return (len(self.waiting) + len(self.running) +
                 len(self.secondary_waiting) + len(self.secondary_running))
 
+    @synchronized
     def has_primary_requests(self) -> bool:
         """Returns True if there are unfinished or finished primary requests."""
-        return (len(self.waiting) > 0 or len(self.running) > 0 or
-                len(self.finished_req_ids_primary) > 0)
+        return (len(self.waiting) > 0 or len(self.running) > 0
+                or len(self.finished_req_ids_primary) > 0)
 
+    @synchronized
     def has_secondary_requests(self) -> bool:
         """Returns True if there are unfinished or finished secondary requests."""
-        return (len(self.secondary_waiting) > 0 or len(self.secondary_running) > 0 or
-                len(self.finished_req_ids_secondary) > 0)
+        return (len(self.secondary_waiting) > 0
+                or len(self.secondary_running) > 0
+                or len(self.finished_req_ids_secondary) > 0)
 
+    @synchronized
     def has_finished_requests(self) -> bool:
         """Returns True if there are finished requests (inference or training)."""
         return len(self.finished_req_ids) > 0
 
+    @synchronized
     def reset_prefix_cache(self) -> bool:
         return self.kv_cache_manager.reset_prefix_cache()
 
+    @synchronized
     def make_stats(
         self,
         spec_decoding_stats: Optional[SpecDecodingStats] = None,
@@ -1865,6 +1910,7 @@ class Scheduler(SchedulerInterface):
                                    for req in self.running),
         )
 
+    @synchronized
     def make_spec_decoding_stats(
         self,
         spec_decoding_stats: Optional[SpecDecodingStats],
@@ -1880,6 +1926,7 @@ class Scheduler(SchedulerInterface):
             num_accepted_tokens=num_accepted_tokens)
         return spec_decoding_stats
 
+    @synchronized
     def shutdown(self) -> None:
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
