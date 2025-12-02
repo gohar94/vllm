@@ -1457,9 +1457,12 @@ class Scheduler(SchedulerInterface):
         Uses unified state for tests/code that bypasses add_request() and directly
         manipulates scheduler.requests and scheduler.running.
         """
-        # Auto-detect queue when caller uses the legacy API without specifying.
-        if is_primary and getattr(scheduler_output, "queue", None) == "secondary":
-            is_primary = False
+        queue = getattr(scheduler_output, "queue", None)
+        if queue == "secondary":
+            return self.update_from_output_secondary(scheduler_output,
+                                                     model_runner_output)
+        if queue == "primary":
+            is_primary = True
 
         return self._update_from_output_impl(
             scheduler_output=scheduler_output,

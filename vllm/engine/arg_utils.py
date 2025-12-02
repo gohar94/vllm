@@ -1426,20 +1426,22 @@ class EngineArgs:
                 "Default modality-specific LoRA(s) were provided for a "
                 "non multimodal model")
 
-        lora_config = LoRAConfig(
-            bias_enabled=self.enable_lora_bias,
-            max_lora_rank=self.max_lora_rank,
-            max_loras=self.max_loras,
-            default_mm_loras=self.default_mm_loras,
-            fully_sharded_loras=self.fully_sharded_loras,
-            lora_extra_vocab_size=self.lora_extra_vocab_size,
-            lora_dtype=self.lora_dtype,
-            max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
-            and self.max_cpu_loras > 0 else None,
-            lora_alpha=self.lora_alpha,
-            lora_training_target_modules=self.lora_training_target_modules,
-            enable_lora_training=self.enable_lora_training if self.enable_lora else None,
-            lora_scheduler_type=self.lora_scheduler_type)
+        lora_config = None
+        if self.enable_lora:
+            lora_config = LoRAConfig(
+                bias_enabled=self.enable_lora_bias,
+                max_lora_rank=self.max_lora_rank,
+                max_loras=self.max_loras,
+                default_mm_loras=self.default_mm_loras,
+                fully_sharded_loras=self.fully_sharded_loras,
+                lora_extra_vocab_size=self.lora_extra_vocab_size,
+                lora_dtype=self.lora_dtype,
+                max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
+                and self.max_cpu_loras > 0 else None,
+                lora_alpha=self.lora_alpha,
+                lora_training_target_modules=self.lora_training_target_modules,
+                enable_lora_training=self.enable_lora_training,
+                lora_scheduler_type=self.lora_scheduler_type)
 
         # bitsandbytes pre-quantized model need a specific model loader
         if model_config.quantization == "bitsandbytes":

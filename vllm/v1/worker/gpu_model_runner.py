@@ -265,6 +265,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.secondary_stream = None
         else:
             if role == "secondary":
+                # Secondary stream is the same as the primary stream.
                 self.primary_stream = shared_runner.secondary_stream
                 self.secondary_stream = shared_runner.secondary_stream
             else:
@@ -327,9 +328,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if shared_runner is None:
             self.requests_lock = threading.RLock()
             self.requests: dict[str, CachedRequestState] = {}
+            self.lora_lock = threading.RLock()
         else:
             self.requests_lock = shared_runner.requests_lock
             self.requests = shared_runner.requests
+            self.lora_lock = getattr(shared_runner, "lora_lock",
+                                     threading.RLock())
 
         self.comm_stream = torch.cuda.Stream()
 

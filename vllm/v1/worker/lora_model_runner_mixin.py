@@ -72,7 +72,8 @@ class LoRAModelRunnerMixin:
         lora_mapping = LoRAMapping(token_lora_mapping,
                                    prompt_lora_mapping,
                                    is_prefill=True)
-        self.lora_manager.set_active_adapters(lora_requests, lora_mapping)
+        with self.lora_lock:
+            self.lora_manager.set_active_adapters(lora_requests, lora_mapping)
 
     def _ensure_lora_enabled(self) -> None:
         if not hasattr(self, "lora_manager"):
@@ -174,20 +175,25 @@ class LoRAModelRunnerMixin:
     def maybe_remove_all_loras(self, lora_config: Optional[LoRAConfig]):
         if lora_config is None:
             return
-        self.lora_manager.remove_all_adapters()
+        with self.lora_lock:
+            self.lora_manager.remove_all_adapters()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         self._ensure_lora_enabled()
-        return self.lora_manager.add_adapter(lora_request)
+        with self.lora_lock:
+            return self.lora_manager.add_adapter(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
         self._ensure_lora_enabled()
-        return self.lora_manager.remove_adapter(lora_id)
+        with self.lora_lock:
+            return self.lora_manager.remove_adapter(lora_id)
 
     def pin_lora(self, lora_id: int) -> bool:
         self._ensure_lora_enabled()
-        return self.lora_manager.pin_adapter(lora_id)
+        with self.lora_lock:
+            return self.lora_manager.pin_adapter(lora_id)
 
     def list_loras(self) -> set[int]:
         self._ensure_lora_enabled()
-        return self.lora_manager.list_adapters()
+        with self.lora_lock:
+            return self.lora_manager.list_adapters()
