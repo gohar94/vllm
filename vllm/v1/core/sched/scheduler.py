@@ -1539,7 +1539,7 @@ class Scheduler(SchedulerInterface):
             # Training requests and skip_kv_cache requests finish after their forward pass (no generation)
             is_training = self._is_training_request(request)
             is_skip_kv_cache = self._should_skip_kv_cache(request)
-            logger.info(f"Finishing request {req_id}: is_training={is_training}, is_skip_kv_cache={is_skip_kv_cache}, is_primary={is_primary}")
+            logger.debug(f"Finishing request {req_id}: is_training={is_training}, is_skip_kv_cache={is_skip_kv_cache}, is_primary={is_primary}")
 
             if is_training or is_skip_kv_cache:
                 stopped = True
@@ -1733,7 +1733,7 @@ class Scheduler(SchedulerInterface):
     def _is_training_request(self, request: Request) -> bool:
         """Check if a request is a training request."""
         if request.is_training:
-            logger.info(f"Request {request.request_id} is a training request")
+            logger.debug(f"Request {request.request_id} is a training request")
             return True
         return False
     
@@ -1751,11 +1751,11 @@ class Scheduler(SchedulerInterface):
     def add_request(self, request: Request) -> None:
         """Add request to appropriate queue based on request type."""
         if self.use_separate_queues and self._is_secondary_request(request):
-            logger.info(f"Adding request {request.request_id} to secondary queue")
+            logger.debug(f"Adding request {request.request_id} to secondary queue")
             self.secondary_waiting.add_request(request)
             self.requests_secondary[request.request_id] = request
         else:
-            logger.info(f"Adding request {request.request_id} to primary queue")
+            logger.debug(f"Adding request {request.request_id} to primary queue")
             self.waiting.add_request(request)
             self.requests_primary[request.request_id] = request
 

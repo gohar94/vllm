@@ -822,7 +822,7 @@ class WorkerProc:
                 output_rank = task.output_rank
             else:
                 rpc_id, method, args, kwargs, output_rank = task
-            logger.info("Worker rank %s executing rpc_id=%s on %s stream",
+            logger.debug("Worker rank %s executing rpc_id=%s on %s stream",
                         self.rank, rpc_id, role)
             try:
                 func = self._resolve_method(method)
@@ -938,7 +938,7 @@ class WorkerProc:
                                output_rank=output_rank)
             target_queue = self._select_task_queue(method, args)
             target_queue.put(task)
-            logger.info("Worker rank %s dispatched rpc_id=%s to %s queue",
+            logger.debug("Worker rank %s dispatched rpc_id=%s to %s queue",
                         self.rank, rpc_id,
                         "secondary" if target_queue
                         is self.secondary_task_queue else "primary")

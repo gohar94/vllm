@@ -255,11 +255,28 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Primary: regular inference, Secondary: training/skip_kv_cache
         if shared_runner is None:
             if scheduler_config.async_scheduling:
-                self.primary_stream = torch.cuda.Stream(device=device)
-                self.secondary_stream = torch.cuda.Stream(device=device)
-                logger.info("Created CUDA streams for concurrent execution: "
-                            "primary_stream=%s, secondary_stream=%s",
-                            self.primary_stream, self.secondary_stream)
+                # Try to create streams with priorities for better scheduling
+                # Higher priority (lower number) for primary stream (inference)
+                # Lower priority (higher number) for secondary stream (training/skip_kv_cache)
+                try:
+                    priority_low, priority_high = torch.cuda.Stream.priority_range()
+                    self.primary_stream = torch.cuda.Stream(
+                        device=device, priority=priority_high)
+                    self.secondary_stream = torch.cuda.Stream(
+                        device=device, priority=priority_low)
+                    logger.info("Created CUDA streams with priorities for concurrent execution: "
+                                "primary_stream=%s (priority=%d), secondary_stream=%s (priority=%d)",
+                                self.primary_stream, priority_high,
+                                self.secondary_stream, priority_low)
+                except (RuntimeError, AttributeError) as e:
+                    # Fallback to default priority if not supported
+                    # This can happen on older GPUs or if priority support is unavailable
+                    logger.warning("Stream priorities not available, using default priority: %s", e)
+                    self.primary_stream = torch.cuda.Stream(device=device)
+                    self.secondary_stream = torch.cuda.Stream(device=device)
+                    logger.info("Created CUDA streams for concurrent execution: "
+                                "primary_stream=%s, secondary_stream=%s",
+                                self.primary_stream, self.secondary_stream)
             else:
                 self.primary_stream = None
                 self.secondary_stream = None
@@ -2297,7 +2314,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Guard against missing streams (should not happen, but be defensive).
         if stream is None:
-            logger.info("execute_model(%s stream unavailable) requests=%s "
+            logger.debug("execute_model(%s stream unavailable) requests=%s "
                         "training=%s skip_kv=%s",
                         selected_stream_name, scheduled_req_ids,
                         has_training_requests, has_skip_kv_cache)
@@ -2305,7 +2322,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Ensure the selected stream has visibility into prior work/materialise results.
         if stream != default_stream:
-            logger.info("execute_model(stream=%s) waiting on default stream "
+            logger.debug("execute_model(stream=%s) waiting on default stream "
                         "for requests=%s training=%s skip_kv=%s",
                         selected_stream_name, scheduled_req_ids,
                         has_training_requests, has_skip_kv_cache)
@@ -2313,11 +2330,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             with torch.cuda.stream(stream):
                 output = execute_fn(scheduler_output, intermediate_tensors)
             default_stream.wait_stream(stream)
-            logger.info("execute_model(stream=%s) finished requests=%s",
+            logger.debug("execute_model(stream=%s) finished requests=%s",
                         selected_stream_name, scheduled_req_ids)
             return output
 
-        logger.info("execute_model(stream=default) executing requests=%s",
+        logger.debug("execute_model(stream=default) executing requests=%s",
                     scheduled_req_ids)
         return execute_fn(scheduler_output, intermediate_tensors)
 
