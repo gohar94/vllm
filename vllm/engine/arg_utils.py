@@ -931,7 +931,7 @@ class EngineArgs:
         scheduler_group.add_argument("--async-scheduling",
                                      **scheduler_kwargs["async_scheduling"])
         scheduler_group.add_argument("--training-token-budget-ratio",
-                                     **scheduler_kwargs["token_budget_ratio"])
+                                     **scheduler_kwargs["training_token_budget_ratio"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)

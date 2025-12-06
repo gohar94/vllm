@@ -2280,7 +2280,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # If CUDA stream multiplexing is disabled, fall back to the default path.
         if self.primary_stream is None:
-            logger.info("execute_model(default stream): requests=%s "
+            logger.debug("execute_model(default stream): requests=%s "
                         "training=%s skip_kv=%s",
                         scheduled_req_ids, has_training_requests,
                         has_skip_kv_cache)
