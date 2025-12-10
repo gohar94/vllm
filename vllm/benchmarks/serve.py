@@ -1013,6 +1013,11 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "openai-compatible backends. If not specified, default to greedy "
         "decoding (i.e. temperature==0.0).",
     )
+    sampling_group.add_argument(
+        "--skip-kv-cache",
+        action="store_true",
+        help="Skip KV cache. If not specified, default to False.",
+    )
 
     parser.add_argument(
         '--tokenizer-mode',
@@ -1161,6 +1166,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
+
+    if args.skip_kv_cache:
+        sampling_params["vllm_xargs"] = {
+            "skip_kv_cache": True,
+        }
 
     # Avoid GC processing "static" data - reduce pause times.
     gc.collect()

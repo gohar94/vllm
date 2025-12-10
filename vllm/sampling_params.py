@@ -354,6 +354,13 @@ class SamplingParams(
         # eos_token_id is added to this by the engine
         self._all_stop_token_ids.update(self.stop_token_ids)
 
+        # Convert skip_kv_cache to boolean
+        if self.extra_args is not None and "skip_kv_cache" in self.extra_args:
+            if self.extra_args["skip_kv_cache"] == True or self.extra_args["skip_kv_cache"] == "1":
+                self.extra_args["skip_kv_cache"] = True
+            else:
+                self.extra_args["skip_kv_cache"] = False
+
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):
             raise ValueError(f"n must be an int, but is of "
@@ -435,9 +442,10 @@ class SamplingParams(
         if self.best_of != self._real_n and self.output_kind == (
                 RequestOutputKind.DELTA):
             raise ValueError("best_of must equal n to use output_kind=DELTA")
-        if self.extra_args is not None and "skip_kv_cache" in self.extra_args and self.extra_args["skip_kv_cache"]:
-            if self.min_tokens != 1 and self.max_tokens != 1:
-                raise ValueError("skip_kv_cache is only supported when min_tokens and max_tokens are both 1")
+        if self.extra_args is not None and "skip_kv_cache" in self.extra_args:
+            if self.extra_args["skip_kv_cache"] == True or self.extra_args["skip_kv_cache"] == "1":
+                if self.min_tokens != 1 and self.max_tokens != 1:
+                    raise ValueError("skip_kv_cache is only supported when min_tokens and max_tokens are both 1")
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
