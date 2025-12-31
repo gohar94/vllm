@@ -44,6 +44,7 @@ from vllm.v1.engine.utils import (EngineHandshakeMetadata, EngineZmqAddresses,
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.timing import TimingCollector
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -288,9 +289,20 @@ class EngineCore:
 
         scheduler_output = self.scheduler.schedule_primary()
 
+        # Time model execution
+        _exec_start_time = time.perf_counter()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
+        _exec_duration_ms = (time.perf_counter() - _exec_start_time) * 1000
+        
+        # Record execution timing
+        _batch_size = len(scheduler_output.num_scheduled_tokens)
+        TimingCollector.get_instance().record_execute_primary(
+            _exec_duration_ms,
+            scheduler_output.total_num_scheduled_tokens,
+            _batch_size
+        )
 
         engine_core_outputs = self.scheduler.update_from_output_primary(
             scheduler_output, model_output)  # type: ignore
@@ -313,9 +325,20 @@ class EngineCore:
         if scheduler_output.total_num_scheduled_tokens == 0:
             return {}, False
 
+        # Time model execution
+        _exec_start_time = time.perf_counter()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
+        _exec_duration_ms = (time.perf_counter() - _exec_start_time) * 1000
+        
+        # Record execution timing
+        _batch_size = len(scheduler_output.num_scheduled_tokens)
+        TimingCollector.get_instance().record_execute_secondary(
+            _exec_duration_ms,
+            scheduler_output.total_num_scheduled_tokens,
+            _batch_size
+        )
 
         engine_core_outputs = self.scheduler.update_from_output_secondary(
             scheduler_output, model_output)  # type: ignore
@@ -398,6 +421,15 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def shutdown(self):
+        # Export timing metrics before shutdown
+        timing_collector = TimingCollector.get_instance()
+        if timing_collector.enabled:
+            timing_collector.print_summary()
+            try:
+                timing_collector.export_all()
+            except Exception as e:
+                logger.warning("Failed to export timing metrics: %s", e)
+        
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()

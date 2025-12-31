@@ -32,6 +32,7 @@ import nvtx
 from torch import nn
 from transformers import LlamaConfig
 
+from contextlib import contextmanager
 from vllm.attention import Attention, AttentionType
 from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
@@ -57,6 +58,47 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+
+# Optional LaAL shim per-stream operator hints (no-op if shim isn't present).
+try:
+    from LaAL.shim.bindings.scheduler import set_operator as _laal_set_operator
+    _LAAL_SHIM_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _LAAL_SHIM_AVAILABLE = False
+    _laal_set_operator = None
+
+
+@contextmanager
+def _laal_stream_hint(op: str, tensor: Optional[torch.Tensor] = None):
+    """Best-effort: tag the current CUDA stream with an operator type.
+
+    Args:
+        op: Operator name ("mlp", "attention", "layernorm").
+        tensor: Optional tensor to determine CUDA device/stream.
+    """
+    if not _LAAL_SHIM_AVAILABLE:
+        yield
+        return
+
+    # Get CUDA stream handle
+    stream_handle = 0  # default stream
+    try:
+        if tensor is not None and getattr(tensor, "is_cuda", False):
+            stream = torch.cuda.current_stream(tensor.device)
+            stream_handle = stream.cuda_stream
+        elif torch.cuda.is_available():
+            stream = torch.cuda.current_stream()
+            stream_handle = stream.cuda_stream
+    except Exception:
+        pass
+
+    try:
+        # set_operator accepts strings directly (e.g., "mlp", "attention")
+        _laal_set_operator(stream_handle, op)
+        yield
+    finally:
+        # End the operator by setting back to "unknown"
+        _laal_set_operator(stream_handle, "unknown")
 
 
 class LlamaMLP(nn.Module):
@@ -93,10 +135,11 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        x, _ = self.gate_up_proj(x)
-        x = self.act_fn(x)
-        x, _ = self.down_proj(x)
-        return x
+        with _laal_stream_hint("mlp", x):
+            x, _ = self.gate_up_proj(x)
+            x = self.act_fn(x)
+            x, _ = self.down_proj(x)
+            return x
 
 
 class LlamaAttention(nn.Module):
@@ -339,17 +382,24 @@ class LlamaDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass for LoRA training. Follows the order of operations as in Transformers."""
         residual = hidden_states
-        hidden_states, _ = self.input_layernorm(hidden_states, residual, is_training=True)
+        with _laal_stream_hint("layernorm", hidden_states):
+            hidden_states, _ = self.input_layernorm(hidden_states,
+                                                   residual,
+                                                   is_training=True)
 
         # Self Attention
-        hidden_states = self.self_attn(positions=positions,
-                                       hidden_states=hidden_states,
-                                       is_lora_training=True)
+        with _laal_stream_hint("attention", hidden_states):
+            hidden_states = self.self_attn(positions=positions,
+                                           hidden_states=hidden_states,
+                                           is_lora_training=True)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states, is_training=True)
+        with _laal_stream_hint("layernorm", hidden_states):
+            hidden_states = self.post_attention_layernorm(hidden_states,
+                                                         is_training=True)
+        # MLP stream hint is set inside LlamaMLP.forward.
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states, None
@@ -371,32 +421,39 @@ class LlamaDecoderLayer(nn.Module):
         # Self Attention
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            with _laal_stream_hint("layernorm", hidden_states):
+                hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            with _laal_stream_hint("layernorm", hidden_states):
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
 
         if is_profiling_enabled:
             nvtx.pop_range()
             nvtx.push_range("LaAL::LlamaDecoderLayer.self_attn")
 
-        hidden_states = self.self_attn(positions=positions,
-                                       hidden_states=hidden_states,
-                                       is_lora_training=False,
-                                       is_profiling_enabled=is_profiling_enabled)
+        with _laal_stream_hint("attention", hidden_states):
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                is_lora_training=False,
+                is_profiling_enabled=is_profiling_enabled,
+            )
 
         if is_profiling_enabled:
             nvtx.pop_range()
             nvtx.push_range("LaAL::LlamaDecoderLayer.post_attention_layernorm")
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        with _laal_stream_hint("layernorm", hidden_states):
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
 
         if is_profiling_enabled:
             nvtx.pop_range()
             nvtx.push_range("LaAL::LlamaDecoderLayer.mlp")
 
+        # MLP stream hint is set inside LlamaMLP.forward.
         hidden_states = self.mlp(hidden_states)
 
         if is_profiling_enabled:
@@ -510,7 +567,8 @@ class LlamaModel(nn.Module):
         if is_profiling_enabled:
             nvtx.push_range("LaAL::LlamaModel.norm")
 
-        ret = self.norm(hidden_states, residual, is_training=is_lora_training)
+        with _laal_stream_hint("layernorm", hidden_states):
+            ret = self.norm(hidden_states, residual, is_training=is_lora_training)
 
         if is_profiling_enabled:
             nvtx.pop_range()

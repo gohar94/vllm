@@ -374,9 +374,10 @@ class MultiprocExecutor(Executor):
                 del self.io_thread_pool
 
         self.rpc_broadcast_mq = None
-        for thread in self._response_threads:
-            thread.join(timeout=1.0)
-        self._response_threads.clear()
+        if getattr(self, '_response_threads', []) != []:
+            for thread in self._response_threads:
+                thread.join(timeout=1.0)
+            self._response_threads.clear()
 
     def check_health(self) -> None:
         self.collective_rpc("check_health", timeout=10)

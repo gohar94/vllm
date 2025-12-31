@@ -483,6 +483,12 @@ class EngineArgs:
 
     training_token_budget_ratio: float = SchedulerConfig.training_token_budget_ratio
 
+    enable_timing: bool = False
+    """Enable timing instrumentation for analyzing scheduling and execution latency."""
+    
+    timing_output_dir: Optional[str] = None
+    """Directory to save timing metrics CSV files. Defaults to /tmp/vllm_timing."""
+
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
@@ -932,6 +938,18 @@ class EngineArgs:
                                      **scheduler_kwargs["async_scheduling"])
         scheduler_group.add_argument("--training-token-budget-ratio",
                                      **scheduler_kwargs["training_token_budget_ratio"])
+        scheduler_group.add_argument(
+            "--enable-timing",
+            action="store_true",
+            default=False,
+            help="Enable timing instrumentation for analyzing scheduling and "
+                 "execution latency. Outputs CSV files for analysis.")
+        scheduler_group.add_argument(
+            "--timing-output-dir",
+            type=str,
+            default=None,
+            help="Directory to save timing metrics CSV files. "
+                 "Defaults to /tmp/vllm_timing.")
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)

@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -120,6 +121,22 @@ PerLayerAttnMetadata: TypeAlias = Union[list[AttnMetadataDict],
                                         AttnMetadataDict]
 
 
+# Optional LaAL shim scheduler control (no-op if shim isn't present).
+try:
+    from LaAL.shim.bindings.scheduler import (
+        start_scheduler as _laal_start_scheduler,
+        is_scheduler_running as _laal_is_scheduler_running,
+    )
+    logger.info("LaAL scheduler bindings imported")
+except Exception:  # pragma: no cover
+    logger.info("LaAL scheduler bindings not imported")
+    def _laal_start_scheduler() -> bool:
+        return False
+
+    def _laal_is_scheduler_running() -> bool:
+        return False
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
@@ -189,6 +206,39 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+        # Best-effort: if the LaAL shim is loaded, start the scheduler.
+        # This is intended for single-worker execution (TP=1, PP=1, DP=1).
+        #
+        # We only enforce single-worker assertions if the shim actually
+        # started successfully (so non-shim runs won't break).
+        pid = os.getpid()
+
+        # Check if scheduler is already running (autostart) or start it now
+        try:
+            if _laal_is_scheduler_running():
+                scheduler_active = True
+                logger.info(f"LaAL scheduler is running")
+            else:
+                scheduler_active = _laal_start_scheduler()
+                logger.info(f"LaAL scheduler started")
+        except Exception as e:
+            logger.info(f"LaAL exception: {e}")
+            scheduler_active = False
+
+        if scheduler_active:
+            assert self.parallel_config.tensor_parallel_size == 1, (
+                "LaAL shim scheduler mode requires tensor_parallel_size=1")
+            assert self.parallel_config.pipeline_parallel_size == 1, (
+                "LaAL shim scheduler mode requires pipeline_parallel_size=1")
+            assert self.parallel_config.data_parallel_size == 1, (
+                "LaAL shim scheduler mode requires data_parallel_size=1")
+            assert self.parallel_config.world_size == 1, (
+                "LaAL shim scheduler mode requires world_size=1 (TPxPP)")
+            logger.info("LaAL shim: scheduler active (single-worker mode), "
+                        "pid: %d", pid)
+        else:
+            logger.info("LaAL shim: scheduler not active, pid: %d", pid)
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -264,19 +314,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         device=device, priority=priority_high)
                     self.secondary_stream = torch.cuda.Stream(
                         device=device, priority=priority_low)
-                    logger.info("Created CUDA streams with priorities for concurrent execution: "
-                                "primary_stream=%s (priority=%d), secondary_stream=%s (priority=%d)",
-                                self.primary_stream, priority_high,
-                                self.secondary_stream, priority_low)
+                    logger.info(
+                        "LaAL vLLM streams created: primary=%s priority=%d, secondary=%s priority=%d",
+                        self.primary_stream,
+                        priority_high,
+                        self.secondary_stream,
+                        priority_low,
+                    )
                 except (RuntimeError, AttributeError) as e:
                     # Fallback to default priority if not supported
                     # This can happen on older GPUs or if priority support is unavailable
                     logger.warning("Stream priorities not available, using default priority: %s", e)
                     self.primary_stream = torch.cuda.Stream(device=device)
                     self.secondary_stream = torch.cuda.Stream(device=device)
-                    logger.info("Created CUDA streams for concurrent execution: "
-                                "primary_stream=%s, secondary_stream=%s",
-                                self.primary_stream, self.secondary_stream)
+                    logger.info(
+                        "LaAL vLLM streams created (default priority): primary=%s, secondary=%s",
+                        self.primary_stream,
+                        self.secondary_stream,
+                    )
             else:
                 self.primary_stream = None
                 self.secondary_stream = None
@@ -2278,65 +2333,36 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if has_training_requests and has_skip_kv_cache:
                     break
 
-        # If CUDA stream multiplexing is disabled, fall back to the default path.
-        if self.primary_stream is None:
-            logger.debug("execute_model(default stream): requests=%s "
-                        "training=%s skip_kv=%s",
-                        scheduled_req_ids, has_training_requests,
-                        has_skip_kv_cache)
-            if has_training_requests:
-                return self.execute_model_training(scheduler_output,
-                                                   intermediate_tensors)
-            return self.execute_model_inference(scheduler_output,
-                                                intermediate_tensors)
-
-        # Select execution stream and function.
-        default_stream = torch.cuda.current_stream()
-        stream = self.primary_stream
+        # Select execution function based on request type.
         execute_fn: Callable[[SchedulerOutput,
                               Optional[IntermediateTensors]],
                              Union[ModelRunnerOutput, AsyncModelRunnerOutput,
                                    IntermediateTensors]]
+        execute_fn = (self.execute_model_training if has_training_requests
+                      else self.execute_model_inference)
 
-        if has_training_requests:
-            execute_fn = self.execute_model_training
-            stream = self.secondary_stream or self.primary_stream
-            selected_stream_name = ("secondary"
-                                    if stream is self.secondary_stream else
-                                    "primary")
-        else:
-            execute_fn = self.execute_model_inference
-            if has_skip_kv_cache and self.secondary_stream is not None:
-                stream = self.secondary_stream
-                selected_stream_name = "secondary"
-            else:
-                selected_stream_name = "primary"
+        # Select stream: secondary for training/skip_kv_cache, primary otherwise.
+        use_secondary = has_training_requests or has_skip_kv_cache
+        stream = (self.secondary_stream if use_secondary else self.primary_stream)
 
-        # Guard against missing streams (should not happen, but be defensive).
+        # If streams not available, execute on default stream.
         if stream is None:
-            logger.debug("execute_model(%s stream unavailable) requests=%s "
-                        "training=%s skip_kv=%s",
-                        selected_stream_name, scheduled_req_ids,
-                        has_training_requests, has_skip_kv_cache)
+            logger.debug("execute_model(default): requests=%s training=%s skip_kv=%s",
+                        scheduled_req_ids, has_training_requests, has_skip_kv_cache)
             return execute_fn(scheduler_output, intermediate_tensors)
 
-        # Ensure the selected stream has visibility into prior work/materialise results.
-        if stream != default_stream:
-            logger.debug("execute_model(stream=%s) waiting on default stream "
-                        "for requests=%s training=%s skip_kv=%s",
-                        selected_stream_name, scheduled_req_ids,
-                        has_training_requests, has_skip_kv_cache)
-            stream.wait_stream(default_stream)
-            with torch.cuda.stream(stream):
-                output = execute_fn(scheduler_output, intermediate_tensors)
-            default_stream.wait_stream(stream)
-            logger.debug("execute_model(stream=%s) finished requests=%s",
-                        selected_stream_name, scheduled_req_ids)
-            return output
+        # Execute on selected stream.
+        stream_name = "secondary" if use_secondary else "primary"
+        logger.debug("execute_model(%s): requests=%s training=%s skip_kv=%s",
+                    stream_name, scheduled_req_ids,
+                    has_training_requests, has_skip_kv_cache)
 
-        logger.debug("execute_model(stream=default) executing requests=%s",
-                    scheduled_req_ids)
-        return execute_fn(scheduler_output, intermediate_tensors)
+        with torch.cuda.stream(stream):
+            output = execute_fn(scheduler_output, intermediate_tensors)
+
+        # Synchronize so the output is ready for caller.
+        stream.synchronize()
+        return output
 
     @torch.inference_mode()
     def execute_model_inference(

@@ -32,6 +32,8 @@ from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.timing import (TimingCollector, time_schedule_primary,
+                                     time_schedule_secondary)
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -239,6 +241,7 @@ class Scheduler(SchedulerInterface):
         chunked prefills, prefix caching, speculative decoding,
         and the "jump decoding" optimization in the future.
         """
+        _schedule_start_time = time.perf_counter()
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -691,10 +694,21 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output, is_primary=True)
+        
+        # Record timing for schedule_primary
+        _schedule_duration_ms = (time.perf_counter() - _schedule_start_time) * 1000
+        _batch_size = len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs)
+        TimingCollector.get_instance().record_schedule_primary(
+            _schedule_duration_ms, 
+            scheduler_output.total_num_scheduled_tokens,
+            _batch_size
+        )
+        
         return scheduler_output
 
     @synchronized
     def schedule_secondary(self) -> SchedulerOutput:
+        _schedule_start_time = time.perf_counter()
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -1146,6 +1160,16 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output, is_primary=False)
+        
+        # Record timing for schedule_secondary
+        _schedule_duration_ms = (time.perf_counter() - _schedule_start_time) * 1000
+        _batch_size = len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs)
+        TimingCollector.get_instance().record_schedule_secondary(
+            _schedule_duration_ms,
+            scheduler_output.total_num_scheduled_tokens,
+            _batch_size
+        )
+        
         return scheduler_output
 
     @synchronized
@@ -1838,10 +1862,16 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids_secondary.add(request_id)
             if self.finished_req_ids_dict_secondary is not None:
                 self.finished_req_ids_dict_secondary[request.client_index].add(request_id)
+            # Record request completion for timing analysis
+            TimingCollector.get_instance().record_request_completed_secondary(
+                request.num_prompt_tokens, request.num_output_tokens)
         else:
             self.finished_req_ids_primary.add(request_id)
             if self.finished_req_ids_dict_primary is not None:
                 self.finished_req_ids_dict_primary[request.client_index].add(request_id)
+            # Record request completion for timing analysis
+            TimingCollector.get_instance().record_request_completed_primary(
+                request.num_prompt_tokens, request.num_output_tokens)
 
         # Also add to unified view for backward compatibility
         self.finished_req_ids.add(request_id)
