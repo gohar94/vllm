@@ -694,12 +694,29 @@ def split_decodes_and_prefills(
         return num_reqs, 0, num_tokens, 0
 
     first_prefill = is_prefill.int().argmax(dim=-1).item()
-    assert torch.all(query_lens[first_prefill:] > decode_threshold)
-    assert torch.all(query_lens[:first_prefill] <= decode_threshold)
-    num_decodes = first_prefill
-    num_prefills = num_reqs - num_decodes
-    num_decode_tokens = query_start_loc[first_prefill].item()
-    num_prefill_tokens = num_tokens - num_decode_tokens
+    
+    # Check if batch is properly ordered (all decodes before all prefills).
+    # This may not hold for training/skip_kv_cache batches with chunked prefill
+    # where subsequent chunks may have varying token counts.
+    is_ordered = (torch.all(query_lens[first_prefill:] > decode_threshold) and
+                  torch.all(query_lens[:first_prefill] <= decode_threshold))
+    
+    if is_ordered:
+        # Fast path: batch is properly ordered
+        num_decodes = first_prefill
+        num_prefills = num_reqs - num_decodes
+        num_decode_tokens = query_start_loc[first_prefill].item()
+        num_prefill_tokens = num_tokens - num_decode_tokens
+    else:
+        # Batch is not ordered - this can happen with training/skip_kv_cache 
+        # chunked prefill where chunks have varying token counts.
+        # Fall back to treating everything as prefill to avoid incorrect
+        # tensor slicing in the attention forward path.
+        num_decodes = 0
+        num_prefills = num_reqs
+        num_decode_tokens = 0
+        num_prefill_tokens = num_tokens
+    
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 

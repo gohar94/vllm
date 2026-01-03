@@ -294,8 +294,13 @@ class KVCacheManager:
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
-        # We also skip caching for training requests.
-        if not self.enable_caching or delay_cache_blocks or request.is_training:
+        # We also skip caching for training requests and skip_kv_cache requests.
+        # These requests allocate KV cache for chunked prefill but don't save
+        # to prefix cache for future requests.
+        skip_kv_cache = (request.sampling_params is not None
+                         and request.sampling_params.extra_args is not None
+                         and request.sampling_params.extra_args.get("skip_kv_cache", False))
+        if not self.enable_caching or delay_cache_blocks or request.is_training or skip_kv_cache:
             return KVCacheBlocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_computed_tokens +

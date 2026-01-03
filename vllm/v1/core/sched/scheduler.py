@@ -98,16 +98,16 @@ class Scheduler(SchedulerInterface):
 
         # Token budgets for secondary (training/skip_kv_cache) vs primary (regular inference)
         secondary_ratio = self.scheduler_config.training_token_budget_ratio
-        if self.scheduler_config.async_scheduling and secondary_ratio == 0.0:
-            # Default to an even split when concurrent scheduling is enabled
-            # but no explicit secondary budget was provided. Without a non-zero
-            # budget, secondary requests (training / skip_kv_cache) would
-            # never be scheduled.
-            secondary_ratio = 0.5
-            self.scheduler_config.training_token_budget_ratio = secondary_ratio
-            logger.info(
-                "async_scheduling enabled but training_token_budget_ratio "
-                "was 0; defaulting to 0.5 so secondary requests can run.")
+        # if self.scheduler_config.async_scheduling and secondary_ratio == 0.0:
+        #     # Default to an even split when concurrent scheduling is enabled
+        #     # but no explicit secondary budget was provided. Without a non-zero
+        #     # budget, secondary requests (training / skip_kv_cache) would
+        #     # never be scheduled.
+        #     secondary_ratio = 0.5
+        #     self.scheduler_config.training_token_budget_ratio = secondary_ratio
+        #     logger.info(
+        #         "async_scheduling enabled but training_token_budget_ratio "
+        #         "was 0; defaulting to 0.5 so secondary requests can run.")
         self.max_num_scheduled_tokens_secondary = int(
             self.max_num_scheduled_tokens * secondary_ratio)
         self.max_num_scheduled_tokens_primary = int(
@@ -305,54 +305,53 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            # Skip KV cache allocation for skip_kv_cache requests
-            if self._should_skip_kv_cache(request):
-                new_blocks = None  # No KV cache needed
-                can_schedule = True
-            else:
-                while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens)
-                    if new_blocks is None:
-                        # The request cannot be scheduled.
-                        # Preempt the lowest-priority request.
-                        if self.policy == SchedulingPolicy.PRIORITY:
-                            preempted_req = max(
-                                self.running,
-                                key=lambda r: (r.priority, r.arrival_time),
-                            )
-                            self.running.remove(preempted_req)
-                            if preempted_req in scheduled_running_reqs:
-                                scheduled_running_reqs.remove(preempted_req)
-                        else:
-                            preempted_req = self.running.pop()
-
-                        self.kv_cache_manager.free(preempted_req)
-                        self.encoder_cache_manager.free(preempted_req)
-                        preempted_req.status = RequestStatus.PREEMPTED
-                        preempted_req.num_computed_tokens = 0
-                        if self.log_stats:
-                            preempted_req.record_event(
-                                EngineCoreEventType.PREEMPTED,
-                                scheduled_timestamp)
-
-                        self.waiting.prepend_request(preempted_req)
-                        preempted_reqs.append(preempted_req)
-                        if preempted_req == request:
-                            # No more request to preempt.
-                            can_schedule = False
-                            break
+            # Allocate KV cache for running requests.
+            # Note: training/skip_kv_cache requests also allocate KV cache (for chunked prefill)
+            # but don't use prefix caching. The KV cache is freed after the request completes.
+            while True:
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens,
+                    num_lookahead_tokens=self.num_lookahead_tokens)
+                if new_blocks is None:
+                    # The request cannot be scheduled.
+                    # Preempt the lowest-priority request.
+                    if self.policy == SchedulingPolicy.PRIORITY:
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: (r.priority, r.arrival_time),
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            scheduled_running_reqs.remove(preempted_req)
                     else:
-                        # The request can be scheduled.
-                        can_schedule = True
+                        preempted_req = self.running.pop()
+
+                    self.kv_cache_manager.free(preempted_req)
+                    self.encoder_cache_manager.free(preempted_req)
+                    preempted_req.status = RequestStatus.PREEMPTED
+                    preempted_req.num_computed_tokens = 0
+                    if self.log_stats:
+                        preempted_req.record_event(
+                            EngineCoreEventType.PREEMPTED,
+                            scheduled_timestamp)
+
+                    self.waiting.prepend_request(preempted_req)
+                    preempted_reqs.append(preempted_req)
+                    if preempted_req == request:
+                        # No more request to preempt.
+                        can_schedule = False
                         break
-                if not can_schedule:
+                else:
+                    # The request can be scheduled.
+                    can_schedule = True
                     break
+            if not can_schedule:
+                break
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            request.num_batches += 1  # Track batch/chunk count
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
@@ -531,23 +530,22 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                # Skip KV cache allocation for skip_kv_cache requests
-                if self._should_skip_kv_cache(request):
-                    new_blocks = None  # No KV cache needed
-                else:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens + num_external_computed_tokens,
-                        num_new_local_computed_tokens,
-                        new_computed_blocks,
-                        num_lookahead_tokens=effective_lookahead_tokens,
-                        delay_cache_blocks=load_kv_async,
-                        num_encoder_tokens=num_encoder_tokens,
-                    )
+                # Allocate KV cache for new requests.
+                # Note: training/skip_kv_cache requests also allocate KV cache (for chunked prefill)
+                # but don't use prefix caching. The KV cache is freed after the request completes.
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens + num_external_computed_tokens,
+                    num_new_local_computed_tokens,
+                    new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                    delay_cache_blocks=load_kv_async,
+                    num_encoder_tokens=num_encoder_tokens,
+                )
 
-                    if new_blocks is None:
-                        # The request cannot be scheduled.
-                        break
+                if new_blocks is None:
+                    # The request cannot be scheduled.
+                    break
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -572,6 +570,7 @@ class Scheduler(SchedulerInterface):
 
                 req_index += 1
                 self.running.append(request)
+                request.num_batches += 1  # Track batch/chunk count
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
@@ -772,54 +771,53 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            # Skip KV cache allocation for skip_kv_cache requests
-            if self._should_skip_kv_cache(request):
-                new_blocks = None  # No KV cache needed
-                can_schedule = True
-            else:
-                while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens)
-                    if new_blocks is None:
-                        # The request cannot be scheduled.
-                        # Preempt the lowest-priority request.
-                        if self.policy == SchedulingPolicy.PRIORITY:
-                            preempted_req = max(
-                                self.secondary_running,
-                                key=lambda r: (r.priority, r.arrival_time),
-                            )
-                            self.secondary_running.remove(preempted_req)
-                            if preempted_req in scheduled_running_reqs:
-                                scheduled_running_reqs.remove(preempted_req)
-                        else:
-                            preempted_req = self.secondary_running.pop()
-
-                        self.kv_cache_manager.free(preempted_req)
-                        self.encoder_cache_manager.free(preempted_req)
-                        preempted_req.status = RequestStatus.PREEMPTED
-                        preempted_req.num_computed_tokens = 0
-                        if self.log_stats:
-                            preempted_req.record_event(
-                                EngineCoreEventType.PREEMPTED,
-                                scheduled_timestamp)
-
-                        self.secondary_waiting.prepend_request(preempted_req)
-                        preempted_reqs.append(preempted_req)
-                        if preempted_req == request:
-                            # No more request to preempt.
-                            can_schedule = False
-                            break
+            # Allocate KV cache for running requests.
+            # Note: training/skip_kv_cache requests also allocate KV cache (for chunked prefill)
+            # but don't use prefix caching. The KV cache is freed after the request completes.
+            while True:
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens,
+                    num_lookahead_tokens=self.num_lookahead_tokens)
+                if new_blocks is None:
+                    # The request cannot be scheduled.
+                    # Preempt the lowest-priority request.
+                    if self.policy == SchedulingPolicy.PRIORITY:
+                        preempted_req = max(
+                            self.secondary_running,
+                            key=lambda r: (r.priority, r.arrival_time),
+                        )
+                        self.secondary_running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            scheduled_running_reqs.remove(preempted_req)
                     else:
-                        # The request can be scheduled.
-                        can_schedule = True
+                        preempted_req = self.secondary_running.pop()
+
+                    self.kv_cache_manager.free(preempted_req)
+                    self.encoder_cache_manager.free(preempted_req)
+                    preempted_req.status = RequestStatus.PREEMPTED
+                    preempted_req.num_computed_tokens = 0
+                    if self.log_stats:
+                        preempted_req.record_event(
+                            EngineCoreEventType.PREEMPTED,
+                            scheduled_timestamp)
+
+                    self.secondary_waiting.prepend_request(preempted_req)
+                    preempted_reqs.append(preempted_req)
+                    if preempted_req == request:
+                        # No more request to preempt.
+                        can_schedule = False
                         break
-                if not can_schedule:
+                else:
+                    # The request can be scheduled.
+                    can_schedule = True
                     break
+            if not can_schedule:
+                break
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            request.num_batches += 1  # Track batch/chunk count
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
@@ -998,23 +996,22 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                # Skip KV cache allocation for skip_kv_cache requests
-                if self._should_skip_kv_cache(request):
-                    new_blocks = None  # No KV cache needed
-                else:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens + num_external_computed_tokens,
-                        num_new_local_computed_tokens,
-                        new_computed_blocks,
-                        num_lookahead_tokens=effective_lookahead_tokens,
-                        delay_cache_blocks=load_kv_async,
-                        num_encoder_tokens=num_encoder_tokens,
-                    )
+                # Allocate KV cache for new requests.
+                # Note: training/skip_kv_cache requests also allocate KV cache (for chunked prefill)
+                # but don't use prefix caching. The KV cache is freed after the request completes.
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens + num_external_computed_tokens,
+                    num_new_local_computed_tokens,
+                    new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                    delay_cache_blocks=load_kv_async,
+                    num_encoder_tokens=num_encoder_tokens,
+                )
 
-                    if new_blocks is None:
-                        # The request cannot be scheduled.
-                        break
+                if new_blocks is None:
+                    # The request cannot be scheduled.
+                    break
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1039,6 +1036,7 @@ class Scheduler(SchedulerInterface):
 
                 req_index += 1
                 self.secondary_running.append(request)
+                request.num_batches += 1  # Track batch/chunk count
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
@@ -1560,14 +1558,21 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
-            # Training requests and skip_kv_cache requests finish after their forward pass (no generation)
+            # Training requests and skip_kv_cache requests finish after ALL prompt tokens 
+            # have been processed. They allocate KV cache for chunked prefill but don't
+            # use prefix caching. They don't generate output tokens.
             is_training = self._is_training_request(request)
             is_skip_kv_cache = self._should_skip_kv_cache(request)
-            logger.debug(f"Finishing request {req_id}: is_training={is_training}, is_skip_kv_cache={is_skip_kv_cache}, is_primary={is_primary}")
+            logger.debug(f"Processing request {req_id}: is_training={is_training}, is_skip_kv_cache={is_skip_kv_cache}, "
+                        f"num_computed={request.num_computed_tokens}, num_prompt={request.num_prompt_tokens}")
 
             if is_training or is_skip_kv_cache:
-                stopped = True
-                request.status = RequestStatus.FINISHED_STOPPED
+                # Only finish after all prompt tokens have been processed
+                # (num_computed_tokens is already updated by _update_after_schedule before this call)
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    stopped = True
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    logger.debug(f"Training/skip_kv_cache request {req_id} finished after full prefill")
             # Check for stop and update request status.
             elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -1858,20 +1863,26 @@ class Scheduler(SchedulerInterface):
 
         # Add to appropriate finished sets based on request type
         is_secondary = self._is_secondary_request(request)
+        # Only record completion stats for requests that actually completed,
+        # not aborted ones (e.g., at shutdown)
+        is_actually_completed = (request.status != RequestStatus.FINISHED_ABORTED)
+        
         if is_secondary:
             self.finished_req_ids_secondary.add(request_id)
             if self.finished_req_ids_dict_secondary is not None:
                 self.finished_req_ids_dict_secondary[request.client_index].add(request_id)
-            # Record request completion for timing analysis
-            TimingCollector.get_instance().record_request_completed_secondary(
-                request.num_prompt_tokens, request.num_output_tokens)
+            # Record request completion for timing analysis (skip aborted requests)
+            if is_actually_completed:
+                TimingCollector.get_instance().record_request_completed_secondary(
+                    request.num_prompt_tokens, request.num_output_tokens, request.num_batches)
         else:
             self.finished_req_ids_primary.add(request_id)
             if self.finished_req_ids_dict_primary is not None:
                 self.finished_req_ids_dict_primary[request.client_index].add(request_id)
-            # Record request completion for timing analysis
-            TimingCollector.get_instance().record_request_completed_primary(
-                request.num_prompt_tokens, request.num_output_tokens)
+            # Record request completion for timing analysis (skip aborted requests)
+            if is_actually_completed:
+                TimingCollector.get_instance().record_request_completed_primary(
+                    request.num_prompt_tokens, request.num_output_tokens, request.num_batches)
 
         # Also add to unified view for backward compatibility
         self.finished_req_ids.add(request_id)
@@ -1887,9 +1898,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         is_secondary = self._is_secondary_request(request)
 
-        # Only free KV cache for inference requests (training doesn't use KV cache)
-        if not is_secondary:
-            self.kv_cache_manager.free(request)
+        # Free KV cache for all requests (training/skip_kv_cache now allocate KV cache
+        # for chunked prefill, just without prefix caching)
+        self.kv_cache_manager.free(request)
 
         # Remove from appropriate state dict
         request_id = request.request_id
@@ -1927,6 +1938,51 @@ class Scheduler(SchedulerInterface):
     def has_finished_requests(self) -> bool:
         """Returns True if there are finished requests (inference or training)."""
         return len(self.finished_req_ids) > 0
+
+    def get_prefill_decode_split(
+        self,
+        scheduler_output: SchedulerOutput,
+        is_primary: bool = True,
+    ) -> tuple[int, int]:
+        """
+        Compute the prefill/decode token split for a scheduler output.
+        
+        A request is in "decode" phase if it has only 1 token scheduled AND
+        has already processed all its prompt tokens. Otherwise it's "prefill".
+        
+        Args:
+            scheduler_output: The scheduler output to analyze
+            is_primary: Whether this is for primary (inference) or secondary (training) requests
+            
+        Returns:
+            (prefill_tokens, decode_tokens) tuple
+        """
+        requests_dict = self.requests_primary if is_primary else self.requests_secondary
+        
+        prefill_tokens = 0
+        decode_tokens = 0
+        
+        for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
+            request = requests_dict.get(req_id)
+            if request is None:
+                # Request may have been aborted, count as prefill (unknown)
+                prefill_tokens += num_scheduled
+                continue
+            
+            # A request is in decode phase if:
+            # 1. Only 1 token is scheduled (not chunked prefill)
+            # 2. All prompt tokens have been processed (num_computed_tokens >= num_prompt_tokens)
+            # Note: num_computed_tokens is updated AFTER model execution, so at scheduling time
+            # it reflects the state before this step.
+            is_decode = (num_scheduled == 1 and 
+                        request.num_computed_tokens >= request.num_prompt_tokens)
+            
+            if is_decode:
+                decode_tokens += num_scheduled
+            else:
+                prefill_tokens += num_scheduled
+        
+        return prefill_tokens, decode_tokens
 
     @synchronized
     def reset_prefix_cache(self) -> bool:

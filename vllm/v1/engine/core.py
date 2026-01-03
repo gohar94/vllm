@@ -289,6 +289,10 @@ class EngineCore:
 
         scheduler_output = self.scheduler.schedule_primary()
 
+        # Compute prefill/decode split before execution (for timing metrics)
+        _prefill_tokens, _decode_tokens = self.scheduler.get_prefill_decode_split(
+            scheduler_output, is_primary=True)
+        
         # Time model execution
         _exec_start_time = time.perf_counter()
         model_output = self.execute_model_with_error_logging(
@@ -296,12 +300,14 @@ class EngineCore:
             scheduler_output)
         _exec_duration_ms = (time.perf_counter() - _exec_start_time) * 1000
         
-        # Record execution timing
+        # Record execution timing with prefill/decode split
         _batch_size = len(scheduler_output.num_scheduled_tokens)
         TimingCollector.get_instance().record_execute_primary(
             _exec_duration_ms,
             scheduler_output.total_num_scheduled_tokens,
-            _batch_size
+            _batch_size,
+            _prefill_tokens,
+            _decode_tokens
         )
 
         engine_core_outputs = self.scheduler.update_from_output_primary(
@@ -325,6 +331,10 @@ class EngineCore:
         if scheduler_output.total_num_scheduled_tokens == 0:
             return {}, False
 
+        # Compute prefill/decode split before execution (for timing metrics)
+        _prefill_tokens, _decode_tokens = self.scheduler.get_prefill_decode_split(
+            scheduler_output, is_primary=False)
+
         # Time model execution
         _exec_start_time = time.perf_counter()
         model_output = self.execute_model_with_error_logging(
@@ -332,12 +342,14 @@ class EngineCore:
             scheduler_output)
         _exec_duration_ms = (time.perf_counter() - _exec_start_time) * 1000
         
-        # Record execution timing
+        # Record execution timing with prefill/decode split
         _batch_size = len(scheduler_output.num_scheduled_tokens)
         TimingCollector.get_instance().record_execute_secondary(
             _exec_duration_ms,
             scheduler_output.total_num_scheduled_tokens,
-            _batch_size
+            _batch_size,
+            _prefill_tokens,
+            _decode_tokens
         )
 
         engine_core_outputs = self.scheduler.update_from_output_secondary(
