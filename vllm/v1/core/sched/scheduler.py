@@ -98,16 +98,10 @@ class Scheduler(SchedulerInterface):
 
         # Token budgets for secondary (training/skip_kv_cache) vs primary (regular inference)
         secondary_ratio = self.scheduler_config.training_token_budget_ratio
-        # if self.scheduler_config.async_scheduling and secondary_ratio == 0.0:
-        #     # Default to an even split when concurrent scheduling is enabled
-        #     # but no explicit secondary budget was provided. Without a non-zero
-        #     # budget, secondary requests (training / skip_kv_cache) would
-        #     # never be scheduled.
-        #     secondary_ratio = 0.5
-        #     self.scheduler_config.training_token_budget_ratio = secondary_ratio
-        #     logger.info(
-        #         "async_scheduling enabled but training_token_budget_ratio "
-        #         "was 0; defaulting to 0.5 so secondary requests can run.")
+        # NOTE: If async_scheduling is enabled but training_token_budget_ratio is 0,
+        # secondary requests (training/skip_kv_cache) will have no token budget and
+        # will not be scheduled. Callers should set training_token_budget_ratio > 0
+        # when using skip_kv_cache or training requests with async_scheduling.
         self.max_num_scheduled_tokens_secondary = int(
             self.max_num_scheduled_tokens * secondary_ratio)
         self.max_num_scheduled_tokens_primary = int(
