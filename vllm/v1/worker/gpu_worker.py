@@ -730,6 +730,7 @@ class Worker(WorkerBase):
 
     def shutdown(self) -> None:
         self.model_runner.ensure_kv_transfer_shutdown()
+        self.model_runner.shutdown()
 
 
 def init_worker_distributed_environment(

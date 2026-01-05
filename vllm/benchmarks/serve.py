@@ -34,6 +34,10 @@ from typing import Any, Literal, Optional
 _shutdown_requested = False
 _shutdown_event: Optional[asyncio.Event] = None
 
+# Global flag and event for synchronized start (wait for SIGUSR2)
+_start_signal_received = False
+_start_event: Optional[asyncio.Event] = None
+
 import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm
@@ -406,6 +410,7 @@ async def benchmark(
     ramp_up_start_rps: Optional[int] = None,
     ramp_up_end_rps: Optional[int] = None,
     ready_check_timeout_sec: int = 600,
+    wait_for_start_signal: bool = False,
 ):
     task_type = (
         TaskType.EMBEDDING
@@ -479,7 +484,19 @@ async def benchmark(
             "Initial test run failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {test_output.error}")
     else:
-        print("Initial test run completed. Starting main benchmark run...")
+        print("Initial test run completed. Warmup complete.")
+
+    # Wait for SIGUSR2 if synchronized start is requested
+    if wait_for_start_signal:
+        print("READY - Waiting for SIGUSR2 to start benchmark...")
+        # Flush stdout so the parent process can detect "READY"
+        import sys
+        sys.stdout.flush()
+        # Wait for the start signal
+        await _start_event.wait()
+        print("Starting main benchmark run...")
+    else:
+        print("Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -1158,6 +1175,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="Maximum time to wait for the endpoint to become ready "
         "in seconds (default: 600 seconds / 10 minutes).",
     )
+    parser.add_argument(
+        "--wait-for-start-signal",
+        action="store_true",
+        help="After warmup, wait for SIGUSR2 before starting the benchmark. "
+        "This allows multiple benchmark clients to synchronize their start time.",
+    )
 
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
@@ -1179,15 +1202,39 @@ def _handle_shutdown_signal(signum, frame):
             pass
 
 
+def _handle_start_signal(signum, frame):
+    """Signal handler for synchronized start (SIGUSR2)."""
+    global _start_signal_received, _start_event
+    print(f"\nReceived SIGUSR2 - starting benchmark...")
+    _start_signal_received = True
+    # Set the event in a thread-safe way if it exists
+    if _start_event is not None:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(_start_event.set)
+        except RuntimeError:
+            # No running loop, just set directly (may not wake up waiters)
+            pass
+
+
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
-    global _shutdown_event
+    global _shutdown_event, _start_event, _start_signal_received
 
     # Create the shutdown event for this run
     _shutdown_event = asyncio.Event()
+    
+    # Create the start event for synchronized start
+    _start_event = asyncio.Event()
+    _start_signal_received = False
 
     # Setup signal handler for graceful shutdown (SIGUSR1)
     # This allows external processes to signal the benchmark to stop gracefully
     signal.signal(signal.SIGUSR1, _handle_shutdown_signal)
+    
+    # Setup signal handler for synchronized start (SIGUSR2)
+    # This allows external processes to signal when to start the benchmark
+    if hasattr(args, 'wait_for_start_signal') and args.wait_for_start_signal:
+        signal.signal(signal.SIGUSR2, _handle_start_signal)
     
     print(args)
     random.seed(args.seed)
@@ -1310,6 +1357,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_start_rps=args.ramp_up_start_rps,
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
+        wait_for_start_signal=getattr(args, 'wait_for_start_signal', False),
     )
 
     # Save config and results to json
