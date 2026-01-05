@@ -125,12 +125,16 @@ PerLayerAttnMetadata: TypeAlias = Union[list[AttnMetadataDict],
 try:
     from LaAL.shim.bindings.scheduler import (
         start_scheduler as _laal_start_scheduler,
+        stop_scheduler as _laal_stop_scheduler,
         is_scheduler_running as _laal_is_scheduler_running,
     )
     logger.info("LaAL scheduler bindings imported")
 except Exception:  # pragma: no cover
     logger.info("LaAL scheduler bindings not imported")
     def _laal_start_scheduler() -> bool:
+        return False
+
+    def _laal_stop_scheduler() -> bool:
         return False
 
     def _laal_is_scheduler_running() -> bool:
@@ -362,9 +366,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if shared_runner is None:
             # mm_hash ->  encoder_output
             self.encoder_cache: dict[str, torch.Tensor] = {}
+            self.encoder_cache_lock = threading.Lock()
             self.training_manager: Optional[TrainingManager] = None
         else:
             self.encoder_cache = shared_runner.encoder_cache
+            self.encoder_cache_lock = shared_runner.encoder_cache_lock
             self.training_manager = shared_runner.training_manager
 
         self.use_aux_hidden_state_outputs = False
@@ -526,6 +532,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device="cpu",
             pin_memory=self.pin_memory)
 
+    def shutdown(self) -> None:
+        """Shutdown the model runner, stopping the LaAL scheduler if active."""
+        # Only the primary runner (not shared) should stop the scheduler
+        if self._shared_runner is None and self._role == "primary":
+            try:
+                if _laal_stop_scheduler():
+                    logger.info("LaAL scheduler stopped and traces flushed")
+            except Exception as e:
+                logger.debug("Failed to stop LaAL scheduler: %s", e)
+
     def spawn_stream_runner(self, role: str) -> "GPUModelRunner":
         if role == "primary":
             raise ValueError("Primary stream runner already exists.")
@@ -672,8 +688,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.input_batch.remove_request(req_id)
 
             # Free the cached encoder outputs.
-            for mm_hash in scheduler_output.free_encoder_mm_hashes:
-                self.encoder_cache.pop(mm_hash, None)
+            with self.encoder_cache_lock:
+                for mm_hash in scheduler_output.free_encoder_mm_hashes:
+                    self.encoder_cache.pop(mm_hash, None)
 
             # Remove the unscheduled requests from the persistent batch.
             scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
@@ -1656,11 +1673,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 encoder_outputs.append(output)
 
         # Cache the encoder outputs by mm_hash
-        for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
-            self.encoder_cache[mm_hash] = scatter_mm_placeholders(
-                output,
-                is_embed=pos_info.is_embed,
-            )
+        with self.encoder_cache_lock:
+            for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
+                self.encoder_cache[mm_hash] = scatter_mm_placeholders(
+                    output,
+                    is_embed=pos_info.is_embed,
+                )
 
     def _gather_mm_embeddings(
         self,
@@ -1699,7 +1717,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 assert start_idx < end_idx
 
                 mm_hash = mm_feature.identifier
-                encoder_output = self.encoder_cache.get(mm_hash, None)
+                with self.encoder_cache_lock:
+                    encoder_output = self.encoder_cache.get(mm_hash, None)
                 assert encoder_output is not None,\
                     f"Encoder cache miss for {mm_hash}."
 
@@ -3749,8 +3768,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
 
                     # Cache the dummy encoder outputs.
-                    self.encoder_cache["tmp"] = dict(
-                        enumerate(dummy_encoder_outputs))
+                    with self.encoder_cache_lock:
+                        self.encoder_cache["tmp"] = dict(
+                            enumerate(dummy_encoder_outputs))
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states \
@@ -3764,7 +3784,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             output = None
         self._sync_device()
         del hidden_states, output
-        self.encoder_cache.clear()
+        with self.encoder_cache_lock:
+            self.encoder_cache.clear()
         gc.collect()
 
     def capture_model(self) -> int:
