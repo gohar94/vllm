@@ -4,8 +4,8 @@
 import copy
 import gc
 import os
-from contextlib import AbstractContextManager, nullcontext
-from typing import TYPE_CHECKING, Any, Optional, Union
+from contextlib import AbstractContextManager, nullcontext, contextmanager
+from typing import TYPE_CHECKING, Any, ContextManager, Optional, Union
 
 import torch
 import torch.distributed
@@ -198,9 +198,14 @@ class Worker(WorkerBase):
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
-        # Construct the model runner
-        self.model_runner: GPUModelRunner = GPUModelRunner(
+        # Construct the model runner(s)
+        self.primary_runner: GPUModelRunner = GPUModelRunner(
             self.vllm_config, self.device)
+        self.model_runners: dict[str, GPUModelRunner] = {
+            "primary": self.primary_runner
+        }
+        self._active_runner: GPUModelRunner = self.primary_runner
+        self.secondary_runner: Optional[GPUModelRunner] = None
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -305,6 +310,36 @@ class Worker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    def _ensure_secondary_runner(self) -> None:
+        if not self.scheduler_config.async_scheduling:
+            self.secondary_runner = None
+            return
+        if "secondary" in self.model_runners:
+            return
+        secondary = self.primary_runner.spawn_stream_runner("secondary")
+        self.model_runners["secondary"] = secondary
+        self.secondary_runner = secondary
+
+    @contextmanager
+    def use_runner(self, role: str) -> ContextManager[GPUModelRunner]:
+        runner = self.model_runners.get(role)
+        if runner is None:
+            raise ValueError(f"Runner for role '{role}' is not initialized.")
+        previous = self._active_runner
+        self._active_runner = runner
+        try:
+            yield runner
+        finally:
+            self._active_runner = previous
+
+    @property
+    def model_runner(self) -> GPUModelRunner:
+        return self._active_runner
+
+    @model_runner.setter
+    def model_runner(self, runner: GPUModelRunner) -> None:
+        self._active_runner = runner
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
@@ -317,6 +352,7 @@ class Worker(WorkerBase):
             context = nullcontext()
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+        self._ensure_secondary_runner()
 
     def compile_or_warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,

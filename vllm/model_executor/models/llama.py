@@ -28,6 +28,7 @@ from itertools import islice
 from typing import Any, Optional, Union
 
 import torch
+import nvtx
 from torch import nn
 from transformers import LlamaConfig
 
@@ -209,14 +210,39 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        is_lora_training: bool = False,
+        is_profiling_enabled: bool = False,
     ) -> torch.Tensor:
+        if is_profiling_enabled:
+            nvtx.push_range("LaAL::LlamaAttention.qkv_proj")
+
         qkv, _ = self.qkv_proj(hidden_states)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+            nvtx.push_range("LaAL::LlamaAttention.rotary_emb")
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # The following is not needed for training in Transformers.
-        with torch.no_grad():
+        ctx = torch.no_grad() if not is_lora_training else nullcontext()
+        with ctx:
             q, k = self.rotary_emb(positions, q, k)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+            nvtx.push_range("LAAL::LlamaAttention.attn")
+
         attn_output = self.attn(q, k, v)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+            nvtx.push_range("LAAL::LlamaAttention.o_proj")
+
         output, _ = self.o_proj(attn_output)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+
         return output
 
     def _init_rotary_emb(self, config: LlamaConfig,
@@ -317,7 +343,8 @@ class LlamaDecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states = self.self_attn(positions=positions,
-                                       hidden_states=hidden_states)
+                                       hidden_states=hidden_states,
+                                       is_lora_training=True)
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -333,9 +360,13 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         is_lora_training: bool = False,
+        is_profiling_enabled: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if is_lora_training:
             return self.forward_training(positions, hidden_states, residual)
+
+        if is_profiling_enabled:
+            nvtx.push_range("LaAL::LlamaDecoderLayer.input_layernorm")
 
         # Self Attention
         if residual is None:
@@ -344,13 +375,33 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+            nvtx.push_range("LaAL::LlamaDecoderLayer.self_attn")
+
         hidden_states = self.self_attn(positions=positions,
-                                       hidden_states=hidden_states)
+                                       hidden_states=hidden_states,
+                                       is_lora_training=False,
+                                       is_profiling_enabled=is_profiling_enabled)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+            nvtx.push_range("LaAL::LlamaDecoderLayer.post_attention_layernorm")
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+            nvtx.push_range("LaAL::LlamaDecoderLayer.mlp")
+
         hidden_states = self.mlp(hidden_states)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+
         return hidden_states, residual
 
 
@@ -414,8 +465,12 @@ class LlamaModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
         is_lora_training: bool = False,
+        is_profiling_enabled: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors, tuple[torch.Tensor,
                                                         list[torch.Tensor]]]:
+        if is_profiling_enabled:
+            nvtx.push_range("LaAL::LlamaModel.forward")
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -432,15 +487,34 @@ class LlamaModel(nn.Module):
                 islice(self.layers, self.start_layer, self.end_layer)):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(positions, hidden_states, residual, is_lora_training=is_lora_training)
+
+            if is_profiling_enabled:
+                nvtx.push_range(f"LaAL::LlamaModel.layer_{idx}")
+
+            hidden_states, residual = layer(positions, hidden_states, residual,
+                                            is_lora_training=is_lora_training,
+                                            is_profiling_enabled=is_profiling_enabled)
+
+            if is_profiling_enabled:
+                nvtx.pop_range()
 
         if not get_pp_group().is_last_rank:
+            if is_profiling_enabled:
+                nvtx.pop_range()
+
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
 
+        if is_profiling_enabled:
+            nvtx.push_range("LaAL::LlamaModel.norm")
+
         ret = self.norm(hidden_states, residual, is_training=is_lora_training)
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
+
         if isinstance(ret, tuple):
             hidden_states, _ = ret
         else:
@@ -448,6 +522,9 @@ class LlamaModel(nn.Module):
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
+
+        if is_profiling_enabled:
+            nvtx.pop_range()
 
         return hidden_states
 
@@ -629,9 +706,11 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         is_lora_training: bool = False,
+        is_profiling_enabled: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         model_output = self.model(input_ids, positions, intermediate_tensors,
-                                  inputs_embeds, is_lora_training=is_lora_training)
+                                  inputs_embeds, is_lora_training=is_lora_training,
+                                  is_profiling_enabled=is_profiling_enabled)
         return model_output
 
     def compute_logits(

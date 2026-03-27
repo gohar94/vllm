@@ -227,7 +227,10 @@ class FlashAttentionMetadataBuilder(
     def build(self,
               common_prefix_len: int,
               common_attn_metadata: CommonAttentionMetadata,
-              fast_build: bool = False) -> FlashAttentionMetadata:
+              fast_build: bool = False,
+              is_training: Optional[bool] = False,
+              is_profiling_enabled: Optional[bool] = False,
+              training_attention_mask: Optional[dict] = None) -> FlashAttentionMetadata:
         """
         fast_build disables AOT scheduling, used when there will be few 
         iterations i.e. spec-decode

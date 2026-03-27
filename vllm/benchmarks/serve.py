@@ -21,6 +21,7 @@ import gc
 import json
 import os
 import random
+import signal
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable
@@ -28,6 +29,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Optional
+
+# Global flag and event for graceful shutdown
+_shutdown_requested = False
+_shutdown_event: Optional[asyncio.Event] = None
 
 import aiohttp
 import numpy as np
@@ -197,6 +202,12 @@ async def get_request(
 
     start_ts = time.time()
     for request_index, request in enumerate(input_requests):
+        # Check for graceful shutdown signal
+        if _shutdown_requested:
+            print(f"\nGraceful shutdown requested. "
+                  f"Stopping after {request_index} requests "
+                  f"(out of {total_requests}).")
+            return
         if delay_ts[request_index] > 0:
             current_ts = time.time()
             sleep_interval_s = start_ts + delay_ts[request_index] - current_ts
@@ -579,7 +590,79 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input,
                                      session=session,
                                      pbar=pbar)))
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    # Helper function to cancel pending tasks and collect completed ones
+    async def _cancel_and_collect() -> tuple[list[RequestFuncOutput], list[SampleRequest]]:
+        print("Cancelling in-flight requests...")
+        completed_outputs = []
+        completed_input_requests = []
+        cancelled_count = 0
+        for i, task in enumerate(tasks):
+            if task.done():
+                try:
+                    completed_outputs.append(task.result())
+                    completed_input_requests.append(input_requests[i])
+                except Exception:
+                    # Task failed, skip it
+                    pass
+            else:
+                task.cancel()
+                cancelled_count += 1
+        # Wait briefly for cancellations to propagate
+        if cancelled_count > 0:
+            await asyncio.gather(*[t for t in tasks if not t.done()], 
+                                return_exceptions=True)
+        print(f"Cancelled {cancelled_count} in-flight requests. "
+              f"Proceeding with {len(completed_outputs)} completed requests.")
+        return completed_outputs, completed_input_requests
+
+    # If shutdown was already requested during request dispatch, handle it
+    if _shutdown_requested:
+        outputs, input_requests = await _cancel_and_collect()
+    elif not tasks:
+        # No tasks were created (edge case)
+        outputs = []
+    else:
+        # Wait for either all tasks to complete OR shutdown signal
+        # Create a task that waits for shutdown event
+        async def wait_for_shutdown():
+            await _shutdown_event.wait()
+
+        shutdown_task = asyncio.create_task(wait_for_shutdown())
+
+        # Wait for all request tasks to complete, racing against shutdown
+        # Use asyncio.wait to monitor both the shutdown task and all request tasks
+        all_request_tasks = set(tasks)
+        all_tasks_with_shutdown = all_request_tasks | {shutdown_task}
+
+        # Wait until all request tasks are done OR shutdown is triggered
+        done, pending = await asyncio.wait(
+            all_tasks_with_shutdown,
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Keep waiting until either shutdown or all request tasks done
+        while shutdown_task not in done and (pending - {shutdown_task}):
+            done_new, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            done = done | done_new
+
+        # Clean up shutdown task
+        if not shutdown_task.done():
+            shutdown_task.cancel()
+            try:
+                await shutdown_task
+            except asyncio.CancelledError:
+                pass
+
+        # If shutdown was triggered (either via event or flag), cancel remaining
+        if _shutdown_requested or shutdown_task in done:
+            outputs, input_requests = await _cancel_and_collect()
+        else:
+            # All tasks completed normally
+            outputs: list[RequestFuncOutput] = [t.result() for t in tasks]
 
     if pbar is not None:
         pbar.close()
@@ -1013,6 +1096,11 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "openai-compatible backends. If not specified, default to greedy "
         "decoding (i.e. temperature==0.0).",
     )
+    sampling_group.add_argument(
+        "--skip-kv-cache",
+        action="store_true",
+        help="Skip KV cache. If not specified, default to False.",
+    )
 
     parser.add_argument(
         '--tokenizer-mode',
@@ -1076,7 +1164,31 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
     return asyncio.run(main_async(args))
 
 
+def _handle_shutdown_signal(signum, frame):
+    """Signal handler for graceful shutdown."""
+    global _shutdown_requested, _shutdown_event
+    print(f"\nReceived signal {signum}. Initiating graceful shutdown...")
+    _shutdown_requested = True
+    # Set the event in a thread-safe way if it exists
+    if _shutdown_event is not None:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(_shutdown_event.set)
+        except RuntimeError:
+            # No running loop, just set directly (may not wake up waiters)
+            pass
+
+
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+    global _shutdown_event
+
+    # Create the shutdown event for this run
+    _shutdown_event = asyncio.Event()
+
+    # Setup signal handler for graceful shutdown (SIGUSR1)
+    # This allows external processes to signal the benchmark to stop gracefully
+    signal.signal(signal.SIGUSR1, _handle_shutdown_signal)
+    
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1161,6 +1273,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
+
+    if args.skip_kv_cache:
+        sampling_params["vllm_xargs"] = {
+            "skip_kv_cache": True,
+        }
 
     # Avoid GC processing "static" data - reduce pause times.
     gc.collect()

@@ -3,12 +3,13 @@
 
 import gc
 import itertools
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
 
 import numpy as np
 import torch
@@ -172,7 +173,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
+        *,
+        shared_runner: Optional["GPUModelRunner"] = None,
+        role: str = "primary",
     ):
+        self._role = role
+        self._shared_runner = shared_runner
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -245,6 +251,44 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
+        # CUDA streams for concurrent primary and secondary execution
+        # Primary: regular inference, Secondary: training/skip_kv_cache
+        if shared_runner is None:
+            if scheduler_config.async_scheduling:
+                # Try to create streams with priorities for better scheduling
+                # Higher priority (lower number) for primary stream (inference)
+                # Lower priority (higher number) for secondary stream (training/skip_kv_cache)
+                try:
+                    priority_low, priority_high = torch.cuda.Stream.priority_range()
+                    self.primary_stream = torch.cuda.Stream(
+                        device=device, priority=priority_high)
+                    self.secondary_stream = torch.cuda.Stream(
+                        device=device, priority=priority_low)
+                    logger.info("Created CUDA streams with priorities for concurrent execution: "
+                                "primary_stream=%s (priority=%d), secondary_stream=%s (priority=%d)",
+                                self.primary_stream, priority_high,
+                                self.secondary_stream, priority_low)
+                except (RuntimeError, AttributeError) as e:
+                    # Fallback to default priority if not supported
+                    # This can happen on older GPUs or if priority support is unavailable
+                    logger.warning("Stream priorities not available, using default priority: %s", e)
+                    self.primary_stream = torch.cuda.Stream(device=device)
+                    self.secondary_stream = torch.cuda.Stream(device=device)
+                    logger.info("Created CUDA streams for concurrent execution: "
+                                "primary_stream=%s, secondary_stream=%s",
+                                self.primary_stream, self.secondary_stream)
+            else:
+                self.primary_stream = None
+                self.secondary_stream = None
+        else:
+            if role == "secondary":
+                # Secondary stream is the same as the primary stream.
+                self.primary_stream = shared_runner.secondary_stream
+                self.secondary_stream = shared_runner.secondary_stream
+            else:
+                self.primary_stream = shared_runner.primary_stream
+                self.secondary_stream = shared_runner.secondary_stream
+
         self.eplb_state: Optional[EplbState] = None
         """
         State of the expert parallelism load balancer.
@@ -260,38 +304,61 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
 
-        # mm_hash ->  encoder_output
-        self.encoder_cache: dict[str, torch.Tensor] = {}
-
-        # Training manager
-        self.training_manager: Optional[TrainingManager] = None
+        if shared_runner is None:
+            # mm_hash ->  encoder_output
+            self.encoder_cache: dict[str, torch.Tensor] = {}
+            self.training_manager: Optional[TrainingManager] = None
+        else:
+            self.encoder_cache = shared_runner.encoder_cache
+            self.training_manager = shared_runner.training_manager
 
         self.use_aux_hidden_state_outputs = False
-        # Set up speculative decoding.
-        # NOTE(Jiayi): currently we put the entire draft model on
-        # the last PP rank. This is not ideal if there are many
-        # layers in the draft model.
-        if self.speculative_config and get_pp_group().is_last_rank:
-            if self.speculative_config.method == "ngram":
-                self.drafter = NgramProposer(self.vllm_config)
-            elif self.speculative_config.use_eagle():
-                self.drafter = EagleProposer(self.vllm_config, self.device,
-                                             self)  # type: ignore
-                if self.speculative_config.method == "eagle3":
-                    self.use_aux_hidden_state_outputs = True
-            elif self.speculative_config.method == "medusa":
-                self.drafter = MedusaProposer(
-                    vllm_config=self.vllm_config,
-                    device=self.device)  # type: ignore
-            else:
-                raise ValueError("Unknown speculative decoding method: "
-                                 f"{self.speculative_config.method}")
-            self.rejection_sampler = RejectionSampler()
+        if shared_runner is None:
+            # Set up speculative decoding.
+            # NOTE(Jiayi): currently we put the entire draft model on
+            # the last PP rank. This is not ideal if there are many
+            # layers in the draft model.
+            if self.speculative_config and get_pp_group().is_last_rank:
+                if self.speculative_config.method == "ngram":
+                    self.drafter = NgramProposer(self.vllm_config)
+                elif self.speculative_config.use_eagle():
+                    self.drafter = EagleProposer(self.vllm_config, self.device,
+                                                 self)  # type: ignore
+                    if self.speculative_config.method == "eagle3":
+                        self.use_aux_hidden_state_outputs = True
+                elif self.speculative_config.method == "medusa":
+                    self.drafter = MedusaProposer(
+                        vllm_config=self.vllm_config,
+                        device=self.device)  # type: ignore
+                else:
+                    raise ValueError("Unknown speculative decoding method: "
+                                     f"{self.speculative_config.method}")
+                self.rejection_sampler = RejectionSampler()
+        else:
+            self.drafter = getattr(shared_runner, "drafter", None)
+            self.rejection_sampler = getattr(shared_runner, "rejection_sampler",
+                                             None)
+            self.use_aux_hidden_state_outputs = (
+                shared_runner.use_aux_hidden_state_outputs)
 
-        # Request states.
-        self.requests: dict[str, CachedRequestState] = {}
+        # Request states, shared across runners for consistency.
+        if shared_runner is None:
+            self.requests_lock = threading.RLock()
+            self.requests: dict[str, CachedRequestState] = {}
+            self.lora_lock = threading.RLock()
+        else:
+            self.requests_lock = shared_runner.requests_lock
+            self.requests = shared_runner.requests
+            self.lora_lock = getattr(shared_runner, "lora_lock",
+                                     threading.RLock())
+
         self.comm_stream = torch.cuda.Stream()
 
+        self.use_async_scheduling = self.scheduler_config.async_scheduling
+        self._initialize_per_runner_state()
+
+    def _initialize_per_runner_state(self) -> None:
+        """Initializes per-stream state that should not be shared."""
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in
@@ -303,8 +370,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # the block_sizes in the kv cache config.
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
-            # We need to use the encoder length for encoder-decoer
-            # because of KV cache for cross-attention.
             max_model_len=max(self.max_model_len, self.max_encoder_len),
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
@@ -319,18 +384,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             is_pooling_model=self.is_pooling_model,
         )
 
-        self.use_async_scheduling = self.scheduler_config.async_scheduling
-        self.async_output_copy_stream = torch.cuda.Stream() if \
-            self.use_async_scheduling else None
+        self.async_output_copy_stream = (torch.cuda.Stream()
+                                         if self.use_async_scheduling else None)
 
         # TODO(woosuk): Provide an option to tune the max cudagraph batch size.
         # The convention is different.
         # self.cudagraph_batch_sizes sorts in ascending order.
         # The batch sizes in the config are in descending order.
-        if self.compilation_config.cudagraph_capture_sizes and \
-                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+        if (self.compilation_config.cudagraph_capture_sizes
+                and self.compilation_config.cudagraph_mode
+                != CUDAGraphMode.NONE):
             self.cudagraph_batch_sizes = list(
                 reversed(self.compilation_config.cudagraph_capture_sizes))
+        else:
+            self.cudagraph_batch_sizes = []
 
         # Cache the device properties.
         self._init_device_properties()
@@ -343,9 +410,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.query_start_loc = self._make_buffer(self.max_num_reqs + 1,
                                                  dtype=torch.int32)
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
-        # Because inputs_embeds may be bfloat16 and we don't need a numpy
-        # version of this tensor, avoid a RuntimeError by not creating a
-        # numpy buffer.
         self.inputs_embeds = self._make_buffer(self.max_num_tokens,
                                                self.hidden_size,
                                                dtype=self.dtype,
@@ -357,69 +421,47 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
-            # NOTE: `mrope_positions` is implemented with one additional dummy
-            # position on purpose to make it non-contiguous so that it can work
-            # with torch compile.
-            # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
-
-            # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
-            # the modality of inputs. For text-only inputs, each dimension has
-            # identical position IDs, making M-RoPE functionally equivalent to
-            # 1D-RoPE.
-            # See page 5 of https://arxiv.org/abs/2409.12191
             self.mrope_positions = self._make_buffer(
                 (3, self.max_num_tokens + 1), dtype=torch.int64)
+        else:
+            self.mrope_positions = None
 
-        # CUDA event to synchronize use of reused CPU tensors between steps
-        # when async scheduling is enabled.
         self.prepare_inputs_event: Optional[torch.cuda.Event] = None
         if self.use_async_scheduling:
             self.prepare_inputs_event = torch.cuda.Event()
-            # Start in a completed state.
             self.prepare_inputs_event.record(torch.cuda.default_stream())
 
-        # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: Optional[IntermediateTensors] = None
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
-        # Keep in int64 to avoid overflow with long context
         self.arange_np = np.arange(max(self.max_num_reqs + 1,
                                        self.max_model_len,
                                        self.max_num_tokens),
                                    dtype=np.int64)
 
-        # Layer pairings for cross-layer KV sharing.
-        # If an Attention layer `layer_name` is in the keys of this dict, it
-        # means this layer will perform attention using the keys and values
-        # from the KV cache of `shared_kv_cache_layers[layer_name]`.
         self.shared_kv_cache_layers: dict[str, str] = {}
         self.kv_sharing_fast_prefill_eligible_layers: set[str] = set()
-
         self.kv_sharing_fast_prefill_logits_indices = None
         if self.cache_config.kv_sharing_fast_prefill:
             self.kv_sharing_fast_prefill_logits_indices = torch.zeros(
                 self.max_num_tokens, dtype=torch.int32, device=self.device)
 
-        self.uniform_decode_query_len = 1 if not self.speculative_config else \
-            1 + self.speculative_config.num_speculative_tokens
+        self.uniform_decode_query_len = (
+            1 if not self.speculative_config else
+            1 + self.speculative_config.num_speculative_tokens)
 
-        # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
-        self.mm_budget = MultiModalBudget(
+        self.mm_budget = (MultiModalBudget(
             self.model_config,
             self.scheduler_config,
             self.mm_registry,
-        ) if self.supports_mm_inputs else None
+        ) if self.supports_mm_inputs else None)
 
         self.reorder_batch_threshold: Optional[int] = None
 
-        # Attention layers that are only in the KVCacheConfig of the runner
-        # (e.g., KV sharing, encoder-only attention), but not in the
-        # KVCacheConfig of the scheduler.
         self.runner_only_attn_layers: set[str] = set()
 
-        # Cached outputs.
         self._draft_token_ids: Optional[Union[list[list[int]],
                                               torch.Tensor]] = None
         self.transfer_event = torch.cuda.Event()
@@ -428,6 +470,45 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory)
+
+    def spawn_stream_runner(self, role: str) -> "GPUModelRunner":
+        if role == "primary":
+            raise ValueError("Primary stream runner already exists.")
+        runner = GPUModelRunner(self.vllm_config,
+                                self.device,
+                                shared_runner=self,
+                                role=role)
+        self._share_runtime_state(runner)
+        return runner
+
+    # TODO(girfan): This is a hack to share the runtime state between the primary and secondary runners.
+    # We should find a better way to do this.
+    def _share_runtime_state(self, target: "GPUModelRunner") -> None:
+        target.model = getattr(self, "model", None)
+        target.model_memory_usage = getattr(self, "model_memory_usage", None)
+        target.attn_groups = self.attn_groups
+        target.kv_caches = self.kv_caches
+        target.kv_cache_config = getattr(self, "kv_cache_config", None)
+        target.shared_kv_cache_layers = self.shared_kv_cache_layers
+        target.kv_sharing_fast_prefill_eligible_layers = (
+            self.kv_sharing_fast_prefill_eligible_layers)
+        target.kv_sharing_fast_prefill_logits_indices = (
+            self.kv_sharing_fast_prefill_logits_indices)
+        target.runner_only_attn_layers = self.runner_only_attn_layers
+        target.uniform_decode_query_len = self.uniform_decode_query_len
+        target.cudagraph_dispatcher = self.cudagraph_dispatcher
+        target.mm_budget = self.mm_budget
+        target.vllm_config = self.vllm_config
+        target.model_config = self.vllm_config.model_config
+        target.cache_config = self.vllm_config.cache_config
+        target.compilation_config = self.vllm_config.compilation_config
+        target.lora_config = self.vllm_config.lora_config
+        target.load_config = self.vllm_config.load_config
+        target.parallel_config = self.vllm_config.parallel_config
+        target.scheduler_config = self.vllm_config.scheduler_config
+        target.speculative_config = self.vllm_config.speculative_config
+        target.observability_config = self.vllm_config.observability_config
+        target.lora_manager = getattr(self, "lora_manager", None)
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -522,174 +603,144 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Remove finished requests from the cached states.
-        for req_id in scheduler_output.finished_req_ids:
-            self.requests.pop(req_id, None)
-        # Remove the finished requests from the persistent batch.
-        # NOTE(woosuk): There could be an edge case where finished_req_ids and
-        # scheduled_req_ids overlap. This happens when a request is aborted and
-        # then resubmitted with the same ID. In this case, we treat them as two
-        # distinct requests - clearing the cached states for the first request
-        # and handling the second as a new request.
-        for req_id in scheduler_output.finished_req_ids:
-            self.input_batch.remove_request(req_id)
+        with self.requests_lock:
+            # Remove finished requests from the cached states.
+            for req_id in scheduler_output.finished_req_ids:
+                self.requests.pop(req_id, None)
+            # Remove the finished requests from the persistent batch.
+            # NOTE(woosuk): There could be an edge case where finished_req_ids and
+            # scheduled_req_ids overlap. This happens when a request is aborted and
+            # then resubmitted with the same ID. In this case, we treat them as two
+            # distinct requests - clearing the cached states for the first request
+            # and handling the second as a new request.
+            for req_id in scheduler_output.finished_req_ids:
+                self.input_batch.remove_request(req_id)
 
-        # Free the cached encoder outputs.
-        for mm_hash in scheduler_output.free_encoder_mm_hashes:
-            self.encoder_cache.pop(mm_hash, None)
+            # Free the cached encoder outputs.
+            for mm_hash in scheduler_output.free_encoder_mm_hashes:
+                self.encoder_cache.pop(mm_hash, None)
 
-        # Remove the unscheduled requests from the persistent batch.
-        # NOTE(woosuk): The unscheduled requests are either preempted requests
-        # or running requests that are not scheduled in this step. We remove
-        # them from the persistent batch but keep their cached states since
-        # they will be scheduled again sometime in the future.
-        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
-        cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
-        # NOTE(woosuk): The persistent batch optimization assumes that
-        # consecutive batches contain mostly the same requests. If batches
-        # have low request overlap (e.g., alternating between two distinct
-        # sets of requests), this optimization becomes very inefficient.
-        for req_id in unscheduled_req_ids:
-            self.input_batch.remove_request(req_id)
+            # Remove the unscheduled requests from the persistent batch.
+            scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+            cached_req_ids = self.input_batch.req_id_to_index.keys()
+            unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+            for req_id in unscheduled_req_ids:
+                self.input_batch.remove_request(req_id)
 
-        reqs_to_add: list[CachedRequestState] = []
-        # Add new requests to the cached states.
-        for new_req_data in scheduler_output.scheduled_new_reqs:
-            req_id = new_req_data.req_id
-            sampling_params = new_req_data.sampling_params
-            pooling_params = new_req_data.pooling_params
+            reqs_to_add: list[CachedRequestState] = []
+            # Add new requests to the cached states.
+            for new_req_data in scheduler_output.scheduled_new_reqs:
+                req_id = new_req_data.req_id
+                sampling_params = new_req_data.sampling_params
+                pooling_params = new_req_data.pooling_params
 
-            if sampling_params and \
-                sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
+                if sampling_params and \
+                    sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+                    generator = torch.Generator(device=self.device)
+                    generator.manual_seed(sampling_params.seed)
+                else:
+                    generator = None
 
-            if self.is_pooling_model:
-                assert pooling_params is not None
-                task = pooling_params.task
-                assert task is not None, "You did not set `task` in the API"
+                if self.is_pooling_model:
+                    assert pooling_params is not None
+                    task = pooling_params.task
+                    assert task is not None, "You did not set `task` in the API"
 
-                model = cast(VllmModelForPooling, self.get_model())
-                to_update = model.pooler.get_pooling_updates(task)
-                to_update.apply(pooling_params)
+                    model = cast(VllmModelForPooling, self.get_model())
+                    to_update = model.pooler.get_pooling_updates(task)
+                    to_update.apply(pooling_params)
 
-            req_state = CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=new_req_data.prompt_token_ids,
-                mm_features=new_req_data.mm_features,
-                sampling_params=sampling_params,
-                pooling_params=pooling_params,
-                generator=generator,
-                block_ids=new_req_data.block_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
-                lora_request=new_req_data.lora_request,
-                is_training=new_req_data.is_training,
-                training_params=new_req_data.training_params,
-                labels=new_req_data.labels,
-                training_attention_mask=new_req_data.training_attention_mask,
-            )
-            self.requests[req_id] = req_state
+                req_state = CachedRequestState(
+                    req_id=req_id,
+                    prompt_token_ids=new_req_data.prompt_token_ids,
+                    mm_features=new_req_data.mm_features,
+                    sampling_params=sampling_params,
+                    pooling_params=pooling_params,
+                    generator=generator,
+                    block_ids=new_req_data.block_ids,
+                    num_computed_tokens=new_req_data.num_computed_tokens,
+                    output_token_ids=[],
+                    lora_request=new_req_data.lora_request,
+                    is_training=new_req_data.is_training,
+                    training_params=new_req_data.training_params,
+                    labels=new_req_data.labels,
+                    training_attention_mask=new_req_data.training_attention_mask,
+                )
+                self.requests[req_id] = req_state
 
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            if self.uses_mrope:
-                self._init_mrope_positions(req_state)
+                if self.uses_mrope:
+                    self._init_mrope_positions(req_state)
 
-            reqs_to_add.append(req_state)
-
-        # Update the states of the running/resumed requests.
-        is_last_rank = get_pp_group().is_last_rank
-        req_data = scheduler_output.scheduled_cached_reqs
-        for i, req_id in enumerate(req_data.req_ids):
-            req_state = self.requests[req_id]
-            num_computed_tokens = req_data.num_computed_tokens[i]
-            new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_data.resumed_from_preemption[i]
-
-            # Update the cached states.
-            req_state.num_computed_tokens = num_computed_tokens
-
-            if not is_last_rank:
-                # When using PP, the scheduler sends the sampled tokens back,
-                # because there's no direct communication between the first-
-                # stage worker and the last-stage worker.
-                new_token_ids = req_data.new_token_ids[i]
-                # Add the sampled token(s) from the previous step (if any).
-                # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (num_computed_tokens + len(new_token_ids) -
-                                  req_state.num_tokens)
-                if num_new_tokens == 1:
-                    # Avoid slicing list in most common case.
-                    req_state.output_token_ids.append(new_token_ids[-1])
-                elif num_new_tokens > 0:
-                    req_state.output_token_ids.extend(
-                        new_token_ids[-num_new_tokens:])
-
-            # Update the block IDs.
-            if not resumed_from_preemption:
-                if new_block_ids is not None:
-                    # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(req_state.block_ids,
-                                                  new_block_ids):
-                        block_ids.extend(new_ids)
-            else:
-                assert new_block_ids is not None
-                # The request is resumed from preemption.
-                # Replace the existing block IDs with the new ones.
-                req_state.block_ids = new_block_ids
-
-            req_index = self.input_batch.req_id_to_index.get(req_id)
-            if req_index is None:
-                # The request is not in the persistent batch.
-                # The request was either preempted and resumed later, or was not
-                # scheduled in the previous step and needs to be added again.
                 reqs_to_add.append(req_state)
-                continue
 
-            # Update the persistent batch.
-            self.input_batch.num_computed_tokens_cpu[req_index] = (
-                num_computed_tokens)
-            if new_block_ids is not None:
-                self.input_batch.block_table.append_row(
-                    new_block_ids, req_index)
+            # Update the states of the running/resumed requests.
+            is_last_rank = get_pp_group().is_last_rank
+            req_data = scheduler_output.scheduled_cached_reqs
+            for i, req_id in enumerate(req_data.req_ids):
+                req_state = self.requests[req_id]
+                num_computed_tokens = req_data.num_computed_tokens[i]
+                new_block_ids = req_data.new_block_ids[i]
+                resumed_from_preemption = req_data.resumed_from_preemption[i]
 
-            # For the last rank, we don't need to update the token_ids_cpu
-            # because the sampled tokens are already cached.
-            if not is_last_rank:
-                # Add new_token_ids to token_ids_cpu.
-                start_token_index = num_computed_tokens
-                end_token_index = num_computed_tokens + len(new_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index,
-                    start_token_index:end_token_index] = new_token_ids
-                self.input_batch.num_tokens_no_spec[
-                    req_index] = end_token_index
-                self.input_batch.num_tokens[req_index] = end_token_index
+                req_state.num_computed_tokens = num_computed_tokens
 
-            # Add spec_token_ids to token_ids_cpu.
-            spec_token_ids = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
-            if spec_token_ids:
-                num_spec_tokens = len(spec_token_ids)
-                start_index = self.input_batch.num_tokens_no_spec[req_index]
-                end_token_index = start_index + num_spec_tokens
-                self.input_batch.token_ids_cpu[
-                    req_index, start_index:end_token_index] = spec_token_ids
-                # NOTE(woosuk): `num_tokens` here may include spec tokens.
-                self.input_batch.num_tokens[req_index] += num_spec_tokens
+                if not is_last_rank:
+                    new_token_ids = req_data.new_token_ids[i]
+                    num_new_tokens = (num_computed_tokens + len(new_token_ids) -
+                                      req_state.num_tokens)
+                    if num_new_tokens == 1:
+                        req_state.output_token_ids.append(new_token_ids[-1])
+                    elif num_new_tokens > 0:
+                        req_state.output_token_ids.extend(
+                            new_token_ids[-num_new_tokens:])
 
-        # Add the new or resumed requests to the persistent batch.
-        # The smaller empty indices are filled first.
-        for request in reqs_to_add:
-            self.input_batch.add_request(request)
+                if not resumed_from_preemption:
+                    if new_block_ids is not None:
+                        for block_ids, new_ids in zip(req_state.block_ids,
+                                                      new_block_ids):
+                            block_ids.extend(new_ids)
+                else:
+                    assert new_block_ids is not None
+                    req_state.block_ids = new_block_ids
 
-        # Condense the batched states if there are gaps left by removed requests
-        self.input_batch.condense()
-        # Allow attention backend to reorder the batch, potentially
-        self._may_reorder_batch(scheduler_output)
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None:
+                    reqs_to_add.append(req_state)
+                    continue
+
+                self.input_batch.num_computed_tokens_cpu[req_index] = (
+                    num_computed_tokens)
+                if new_block_ids is not None:
+                    self.input_batch.block_table.append_row(
+                        new_block_ids, req_index)
+
+                if not is_last_rank:
+                    start_token_index = num_computed_tokens
+                    new_token_ids = req_data.new_token_ids[i]
+                    end_token_index = num_computed_tokens + len(new_token_ids)
+                    self.input_batch.token_ids_cpu[
+                        req_index,
+                        start_token_index:end_token_index] = new_token_ids
+                    self.input_batch.num_tokens_no_spec[
+                        req_index] = end_token_index
+                    self.input_batch.num_tokens[req_index] = end_token_index
+
+                spec_token_ids = (
+                    scheduler_output.scheduled_spec_decode_tokens.get(req_id,
+                                                                      ()))
+                if spec_token_ids:
+                    num_spec_tokens = len(spec_token_ids)
+                    start_index = self.input_batch.num_tokens_no_spec[req_index]
+                    end_token_index = start_index + num_spec_tokens
+                    self.input_batch.token_ids_cpu[
+                        req_index, start_index:end_token_index] = spec_token_ids
+                    self.input_batch.num_tokens[req_index] += num_spec_tokens
+
+            for request in reqs_to_add:
+                self.input_batch.add_request(request)
+
+            self.input_batch.condense()
+            self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
@@ -891,7 +942,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return encoder_seq_lens
 
     def _prepare_inputs(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: "SchedulerOutput", is_profiling_enabled: bool = False
     ) -> tuple[PerLayerAttnMetadata, torch.Tensor,
                Optional[SpecDecodeMetadata], np.ndarray,
                Optional[CommonAttentionMetadata], int, Optional[UBatchSlices],
@@ -1200,6 +1251,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         gpu[:num_reqs],
                         num_draft_tokens=self.num_draft_tokens.gpu[:num_reqs],
                     )
+
+                extra_attn_metadata_args['is_profiling_enabled'] = is_profiling_enabled
 
                 # Add is_training flag to metadata args for XFormers backend
                 if is_training_batch:
@@ -2185,22 +2238,105 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
         """Execute model - dispatches to training or inference based on request type.
-        
+
         Args:
             scheduler_output: Output from the scheduler
             intermediate_tensors: Intermediate tensors from previous pipeline stage
-            
+
         Returns:
             ModelRunnerOutput (or async wrapper) or IntermediateTensors for PP
         """
-        # Detect if this batch contains any training requests
-        has_training_requests = any(req.is_training for req in scheduler_output.scheduled_new_reqs)
-        if has_training_requests:
-            return self.execute_model_training(scheduler_output,
-                                               intermediate_tensors)
-        else:
+
+        def _is_skip_kv(req_sampling_params) -> bool:
+            if req_sampling_params is None:
+                return False
+            extra_args = getattr(req_sampling_params, "extra_args", None)
+            if not extra_args:
+                return False
+            return bool(extra_args.get("skip_kv_cache", False))
+
+        # Determine whether this batch contains training or skip-kv-cache work.
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens.keys())
+        if scheduler_output.scheduled_cached_reqs.req_ids:
+            scheduled_req_ids.update(scheduler_output.scheduled_cached_reqs.req_ids)
+
+        has_training_requests = any(req.is_training
+                                    for req in scheduler_output.scheduled_new_reqs)
+        has_skip_kv_cache = any(_is_skip_kv(req.sampling_params)
+                                for req in scheduler_output.scheduled_new_reqs)
+
+        if not has_training_requests or not has_skip_kv_cache:
+            for req_id in scheduled_req_ids:
+                cached_state = self.requests.get(req_id)
+                if cached_state is None:
+                    continue
+                if not has_training_requests and cached_state.is_training:
+                    has_training_requests = True
+                if (not has_skip_kv_cache
+                        and _is_skip_kv(cached_state.sampling_params)):
+                    has_skip_kv_cache = True
+                if has_training_requests and has_skip_kv_cache:
+                    break
+
+        # If CUDA stream multiplexing is disabled, fall back to the default path.
+        if self.primary_stream is None:
+            logger.debug("execute_model(default stream): requests=%s "
+                        "training=%s skip_kv=%s",
+                        scheduled_req_ids, has_training_requests,
+                        has_skip_kv_cache)
+            if has_training_requests:
+                return self.execute_model_training(scheduler_output,
+                                                   intermediate_tensors)
             return self.execute_model_inference(scheduler_output,
                                                 intermediate_tensors)
+
+        # Select execution stream and function.
+        default_stream = torch.cuda.current_stream()
+        stream = self.primary_stream
+        execute_fn: Callable[[SchedulerOutput,
+                              Optional[IntermediateTensors]],
+                             Union[ModelRunnerOutput, AsyncModelRunnerOutput,
+                                   IntermediateTensors]]
+
+        if has_training_requests:
+            execute_fn = self.execute_model_training
+            stream = self.secondary_stream or self.primary_stream
+            selected_stream_name = ("secondary"
+                                    if stream is self.secondary_stream else
+                                    "primary")
+        else:
+            execute_fn = self.execute_model_inference
+            if has_skip_kv_cache and self.secondary_stream is not None:
+                stream = self.secondary_stream
+                selected_stream_name = "secondary"
+            else:
+                selected_stream_name = "primary"
+
+        # Guard against missing streams (should not happen, but be defensive).
+        if stream is None:
+            logger.debug("execute_model(%s stream unavailable) requests=%s "
+                        "training=%s skip_kv=%s",
+                        selected_stream_name, scheduled_req_ids,
+                        has_training_requests, has_skip_kv_cache)
+            return execute_fn(scheduler_output, intermediate_tensors)
+
+        # Ensure the selected stream has visibility into prior work/materialise results.
+        if stream != default_stream:
+            logger.debug("execute_model(stream=%s) waiting on default stream "
+                        "for requests=%s training=%s skip_kv=%s",
+                        selected_stream_name, scheduled_req_ids,
+                        has_training_requests, has_skip_kv_cache)
+            stream.wait_stream(default_stream)
+            with torch.cuda.stream(stream):
+                output = execute_fn(scheduler_output, intermediate_tensors)
+            default_stream.wait_stream(stream)
+            logger.debug("execute_model(stream=%s) finished requests=%s",
+                        selected_stream_name, scheduled_req_ids)
+            return output
+
+        logger.debug("execute_model(stream=default) executing requests=%s",
+                    scheduled_req_ids)
+        return execute_fn(scheduler_output, intermediate_tensors)
 
     @torch.inference_mode()
     def execute_model_inference(
@@ -2230,7 +2366,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 (attn_metadata, logits_indices, spec_decode_metadata,
                  num_scheduled_tokens_np, spec_decode_common_attn_metadata,
                  max_query_len, ubatch_slices, num_tokens_after_padding
-                 ) = self._prepare_inputs(scheduler_output)
+                 ) = self._prepare_inputs(scheduler_output, is_profiling_enabled=self.vllm_config.model_config.is_profiling_enabled)
 
             finally:
                 if self.prepare_inputs_event is not None:
@@ -2247,6 +2383,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_kwargs,
             ) = self._preprocess(scheduler_output, intermediate_tensors,
                                  ubatch_slices, num_tokens_after_padding)
+
+            if self.vllm_config.model_config.is_profiling_enabled:
+                model_kwargs["is_profiling_enabled"] = True
 
             if ubatch_slices is not None:
                 num_input_tokens = num_input_tokens // 2
@@ -2418,7 +2557,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 (attn_metadata, logits_indices, spec_decode_metadata,
                  num_scheduled_tokens_np, spec_decode_common_attn_metadata,
                  max_query_len, ubatch_slices, num_tokens_after_padding
-                 ) = self._prepare_inputs(scheduler_output)
+                 ) = self._prepare_inputs(scheduler_output, is_profiling_enabled=self.vllm_config.model_config.is_profiling_enabled)
 
             finally:
                 if self.prepare_inputs_event is not None:
@@ -2435,6 +2574,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_kwargs,
             ) = self._preprocess(scheduler_output, intermediate_tensors,
                                  ubatch_slices, num_tokens_after_padding)
+
+            if self.vllm_config.model_config.is_profiling_enabled:
+                model_kwargs["is_profiling_enabled"] = True
 
             if ubatch_slices is not None:
                 num_input_tokens = num_input_tokens // 2

@@ -169,7 +169,10 @@ class KVCacheManager:
         if (not self.enable_caching
                 or request.is_training
                 or (request.sampling_params is not None
-                    and request.sampling_params.prompt_logprobs is not None)):
+                    and request.sampling_params.prompt_logprobs is not None)
+                or (request.sampling_params is not None
+                    and request.sampling_params.extra_args is not None
+                    and request.sampling_params.extra_args.get("skip_kv_cache", False))):
             return self.create_empty_block_list(), 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token

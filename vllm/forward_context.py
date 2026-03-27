@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ class BatchDescriptor(NamedTuple):
     """
     num_tokens: int
     uniform_decode: bool = False
+    is_training: bool = False
     """
     False can also be used for an uniform decode batch to dispatch to the 
     cudagraph supporting non-uniform batches.
@@ -46,7 +48,7 @@ class BatchDescriptor(NamedTuple):
         """
         Return a non-uniform version of current batch descriptor.
         """
-        return BatchDescriptor(self.num_tokens, uniform_decode=False)
+        return BatchDescriptor(self.num_tokens, uniform_decode=False, is_training=self.is_training)
 
 
 def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
@@ -251,11 +253,30 @@ class ForwardContext:
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
 
 
+# Use thread-local storage to support concurrent execution on multiple threads/streams
+_thread_local = threading.local()
+
+def _get_forward_context_storage() -> Optional[ForwardContext]:
+    """Get the thread-local forward context storage."""
+    if not hasattr(_thread_local, 'forward_context'):
+        _thread_local.forward_context = None
+    return _thread_local.forward_context
+
+def _set_forward_context_storage(context: Optional[ForwardContext]) -> None:
+    """Set the thread-local forward context storage."""
+    _thread_local.forward_context = context
+
+# Backward compatibility: maintain module-level variable for single-threaded code
 _forward_context: Optional[ForwardContext] = None
 
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
+    # Try thread-local first (for concurrent execution)
+    thread_local_context = _get_forward_context_storage()
+    if thread_local_context is not None:
+        return thread_local_context
+    # Fall back to module-level for backward compatibility
     assert _forward_context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context.")
@@ -287,12 +308,20 @@ def override_forward_context(forward_context: Optional[ForwardContext]):
     forward pass.
     """
     global _forward_context
-    prev_context = _forward_context
+
+    # Save previous context from both thread-local and module-level
+    prev_thread_local_context = _get_forward_context_storage()
+    prev_module_context = _forward_context
+
+    # Set new context in both thread-local and module-level (for backward compatibility)
+    _set_forward_context_storage(forward_context)
     _forward_context = forward_context
     try:
         yield
     finally:
-        _forward_context = prev_context
+        # Restore previous context
+        _set_forward_context_storage(prev_thread_local_context)
+        _forward_context = prev_module_context
 
 
 @contextmanager

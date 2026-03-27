@@ -164,6 +164,9 @@ class EngineCore:
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
 
+        # Check if concurrent execution mode is enabled
+        self.use_concurrent_execution = self.vllm_config.scheduler_config.async_scheduling
+
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
@@ -273,25 +276,65 @@ class EngineCore:
                                   self.scheduler.make_stats())
             raise err
 
-    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
-        """Schedule, execute, and make output.
+    def step_primary(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """Schedule, execute, and make output for primary (regular inference) requests.
 
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
-        if not self.scheduler.has_requests():
+        # Check for any primary requests remaining in the scheduler
+        if not self.scheduler.has_primary_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule()
+
+        scheduler_output = self.scheduler.schedule_primary()
+
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
-        engine_core_outputs = self.scheduler.update_from_output(
+
+        engine_core_outputs = self.scheduler.update_from_output_primary(
             scheduler_output, model_output)  # type: ignore
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
+
+    def step_secondary(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """Schedule, execute, and make output for secondary (training/skip_kv_cache) requests.
+
+        Returns tuple of outputs and a flag indicating whether the model
+        was executed.
+        """
+        # Check for any secondary requests remaining in the scheduler
+        if not self.scheduler.has_secondary_requests():
+            return {}, False
+        scheduler_output = self.scheduler.schedule_secondary()
+
+        # Secondary scheduler returns empty output in Phase 2
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return {}, False
+
+        model_output = self.execute_model_with_error_logging(
+            self.model_executor.execute_model,  # type: ignore
+            scheduler_output)
+
+        engine_core_outputs = self.scheduler.update_from_output_secondary(
+            scheduler_output, model_output)  # type: ignore
+
+        return (engine_core_outputs,
+                scheduler_output.total_num_scheduled_tokens > 0)
+    
+    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """Backward compatibility wrapper for step_primary().
+
+        Schedule, execute, and make output.
+
+        Returns tuple of outputs and a flag indicating whether the model
+        was executed.
+        """
+        if self.use_concurrent_execution:
+            raise ValueError("step() is not supported in concurrent execution mode")
+
+        return self.step_primary()
 
     def post_step(self, model_executed: bool) -> None:
         if self.use_spec_decode and model_executed:
@@ -720,15 +763,115 @@ class EngineCoreProc(EngineCore):
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
 
+    def run_primary_loop(self):
+        """Primary thread loop - continuously processes primary (regular inference) requests."""
+        logger.info("Starting primary loop in thread: %s", threading.current_thread().name)
+
+        while not self._shutdown_event.is_set():
+            try:
+                if self.scheduler.has_primary_requests():
+                    self._process_primary_step()
+                else:
+                    # Small sleep to avoid busy waiting when no inference requests
+                    self._shutdown_event.wait(timeout=0.001)
+            except Exception as e:
+                logger.exception("Error in inference loop: %s", e)
+                # Continue running unless shutdown
+                if not self._shutdown_event.is_set():
+                    continue
+                else:
+                    break
+
+        logger.info("Primary loop exiting")
+
+    def run_secondary_loop(self):
+        """Secondary thread loop - continuously processes secondary (training/skip_kv_cache) requests."""
+        logger.info("Starting secondary loop in thread: %s", threading.current_thread().name)
+
+        while not self._shutdown_event.is_set():
+            try:
+                if self.scheduler.has_secondary_requests():
+                    self._process_secondary_step()
+                else:
+                    # Small sleep to avoid busy waiting when no training requests
+                    self._shutdown_event.wait(timeout=0.001)
+            except Exception as e:
+                logger.exception("Error in training loop: %s", e)
+                # Continue running unless shutdown
+                if not self._shutdown_event.is_set():
+                    continue
+                else:
+                    break
+
+        logger.info("Secondary loop exiting")
+
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
 
+        if self.use_concurrent_execution:
+            # Use concurrent threading for training+inference
+            logger.info("Using concurrent execution mode with separate threads")
+            self._run_concurrent_busy_loop()
+        else:
+            # Use simple single-threaded mode
+            logger.info("Using single-threaded execution mode")
+            self._run_simple_busy_loop()
+    
+    def _run_simple_busy_loop(self):
+        """Simple single-threaded busy loop (backward compatible)."""
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
+    
+    def _run_concurrent_busy_loop(self):
+        """Concurrent busy loop with separate threads for inference and training."""
+        # Create shutdown event for clean thread termination
+        self._shutdown_event = threading.Event()
+
+        # Start primary thread
+        self.primary_thread = threading.Thread(
+            target=self.run_primary_loop,
+            name="PrimaryLoop",
+            daemon=True
+        )
+        self.primary_thread.start()
+
+        # Start secondary thread  
+        self.secondary_thread = threading.Thread(
+            target=self.run_secondary_loop,
+            name="SecondaryLoop",
+            daemon=True
+        )
+        self.secondary_thread.start()
+
+        logger.info("Started primary and secondary threads")
+
+        # Main thread handles input queue
+        try:
+            while True:
+                # Poll the input queue and route requests to appropriate queues
+                self._process_input_queue_threaded()
+                # Small sleep to prevent busy waiting
+                import time
+                time.sleep(0.0001)
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, shutting down...")
+            self._shutdown_event.set()
+            self.primary_thread.join(timeout=5.0)
+            self.secondary_thread.join(timeout=5.0)
+            raise
+    
+    def _process_input_queue_threaded(self):
+        """Process input queue in threaded mode (non-blocking)."""
+        while not self.input_queue.empty():
+            try:
+                req = self.input_queue.get_nowait()
+                self._handle_client_request(*req)
+            except Exception:
+                break
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -751,16 +894,38 @@ class EngineCoreProc(EngineCore):
             self._handle_client_request(*req)
 
     def _process_engine_step(self) -> bool:
-        """Called only when there are unfinished local requests."""
+        """Called only when there are unfinished local requests (simple mode)."""
 
-        # Step the engine core.
-        outputs, model_executed = self.step_fn()
+        # Step the engine core (use regular step, not step_inference)
+        outputs, model_executed = (self.step() if self.batch_queue is None
+                                   else self.step_with_batch_queue())
         # Put EngineCoreOutputs into the output queue.
         for output in (outputs.items() if outputs else ()):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        return model_executed
 
+    def _process_primary_step(self) -> bool:
+        """Process one primary step for threaded mode."""
+        # Step the primary engine
+        outputs, model_executed = self.step_primary()
+        # Put EngineCoreOutputs into the output queue
+        for output in (outputs.items() if outputs else ()):
+            self.output_queue.put_nowait(output)
+        # Post-step hook
+        self.post_step(model_executed)
+        return model_executed
+
+    def _process_secondary_step(self) -> bool:
+        """Process one secondary step for threaded mode."""
+        # Step the secondary engine
+        outputs, model_executed = self.step_secondary()
+        # Put EngineCoreOutputs into the output queue
+        for output in (outputs.items() if outputs else ()):
+            self.output_queue.put_nowait(output)
+        # Post-step hook
+        self.post_step(model_executed)
         return model_executed
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
@@ -1035,48 +1200,6 @@ class DPEngineCoreProc(EngineCoreProc):
                                    current_wave=self.current_wave)
             self.output_queue.put_nowait(
                 (-1, EngineCoreOutputs(scheduler_stats=stats)))
-
-    def run_busy_loop(self):
-        """Core busy loop of the EngineCore for data parallel case."""
-
-        # Loop until process is sent a SIGINT or SIGTERM
-        while True:
-            # 1) Poll the input queue until there is work to do.
-            self._process_input_queue()
-
-            # 2) Step the engine core.
-            executed = self._process_engine_step()
-            self._maybe_publish_request_counts()
-
-            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
-            if not executed:
-                if not local_unfinished_reqs and not self.engines_running:
-                    # All engines are idle.
-                    continue
-
-                # We are in a running state and so must execute a dummy pass
-                # if the model didn't execute any ready requests.
-                self.execute_dummy_batch()
-
-            # 3) All-reduce operation to determine global unfinished reqs.
-            self.engines_running = self._has_global_unfinished_reqs(
-                local_unfinished_reqs)
-
-            if not self.engines_running:
-                if self.dp_rank == 0 or not self.has_coordinator:
-                    # Notify client that we are pausing the loop.
-                    logger.debug("Wave %d finished, pausing engine loop.",
-                                 self.current_wave)
-                    # In the coordinator case, dp rank 0 sends updates to the
-                    # coordinator. Otherwise (offline spmd case), each rank
-                    # sends the update to its colocated front-end process.
-                    client_index = -1 if self.has_coordinator else 0
-                    self.output_queue.put_nowait(
-                        (client_index,
-                         EngineCoreOutputs(wave_complete=self.current_wave)))
-                # Increment wave count and reset step counter.
-                self.current_wave += 1
-                self.step_counter = 0
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
 

@@ -387,6 +387,7 @@ class EngineArgs:
         MultiModalConfig.mm_shm_cache_max_object_size_mb
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
     io_processor_plugin: Optional[str] = None
+    is_profiling_enabled: bool = False
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     # LoRA fields
     enable_lora: bool = False
@@ -399,10 +400,10 @@ class EngineArgs:
     max_cpu_loras: Optional[int] = LoRAConfig.max_cpu_loras
     lora_dtype: Optional[Union[str, torch.dtype]] = LoRAConfig.lora_dtype
     lora_extra_vocab_size: int = LoRAConfig.lora_extra_vocab_size
-    lora_alpha: int = LoRAConfig.lora_alpha
-    lora_training_target_modules: List[str] = LoRAConfig.training_target_modules
-    enable_lora_training: bool = LoRAConfig.enable_lora_training
-    lora_scheduler_type: str = LoRAConfig.scheduler_type
+    lora_alpha: Optional[int] = LoRAConfig.lora_alpha
+    lora_training_target_modules: Optional[List[str]] = LoRAConfig.lora_training_target_modules
+    enable_lora_training: Optional[bool] = LoRAConfig.enable_lora_training
+    lora_scheduler_type: Optional[str] = LoRAConfig.lora_scheduler_type
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: Optional[
@@ -479,6 +480,8 @@ class EngineArgs:
     """Custom logitproc types"""
 
     async_scheduling: bool = SchedulerConfig.async_scheduling
+
+    training_token_budget_ratio: float = SchedulerConfig.training_token_budget_ratio
 
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
@@ -601,6 +604,8 @@ class EngineArgs:
                                  **model_kwargs["logits_processors"])
         model_group.add_argument("--io-processor-plugin",
                                  **model_kwargs["io_processor_plugin"])
+        model_group.add_argument("--is-profiling-enabled",
+                                 **model_kwargs["is_profiling_enabled"])
 
         # Model loading arguments
         load_kwargs = get_kwargs(LoadConfig)
@@ -841,6 +846,14 @@ class EngineArgs:
             "--lora-dtype",
             **lora_kwargs["lora_dtype"],
         )
+        lora_group.add_argument("--lora-alpha",
+                                **lora_kwargs["lora_alpha"])
+        lora_group.add_argument("--lora-training-target-modules",
+                                **lora_kwargs["lora_training_target_modules"])
+        lora_group.add_argument("--enable-lora-training",
+                                **lora_kwargs["enable_lora_training"])
+        lora_group.add_argument("--lora-scheduler-type",
+                                **lora_kwargs["lora_scheduler_type"])
         lora_group.add_argument("--max-cpu-loras",
                                 **lora_kwargs["max_cpu_loras"])
         lora_group.add_argument("--fully-sharded-loras",
@@ -917,6 +930,8 @@ class EngineArgs:
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"])
         scheduler_group.add_argument("--async-scheduling",
                                      **scheduler_kwargs["async_scheduling"])
+        scheduler_group.add_argument("--training-token-budget-ratio",
+                                     **scheduler_kwargs["training_token_budget_ratio"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1041,6 +1056,7 @@ class EngineArgs:
             override_attention_dtype=self.override_attention_dtype,
             logits_processors=self.logits_processors,
             io_processor_plugin=self.io_processor_plugin,
+            is_profiling_enabled=self.is_profiling_enabled,
         )
 
     def validate_tensorizer_args(self):
@@ -1402,6 +1418,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.
             disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            training_token_budget_ratio=self.training_token_budget_ratio,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
@@ -1409,20 +1426,22 @@ class EngineArgs:
                 "Default modality-specific LoRA(s) were provided for a "
                 "non multimodal model")
 
-        lora_config = LoRAConfig(
-            bias_enabled=self.enable_lora_bias,
-            max_lora_rank=self.max_lora_rank,
-            max_loras=self.max_loras,
-            default_mm_loras=self.default_mm_loras,
-            fully_sharded_loras=self.fully_sharded_loras,
-            lora_extra_vocab_size=self.lora_extra_vocab_size,
-            lora_dtype=self.lora_dtype,
-            max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
-            and self.max_cpu_loras > 0 else None,
-            lora_alpha=self.lora_alpha,
-            training_target_modules=self.lora_training_target_modules,
-            enable_lora_training=self.enable_lora_training if self.enable_lora else None,
-            scheduler_type=self.lora_scheduler_type)
+        lora_config = None
+        if self.enable_lora:
+            lora_config = LoRAConfig(
+                bias_enabled=self.enable_lora_bias,
+                max_lora_rank=self.max_lora_rank,
+                max_loras=self.max_loras,
+                default_mm_loras=self.default_mm_loras,
+                fully_sharded_loras=self.fully_sharded_loras,
+                lora_extra_vocab_size=self.lora_extra_vocab_size,
+                lora_dtype=self.lora_dtype,
+                max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
+                and self.max_cpu_loras > 0 else None,
+                lora_alpha=self.lora_alpha,
+                lora_training_target_modules=self.lora_training_target_modules,
+                enable_lora_training=self.enable_lora_training,
+                lora_scheduler_type=self.lora_scheduler_type)
 
         # bitsandbytes pre-quantized model need a specific model loader
         if model_config.quantization == "bitsandbytes":

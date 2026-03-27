@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 import multiprocessing
 import pickle
 import queue
@@ -9,6 +10,7 @@ import time
 import traceback
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property, partial
@@ -21,6 +23,8 @@ from typing import Any, Callable, Optional, Union, cast
 import cloudpickle
 
 import vllm.envs as envs
+import torch
+
 from vllm.config import VllmConfig
 from vllm.distributed import (destroy_distributed_environment,
                               destroy_model_parallel)
@@ -135,6 +139,14 @@ class MultiprocExecutor(Executor):
         self.output_rank = self._get_output_rank()
         self.has_connector = self.vllm_config.kv_transfer_config is not None
 
+        # RPC dispatch bookkeeping for concurrent requests.
+        self._rpc_id_counter = itertools.count()
+        self._pending_lock = threading.Lock()
+        self._pending_rpcs: dict[int, "_PendingRPC"] = {}
+        self._rpc_enqueue_lock = threading.Lock()
+        self._response_threads: list[Thread] = []
+        self._start_response_listeners()
+
     def start_worker_monitor(self):
         workers = self.workers
         self_ref = weakref.ref(self)
@@ -163,6 +175,57 @@ class MultiprocExecutor(Executor):
         Thread(target=monitor_workers,
                daemon=True,
                name="MultiprocWorkerMonitor").start()
+
+    def _start_response_listeners(self):
+        for handle in self.workers:
+            thread = Thread(target=self._response_listener,
+                            args=(handle, ),
+                            daemon=True,
+                            name=f"mp_exec_resp_{handle.rank}")
+            thread.start()
+            self._response_threads.append(thread)
+
+    def _response_listener(self, handle: "WorkerProcHandle") -> None:
+        mq = handle.worker_response_mq
+        while not self.shutdown_event.is_set():
+            try:
+                message = mq.dequeue(timeout=0.1,
+                                     cancel=self.shutdown_event)
+            except TimeoutError:
+                continue
+            except Exception:
+                if not self.shutdown_event.is_set():
+                    logger.exception("Failed to dequeue worker response.")
+                break
+            if message is None:
+                continue
+            if not isinstance(message, tuple) or len(message) != 3:
+                logger.error("Unexpected worker response format: %s", message)
+                continue
+            rpc_id, status, payload = message
+            self._dispatch_worker_response(rpc_id, handle.rank, status,
+                                           payload)
+
+    def _dispatch_worker_response(self, rpc_id: int, worker_rank: int,
+                                  status, payload) -> None:
+        with self._pending_lock:
+            pending = self._pending_rpcs.get(rpc_id)
+        if pending is None:
+            logger.debug("Received response for unknown rpc_id %s", rpc_id)
+            return
+
+        if status != WorkerProc.ResponseStatus.SUCCESS:
+            error = RuntimeError(
+                f"Worker failed with error '{payload}', please check the"
+                " stack trace above for the root cause")
+            pending.fail(error)
+            return
+
+        pending.add_success(worker_rank, payload)
+
+    def _remove_pending_rpc(self, rpc_id: int) -> None:
+        with self._pending_lock:
+            self._pending_rpcs.pop(rpc_id, None)
 
     def register_failure_callback(self, callback: FailureCallback):
         if self.is_failed:
@@ -225,52 +288,42 @@ class MultiprocExecutor(Executor):
         # NOTE: If the args are heterogeneous, then we pack them into a list,
         # and unpack them in the method of every worker, because every worker
         # knows their own rank.
+        if isinstance(method, str):
+            send_method = method
+        else:
+            send_method = cloudpickle.dumps(
+                method, protocol=pickle.HIGHEST_PROTOCOL)
+
+        workers = (self.workers[unique_reply_rank],
+                   ) if unique_reply_rank is not None else self.workers
+        expected_ranks = tuple(w.rank for w in workers)
+
+        rpc_id = next(self._rpc_id_counter)
+        pending = _PendingRPC(rpc_id, expected_ranks, self._remove_pending_rpc)
+        with self._pending_lock:
+            self._pending_rpcs[rpc_id] = pending
+
         try:
-            if isinstance(method, str):
-                send_method = method
-            else:
-                send_method = cloudpickle.dumps(
-                    method, protocol=pickle.HIGHEST_PROTOCOL)
-            self.rpc_broadcast_mq.enqueue(
-                (send_method, args, kwargs, unique_reply_rank))
+            with self._rpc_enqueue_lock:
+                self.rpc_broadcast_mq.enqueue(
+                    (rpc_id, send_method, args, kwargs, unique_reply_rank))
+        except Exception:
+            self._remove_pending_rpc(rpc_id)
+            pending.fail(RuntimeError("Failed to enqueue RPC request"))
+            raise
 
-            workers = (self.workers[unique_reply_rank],
-                       ) if unique_reply_rank is not None else self.workers
-            responses = []
+        if non_block:
+            return [pending.futures[rank] for rank in expected_ranks]
 
-            def get_response(w: WorkerProcHandle,
-                             dequeue_timeout: Optional[float] = None,
-                             cancel_event: Optional[threading.Event] = None):
-                status, result = w.worker_response_mq.dequeue(
-                    timeout=dequeue_timeout, cancel=cancel_event)
-
-                if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause")
-                return result
-
-            for w in workers:
-                dequeue_timeout = None if deadline is None else (
-                    deadline - time.monotonic())
-
-                if self.io_thread_pool is not None:
-                    # We must consume worker_response_mq from a single thread.
-                    result = self.io_thread_pool.submit(  # type: ignore
-                        get_response, w, dequeue_timeout, self.shutdown_event)
-                    if not non_block:
-                        result = result.result()
-                elif not non_block:
-                    result = get_response(w, dequeue_timeout,
-                                          self.shutdown_event)
-                else:
-                    raise RuntimeError("non_block can only be used when"
-                                       " max_concurrent_batches > 1")
-                responses.append(result)
-
-            return responses
+        try:
+            responses = pending.result(deadline)
         except TimeoutError as e:
+            pending.fail(e)
             raise TimeoutError(f"RPC call to {method} timed out.") from e
+        except Exception:
+            raise
+
+        return responses
 
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):
@@ -321,6 +374,9 @@ class MultiprocExecutor(Executor):
                 del self.io_thread_pool
 
         self.rpc_broadcast_mq = None
+        for thread in self._response_threads:
+            thread.join(timeout=1.0)
+        self._response_threads.clear()
 
     def check_health(self) -> None:
         self.collective_rpc("check_health", timeout=10)
@@ -343,6 +399,67 @@ class MultiprocExecutor(Executor):
         # 24-31, PP rank 3
         # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
         return self.world_size - self.parallel_config.tensor_parallel_size
+
+
+class _PendingRPC:
+    """Tracks outstanding RPC responses across workers."""
+
+    def __init__(self, rpc_id: int, expected_ranks: tuple[int, ...],
+                 on_complete: Callable[[int], None]) -> None:
+        self.rpc_id = rpc_id
+        self.expected_ranks = expected_ranks
+        self._on_complete = on_complete
+        self._lock = threading.Lock()
+        self._completed = False
+        self.futures: dict[int, Future] = {
+            rank: Future() for rank in expected_ranks
+        }
+        for fut in self.futures.values():
+            fut.add_done_callback(self._future_done)
+
+    def _future_done(self, _: Future) -> None:
+        with self._lock:
+            if self._completed:
+                return
+            if all(f.done() for f in self.futures.values()):
+                self._completed = True
+        if self._completed:
+            self._on_complete(self.rpc_id)
+
+    def add_success(self, worker_rank: int, value: Any) -> None:
+        future = self.futures.get(worker_rank)
+        if future is None or future.done():
+            return
+        future.set_result(value)
+
+    def fail(self, exc: Exception) -> None:
+        with self._lock:
+            if self._completed:
+                return
+            self._completed = True
+        for future in self.futures.values():
+            if not future.done():
+                future.set_exception(exc)
+        self._on_complete(self.rpc_id)
+
+    def result(self, deadline: Optional[float]) -> list[Any]:
+        results: list[Any] = []
+        for rank in self.expected_ranks:
+            future = self.futures[rank]
+            timeout = None
+            if deadline is not None:
+                timeout = max(0.0, deadline - time.monotonic())
+            results.append(future.result(timeout=timeout))
+        return results
+
+
+@dataclass
+class _WorkerTask:
+    rpc_id: int
+    method: Union[str, bytes]
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    output_rank: Optional[int]
 
 
 @dataclass
@@ -421,6 +538,32 @@ class WorkerProc:
                 daemon=True,
                 name="WorkerAsyncOutputCopy")
             self.async_output_copy_thread.start()
+        else:
+            self.async_output_queue = queue.Queue()
+
+        # Track CUDA device for execution threads.
+        self.device = torch.cuda.current_device()
+
+        # Dedicated execution queues/threads for primary and secondary work.
+        self.primary_task_queue: queue.Queue[
+            Optional[_WorkerTask]] = queue.Queue()
+        self.secondary_task_queue: queue.Queue[
+            Optional[_WorkerTask]] = queue.Queue()
+        self._execution_threads: list[Thread] = []
+
+        primary_thread = Thread(target=self._execution_loop,
+                                args=(self.primary_task_queue, "primary"),
+                                daemon=True,
+                                name=f"WorkerPrimaryExec-{rank}")
+        primary_thread.start()
+        self._execution_threads.append(primary_thread)
+
+        secondary_thread = Thread(target=self._execution_loop,
+                                  args=(self.secondary_task_queue, "secondary"),
+                                  daemon=True,
+                                  name=f"WorkerSecondaryExec-{rank}")
+        secondary_thread.start()
+        self._execution_threads.append(secondary_thread)
 
         # Initialize multimodal receiver cache if needed
         self.mm_receiver_cache = worker_receiver_cache_from_config(
@@ -515,6 +658,18 @@ class WorkerProc:
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
     def shutdown(self):
+        # Stop execution threads first to avoid dangling GPU work.
+        try:
+            self.primary_task_queue.put(None, timeout=0.1)
+        except queue.Full:
+            pass
+        try:
+            self.secondary_task_queue.put(None, timeout=0.1)
+        except queue.Full:
+            pass
+        for thread in getattr(self, "_execution_threads", ()):
+            thread.join(timeout=1.0)
+
         self.worker.shutdown()
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
@@ -618,7 +773,7 @@ class WorkerProc:
         SUCCESS = auto()
         FAILURE = auto()
 
-    def enqueue_output(self, output: Any):
+    def enqueue_output(self, rpc_id: int, output: Any):
         """Prepares output from the worker and enqueues it to the
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
@@ -627,56 +782,170 @@ class WorkerProc:
             output = output.get_output()
 
         if isinstance(output, Exception):
-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            status = WorkerProc.ResponseStatus.FAILURE
+            payload = str(output)
         else:
-            result = (WorkerProc.ResponseStatus.SUCCESS, output)
+            status = WorkerProc.ResponseStatus.SUCCESS
+            payload = output
         if (response_mq := self.worker_response_mq) is not None:
-            response_mq.enqueue(result)
+            response_mq.enqueue((rpc_id, status, payload))
 
-    def handle_output(self, output: Any):
+    def handle_output(self, rpc_id: int, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
         it is passed to the async_output_busy_loop thread. Otherwise, it is
         enqueued directly to the worker_response_mq.
         """
         if self.use_async_scheduling:
-            self.async_output_queue.put(output)
+            self.async_output_queue.put((rpc_id, output))
         else:
-            self.enqueue_output(output)
+            self.enqueue_output(rpc_id, output)
 
     def async_output_busy_loop(self):
         """Entrypoint for the thread which handles outputs asynchronously."""
         while True:
-            output = self.async_output_queue.get()
-            self.enqueue_output(output)
+            rpc_id, output = self.async_output_queue.get()
+            self.enqueue_output(rpc_id, output)
+
+    def _execution_loop(self, task_queue: "queue.Queue[Optional[_WorkerTask]]",
+                        role: str) -> None:
+        """Executes tasks associated with a particular stream role."""
+        torch.cuda.set_device(self.device)
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            if isinstance(task, _WorkerTask):
+                rpc_id = task.rpc_id
+                method = task.method
+                args = task.args
+                kwargs = task.kwargs
+                output_rank = task.output_rank
+            else:
+                rpc_id, method, args, kwargs, output_rank = task
+            logger.debug("Worker rank %s executing rpc_id=%s on %s stream",
+                        self.rank, rpc_id, role)
+            try:
+                func = self._resolve_method(method)
+                if (self.mm_receiver_cache is not None
+                        and getattr(func, "__name__", "") == "execute_model"):
+                    get_and_update_mm_cache(self.mm_receiver_cache, args)
+                if isinstance(method, str) and hasattr(self.worker,
+                                                       "use_runner"):
+                    context = self.worker.use_runner(role)
+                else:
+                    context = nullcontext()
+                with context:
+                    output = func(*args, **kwargs)
+            except Exception as e:
+                if hasattr(e, "add_note"):
+                    e.add_note(traceback.format_exc())
+                logger.exception("WorkerProc hit an exception.")
+                output = e
+
+            if output_rank is None or self.rank == output_rank:
+                self.handle_output(rpc_id, output)
+
+    def _resolve_method(self, method: Union[str, bytes]) -> Callable:
+        if isinstance(method, str):
+            return getattr(self.worker, method)
+        if isinstance(method, bytes):
+            return partial(cloudpickle.loads(method), self.worker)
+        raise TypeError(f"Unsupported RPC method type: {type(method)}")
+
+    # TODO(girfan): Clean this up a bit. Maybe add a field to the RPC itself to indicate the stream it should be executed on?
+    def _select_task_queue(
+            self, method: Union[str, bytes],
+            args: tuple[Any, ...]) -> "queue.Queue[Optional[_WorkerTask]]":
+        if not self.use_async_scheduling:
+            return self.primary_task_queue
+        if isinstance(method, bytes):
+            return self.primary_task_queue
+        if method != "execute_model" or not args:
+            return self.primary_task_queue
+        scheduler_output = args[0]
+        queue_label = getattr(scheduler_output, "queue", None)
+        if queue_label == "secondary":
+            return self.secondary_task_queue
+        try:
+            if self._requires_secondary_stream(scheduler_output):
+                return self.secondary_task_queue
+        except Exception:
+            logger.debug("Failed to inspect scheduler_output for stream "
+                         "selection; defaulting to primary stream.",
+                         exc_info=True)
+        return self.primary_task_queue
+
+    def _requires_secondary_stream(self,
+                                   scheduler_output: "SchedulerOutput") -> bool:
+        def is_skip_kv(sampling_params) -> bool:
+            if sampling_params is None:
+                return False
+            extra_args = getattr(sampling_params, "extra_args", None)
+            if not extra_args:
+                return False
+            return bool(extra_args.get("skip_kv_cache", False))
+
+        has_training = any(req.is_training
+                           for req in scheduler_output.scheduled_new_reqs)
+        has_skip_kv = any(is_skip_kv(req.sampling_params)
+                          for req in scheduler_output.scheduled_new_reqs)
+        if has_training or has_skip_kv:
+            return True
+
+        cached_ids = set(scheduler_output.num_scheduled_tokens.keys())
+        cached_ids.update(scheduler_output.scheduled_cached_reqs.req_ids)
+        for req_id in cached_ids:
+            cached_state = self._get_request_state(req_id)
+            if cached_state is None:
+                continue
+            if getattr(cached_state, "is_training", False):
+                return True
+            if is_skip_kv(getattr(cached_state, "sampling_params", None)):
+                return True
+        return False
+
+    def _get_request_state(self, req_id: str) -> Optional[Any]:
+        model_runner = getattr(self.worker, "model_runner", None)
+        if model_runner is None:
+            return None
+        requests = getattr(model_runner, "requests", None)
+        if isinstance(requests, dict):
+            return requests.get(req_id)
+        return None
 
     def worker_busy_loop(self, cancel: Optional[threading.Event] = None):
         """Main busy loop for Multiprocessing Workers"""
         while True:
-            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
-                cancel=cancel)
+            if cancel is not None and cancel.is_set():
+                break
             try:
-                if isinstance(method, str):
-                    func = getattr(self.worker, method)
-                elif isinstance(method, bytes):
-                    func = partial(cloudpickle.loads(method), self.worker)
-                # retrieve from shm cache if available
-                if self.mm_receiver_cache is not None \
-                    and func.__name__ == "execute_model":
-                    get_and_update_mm_cache(self.mm_receiver_cache, args)
-                output = func(*args, **kwargs)
-            except Exception as e:
-                # Notes have been introduced in python 3.11
-                if hasattr(e, "add_note"):
-                    e.add_note(traceback.format_exc())
-                logger.exception("WorkerProc hit an exception.")
-                # exception might not be serializable, so we convert it to
-                # string, only for logging purpose.
-                if output_rank is None or self.rank == output_rank:
-                    self.handle_output(e)
+                message = self.rpc_broadcast_mq.dequeue(cancel=cancel)
+            except TimeoutError:
+                if cancel is not None and cancel.is_set():
+                    break
                 continue
 
-            if output_rank is None or self.rank == output_rank:
-                self.handle_output(output)
+            if message is None:
+                if cancel is not None and cancel.is_set():
+                    break
+                continue
+
+            rpc_id, method, args, kwargs, output_rank = message
+            task = _WorkerTask(rpc_id=rpc_id,
+                               method=method,
+                               args=args,
+                               kwargs=kwargs,
+                               output_rank=output_rank)
+            target_queue = self._select_task_queue(method, args)
+            target_queue.put(task)
+            logger.debug("Worker rank %s dispatched rpc_id=%s to %s queue",
+                        self.rank, rpc_id,
+                        "secondary" if target_queue
+                        is self.secondary_task_queue else "primary")
+
+        # Signal execution threads to terminate.
+        self.primary_task_queue.put(None)
+        self.secondary_task_queue.put(None)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
